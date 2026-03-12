@@ -24,6 +24,7 @@ def main() -> None:
     with CyclesClient(config) as client:
         # Full reserve → execute → commit lifecycle
         response = client.create_reservation(ReservationCreateRequest(
+            idempotency_key="req-001",
             subject=Subject(tenant="acme", agent="support-bot"),
             action=Action(kind="llm.completion", name="gpt-4"),
             estimate=Amount(unit=Unit.USD_MICROCENTS, amount=500_000),
@@ -44,6 +45,7 @@ def main() -> None:
 
         # Commit actual usage
         commit_response = client.commit_reservation(reservation_id, CommitRequest(
+            idempotency_key="commit-001",
             actual=Amount(unit=Unit.USD_MICROCENTS, amount=420_000),
             metrics=CyclesMetrics(
                 tokens_input=1200,
