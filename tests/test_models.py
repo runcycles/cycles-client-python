@@ -13,13 +13,16 @@ from runcycles.models import (
     CyclesMetrics,
     Decision,
     DecisionRequest,
+    DecisionResult,
     DryRunResult,
     ErrorCode,
     ErrorResponse,
     EventCreateRequest,
     ReservationCreateRequest,
+    ReservationDetailResult,
     ReservationExtendRequest,
     ReservationResult,
+    ReservationStatus,
     ReleaseRequest,
     SignedAmount,
     Subject,
@@ -231,4 +234,41 @@ class TestDryRunResult:
     def test_has_caps(self) -> None:
         r = DryRunResult(decision=Decision.ALLOW_WITH_CAPS, caps=Caps(max_tokens=100))
         assert r.has_caps()
+        assert r.is_allowed()
+
+
+class TestReservationDetailResult:
+    def test_is_active(self) -> None:
+        r = ReservationDetailResult(reservation_id="rsv_1", status=ReservationStatus.ACTIVE)
+        assert r.is_active()
+        assert not r.is_committed()
+        assert not r.is_released()
+        assert not r.is_expired()
+
+    def test_is_committed(self) -> None:
+        r = ReservationDetailResult(reservation_id="rsv_1", status=ReservationStatus.COMMITTED)
+        assert r.is_committed()
+
+    def test_is_released(self) -> None:
+        r = ReservationDetailResult(reservation_id="rsv_1", status=ReservationStatus.RELEASED)
+        assert r.is_released()
+
+    def test_is_expired(self) -> None:
+        r = ReservationDetailResult(reservation_id="rsv_1", status=ReservationStatus.EXPIRED)
+        assert r.is_expired()
+
+
+class TestDecisionResult:
+    def test_allow(self) -> None:
+        r = DecisionResult(decision=Decision.ALLOW)
+        assert r.is_allowed()
+        assert not r.is_denied()
+
+    def test_deny(self) -> None:
+        r = DecisionResult(decision=Decision.DENY, reason_code="BUDGET_EXCEEDED")
+        assert r.is_denied()
+        assert not r.is_allowed()
+
+    def test_allow_with_caps(self) -> None:
+        r = DecisionResult(decision=Decision.ALLOW_WITH_CAPS, caps=Caps(max_tokens=500))
         assert r.is_allowed()
