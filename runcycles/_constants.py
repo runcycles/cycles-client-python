@@ -1,0 +1,17 @@
+"""Internal constants for the Cycles client."""
+
+API_KEY_HEADER = "X-Cycles-API-Key"
+IDEMPOTENCY_KEY_HEADER = "X-Idempotency-Key"
+REQUEST_ID_HEADER = "X-Request-Id"
+
+DEFAULT_CONNECT_TIMEOUT = 2.0
+DEFAULT_READ_TIMEOUT = 5.0
+DEFAULT_TTL_MS = 60_000
+DEFAULT_GRACE_PERIOD_MS = 5_000
+DEFAULT_OVERAGE_POLICY = "REJECT"
+DEFAULT_UNIT = "USD_MICROCENTS"
+
+RESERVATIONS_PATH = "/v1/reservations"
+DECIDE_PATH = "/v1/decide"
+BALANCES_PATH = "/v1/balances"
+EVENTS_PATH = "/v1/events"

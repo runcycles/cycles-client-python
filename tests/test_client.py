@@ -1,0 +1,257 @@
+"""Tests for CyclesClient and AsyncCyclesClient."""
+
+import json
+
+import httpx
+import pytest
+
+from runcycles.client import AsyncCyclesClient, CyclesClient
+from runcycles.config import CyclesConfig
+from runcycles.models import (
+    Action,
+    Amount,
+    CommitRequest,
+    DecisionRequest,
+    EventCreateRequest,
+    ReservationCreateRequest,
+    ReservationExtendRequest,
+    ReleaseRequest,
+    Subject,
+    Unit,
+)
+
+
+@pytest.fixture
+def config() -> CyclesConfig:
+    return CyclesConfig(base_url="http://localhost:7878", api_key="test-key")
+
+
+class TestCyclesClientSync:
+    def test_create_reservation_success(self, config: CyclesConfig, httpx_mock) -> None:  # type: ignore[no-untyped-def]
+        httpx_mock.add_response(
+            method="POST",
+            url="http://localhost:7878/v1/reservations",
+            json={"decision": "ALLOW", "reservation_id": "res_123"},
+            status_code=200,
+        )
+
+        with CyclesClient(config) as client:
+            response = client.create_reservation(ReservationCreateRequest(
+                idempotency_key="req-001",
+                subject=Subject(tenant="acme"),
+                action=Action(kind="llm.completion"),
+                estimate=Amount(unit=Unit.USD_MICROCENTS, amount=1000),
+            ))
+
+        assert response.is_success
+        assert response.get_body_attribute("decision") == "ALLOW"
+        assert response.get_body_attribute("reservation_id") == "res_123"
+
+    def test_create_reservation_denied(self, config: CyclesConfig, httpx_mock) -> None:  # type: ignore[no-untyped-def]
+        httpx_mock.add_response(
+            method="POST",
+            url="http://localhost:7878/v1/reservations",
+            json={"error": "BUDGET_EXCEEDED", "message": "Insufficient budget"},
+            status_code=409,
+        )
+
+        with CyclesClient(config) as client:
+            response = client.create_reservation({"idempotency_key": "req-002", "subject": {"tenant": "acme"}})
+
+        assert not response.is_success
+        assert response.is_client_error
+        assert response.status == 409
+
+    def test_commit_reservation(self, config: CyclesConfig, httpx_mock) -> None:  # type: ignore[no-untyped-def]
+        httpx_mock.add_response(
+            method="POST",
+            url="http://localhost:7878/v1/reservations/res_123/commit",
+            json={"status": "COMMITTED", "charged": {"unit": "USD_MICROCENTS", "amount": 800}},
+            status_code=200,
+        )
+
+        with CyclesClient(config) as client:
+            response = client.commit_reservation("res_123", CommitRequest(
+                idempotency_key="commit-001",
+                actual=Amount(unit=Unit.USD_MICROCENTS, amount=800),
+            ))
+
+        assert response.is_success
+        assert response.get_body_attribute("status") == "COMMITTED"
+
+    def test_release_reservation(self, config: CyclesConfig, httpx_mock) -> None:  # type: ignore[no-untyped-def]
+        httpx_mock.add_response(
+            method="POST",
+            url="http://localhost:7878/v1/reservations/res_123/release",
+            json={"status": "RELEASED"},
+            status_code=200,
+        )
+
+        with CyclesClient(config) as client:
+            response = client.release_reservation("res_123", ReleaseRequest(
+                idempotency_key="rel-001",
+                reason="cancelled",
+            ))
+
+        assert response.is_success
+
+    def test_extend_reservation(self, config: CyclesConfig, httpx_mock) -> None:  # type: ignore[no-untyped-def]
+        httpx_mock.add_response(
+            method="POST",
+            url="http://localhost:7878/v1/reservations/res_123/extend",
+            json={"status": "ACTIVE", "expires_at_ms": 9999999},
+            status_code=200,
+        )
+
+        with CyclesClient(config) as client:
+            response = client.extend_reservation("res_123", ReservationExtendRequest(
+                idempotency_key="ext-001",
+                extend_by_ms=60000,
+            ))
+
+        assert response.is_success
+
+    def test_decide(self, config: CyclesConfig, httpx_mock) -> None:  # type: ignore[no-untyped-def]
+        httpx_mock.add_response(
+            method="POST",
+            url="http://localhost:7878/v1/decide",
+            json={"decision": "ALLOW"},
+            status_code=200,
+        )
+
+        with CyclesClient(config) as client:
+            response = client.decide(DecisionRequest(
+                idempotency_key="dec-001",
+                subject=Subject(tenant="acme"),
+                estimate=Amount(unit=Unit.USD_MICROCENTS, amount=1000),
+            ))
+
+        assert response.is_success
+
+    def test_get_balances(self, config: CyclesConfig, httpx_mock) -> None:  # type: ignore[no-untyped-def]
+        httpx_mock.add_response(
+            method="GET",
+            url="http://localhost:7878/v1/balances?tenant=acme",
+            json={"balances": []},
+            status_code=200,
+        )
+
+        with CyclesClient(config) as client:
+            response = client.get_balances(tenant="acme")
+
+        assert response.is_success
+
+    def test_list_reservations(self, config: CyclesConfig, httpx_mock) -> None:  # type: ignore[no-untyped-def]
+        httpx_mock.add_response(
+            method="GET",
+            url="http://localhost:7878/v1/reservations?tenant=acme",
+            json={"reservations": [], "has_more": False},
+            status_code=200,
+        )
+
+        with CyclesClient(config) as client:
+            response = client.list_reservations(tenant="acme")
+
+        assert response.is_success
+
+    def test_get_reservation(self, config: CyclesConfig, httpx_mock) -> None:  # type: ignore[no-untyped-def]
+        httpx_mock.add_response(
+            method="GET",
+            url="http://localhost:7878/v1/reservations/res_123",
+            json={"reservation_id": "res_123", "status": "ACTIVE"},
+            status_code=200,
+        )
+
+        with CyclesClient(config) as client:
+            response = client.get_reservation("res_123")
+
+        assert response.is_success
+
+    def test_create_event(self, config: CyclesConfig, httpx_mock) -> None:  # type: ignore[no-untyped-def]
+        httpx_mock.add_response(
+            method="POST",
+            url="http://localhost:7878/v1/events",
+            json={"status": "APPLIED", "event_id": "evt_123"},
+            status_code=200,
+        )
+
+        with CyclesClient(config) as client:
+            response = client.create_event(EventCreateRequest(
+                idempotency_key="evt-001",
+                subject=Subject(tenant="acme"),
+                action=Action(kind="llm.completion"),
+                actual=Amount(unit=Unit.USD_MICROCENTS, amount=500),
+            ))
+
+        assert response.is_success
+
+    def test_transport_error(self, config: CyclesConfig, httpx_mock) -> None:  # type: ignore[no-untyped-def]
+        httpx_mock.add_exception(httpx.ConnectError("Connection refused"))
+
+        with CyclesClient(config) as client:
+            response = client.create_reservation({"idempotency_key": "req-err"})
+
+        assert response.is_transport_error
+        assert response.status == -1
+
+    def test_idempotency_header_set(self, config: CyclesConfig, httpx_mock) -> None:  # type: ignore[no-untyped-def]
+        httpx_mock.add_response(
+            method="POST",
+            url="http://localhost:7878/v1/reservations",
+            json={"decision": "ALLOW"},
+            status_code=200,
+        )
+
+        with CyclesClient(config) as client:
+            client.create_reservation({"idempotency_key": "my-key", "subject": {"tenant": "acme"}})
+
+        request = httpx_mock.get_request()
+        assert request is not None
+        assert request.headers.get("X-Idempotency-Key") == "my-key"
+        assert request.headers.get("X-Cycles-API-Key") == "test-key"
+
+    def test_dict_body(self, config: CyclesConfig, httpx_mock) -> None:  # type: ignore[no-untyped-def]
+        httpx_mock.add_response(
+            method="POST",
+            url="http://localhost:7878/v1/reservations",
+            json={"decision": "ALLOW"},
+            status_code=200,
+        )
+
+        with CyclesClient(config) as client:
+            response = client.create_reservation({
+                "idempotency_key": "raw-dict",
+                "subject": {"tenant": "acme"},
+                "estimate": {"unit": "USD_MICROCENTS", "amount": 1000},
+            })
+
+        assert response.is_success
+
+
+@pytest.mark.asyncio
+class TestAsyncCyclesClient:
+    async def test_create_reservation_success(self, config: CyclesConfig, httpx_mock) -> None:  # type: ignore[no-untyped-def]
+        httpx_mock.add_response(
+            method="POST",
+            url="http://localhost:7878/v1/reservations",
+            json={"decision": "ALLOW", "reservation_id": "res_456"},
+            status_code=200,
+        )
+
+        async with AsyncCyclesClient(config) as client:
+            response = await client.create_reservation(ReservationCreateRequest(
+                idempotency_key="async-001",
+                subject=Subject(tenant="acme"),
+                estimate=Amount(unit=Unit.USD_MICROCENTS, amount=1000),
+            ))
+
+        assert response.is_success
+        assert response.get_body_attribute("reservation_id") == "res_456"
+
+    async def test_transport_error(self, config: CyclesConfig, httpx_mock) -> None:  # type: ignore[no-untyped-def]
+        httpx_mock.add_exception(httpx.ConnectError("Connection refused"))
+
+        async with AsyncCyclesClient(config) as client:
+            response = await client.create_reservation({"idempotency_key": "async-err"})
+
+        assert response.is_transport_error
