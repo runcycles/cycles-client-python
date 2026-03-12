@@ -12,7 +12,14 @@ from typing import Any, Callable
 
 from runcycles.client import AsyncCyclesClient, CyclesClient
 from runcycles.context import CyclesContext, _clear_context, _set_context
-from runcycles.exceptions import BudgetExceededError, CyclesProtocolError, OverdraftLimitExceededError
+from runcycles.exceptions import (
+    BudgetExceededError,
+    CyclesProtocolError,
+    DebtOutstandingError,
+    OverdraftLimitExceededError,
+    ReservationExpiredError,
+    ReservationFinalizedError,
+)
 from runcycles.models import (
     Action,
     Amount,
@@ -142,7 +149,6 @@ def _build_protocol_exception(prefix: str, response: CyclesResponse) -> CyclesPr
     if error_resp:
         ec = error_resp.error_code
         error_code = ec.value if ec else None
-        reason_code = error_code
         request_id = error_resp.request_id
         if error_resp.message:
             message = f"{prefix}: {error_resp.message}"
@@ -153,6 +159,12 @@ def _build_protocol_exception(prefix: str, response: CyclesResponse) -> CyclesPr
         if response.error_message:
             message = f"{prefix}: {response.error_message}"
 
+    # Extract reason_code from body (present in ReservationCreateResponse/DecisionResponse
+    # for DENY cases); fall back to error_code for error responses
+    reason_code = response.get_body_attribute("reason_code")
+    if reason_code is None and error_code is not None:
+        reason_code = error_code
+
     retry_raw = response.get_body_attribute("retry_after_ms")
     if retry_raw is not None:
         retry_after_ms = int(retry_raw)
@@ -162,6 +174,12 @@ def _build_protocol_exception(prefix: str, response: CyclesResponse) -> CyclesPr
         exc_class = BudgetExceededError
     elif error_code == "OVERDRAFT_LIMIT_EXCEEDED":
         exc_class = OverdraftLimitExceededError
+    elif error_code == "DEBT_OUTSTANDING":
+        exc_class = DebtOutstandingError
+    elif error_code == "RESERVATION_EXPIRED":
+        exc_class = ReservationExpiredError
+    elif error_code == "RESERVATION_FINALIZED":
+        exc_class = ReservationFinalizedError
 
     return exc_class(
         message,

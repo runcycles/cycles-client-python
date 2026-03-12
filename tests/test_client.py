@@ -39,7 +39,7 @@ class TestCyclesClientSync:
             response = client.create_reservation(ReservationCreateRequest(
                 idempotency_key="req-001",
                 subject=Subject(tenant="acme"),
-                action=Action(kind="llm.completion"),
+                action=Action(kind="llm.completion", name="gpt-4"),
                 estimate=Amount(unit=Unit.USD_MICROCENTS, amount=1000),
             ))
 
@@ -123,6 +123,7 @@ class TestCyclesClientSync:
             response = client.decide(DecisionRequest(
                 idempotency_key="dec-001",
                 subject=Subject(tenant="acme"),
+                action=Action(kind="llm.completion", name="gpt-4"),
                 estimate=Amount(unit=Unit.USD_MICROCENTS, amount=1000),
             ))
 
@@ -172,14 +173,14 @@ class TestCyclesClientSync:
             method="POST",
             url="http://localhost:7878/v1/events",
             json={"status": "APPLIED", "event_id": "evt_123"},
-            status_code=200,
+            status_code=201,
         )
 
         with CyclesClient(config) as client:
             response = client.create_event(EventCreateRequest(
                 idempotency_key="evt-001",
                 subject=Subject(tenant="acme"),
-                action=Action(kind="llm.completion"),
+                action=Action(kind="llm.completion", name="gpt-4"),
                 actual=Amount(unit=Unit.USD_MICROCENTS, amount=500),
             ))
 
@@ -242,6 +243,7 @@ class TestAsyncCyclesClient:
             response = await client.create_reservation(ReservationCreateRequest(
                 idempotency_key="async-001",
                 subject=Subject(tenant="acme"),
+                action=Action(kind="llm.completion", name="gpt-4"),
                 estimate=Amount(unit=Unit.USD_MICROCENTS, amount=1000),
             ))
 

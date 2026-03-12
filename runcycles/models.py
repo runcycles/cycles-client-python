@@ -124,8 +124,8 @@ class Subject(BaseModel):
 class Action(BaseModel):
     model_config = _SNAKE_CASE_CONFIG
 
-    kind: str | None = None
-    name: str | None = None
+    kind: str
+    name: str
     tags: list[str] | None = None
 
 
@@ -190,10 +190,10 @@ class Balance(BaseModel):
 class ReservationCreateRequest(BaseModel):
     model_config = _SNAKE_CASE_CONFIG
 
-    idempotency_key: str | None = None
-    subject: Subject | None = None
-    action: Action | None = None
-    estimate: Amount | None = None
+    idempotency_key: str
+    subject: Subject
+    action: Action
+    estimate: Amount
     ttl_ms: int | None = None
     grace_period_ms: int | None = None
     overage_policy: CommitOveragePolicy | None = None
@@ -204,8 +204,8 @@ class ReservationCreateRequest(BaseModel):
 class CommitRequest(BaseModel):
     model_config = _SNAKE_CASE_CONFIG
 
-    idempotency_key: str | None = None
-    actual: Amount | None = None
+    idempotency_key: str
+    actual: Amount
     metrics: CyclesMetrics | None = None
     metadata: dict[str, Any] | None = None
 
@@ -213,35 +213,35 @@ class CommitRequest(BaseModel):
 class ReleaseRequest(BaseModel):
     model_config = _SNAKE_CASE_CONFIG
 
-    idempotency_key: str | None = None
+    idempotency_key: str
     reason: str | None = None
 
 
 class ReservationExtendRequest(BaseModel):
     model_config = _SNAKE_CASE_CONFIG
 
-    idempotency_key: str | None = None
-    extend_by_ms: int | None = None
+    idempotency_key: str
+    extend_by_ms: int
     metadata: dict[str, Any] | None = None
 
 
 class DecisionRequest(BaseModel):
     model_config = _SNAKE_CASE_CONFIG
 
-    idempotency_key: str | None = None
-    subject: Subject | None = None
-    action: Action | None = None
-    estimate: Amount | None = None
+    idempotency_key: str
+    subject: Subject
+    action: Action
+    estimate: Amount
     metadata: dict[str, Any] | None = None
 
 
 class EventCreateRequest(BaseModel):
     model_config = _SNAKE_CASE_CONFIG
 
-    idempotency_key: str | None = None
-    subject: Subject | None = None
-    action: Action | None = None
-    actual: Amount | None = None
+    idempotency_key: str
+    subject: Subject
+    action: Action
+    actual: Amount
     overage_policy: CommitOveragePolicy | None = None
     metrics: CyclesMetrics | None = None
     client_time_ms: int | None = None
@@ -343,9 +343,9 @@ class DryRunResult(BaseModel):
 class ErrorResponse(BaseModel):
     model_config = _SNAKE_CASE_CONFIG
 
-    error: str | None = Field(None, description="Error code string")
-    message: str | None = None
-    request_id: str | None = None
+    error: str = Field(..., description="Error code string")
+    message: str
+    request_id: str
     details: dict[str, Any] | None = None
 
     @property
