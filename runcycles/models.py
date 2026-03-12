@@ -96,7 +96,7 @@ class Amount(BaseModel):
     model_config = _SNAKE_CASE_CONFIG
 
     unit: Unit
-    amount: int
+    amount: int = Field(ge=0)
 
 
 class SignedAmount(BaseModel):
@@ -139,10 +139,10 @@ class Caps(BaseModel):
     cooldown_ms: int | None = None
 
     def is_tool_allowed(self, tool: str) -> bool:
-        if self.tool_denylist and tool in self.tool_denylist:
-            return False
         if self.tool_allowlist is not None:
             return tool in self.tool_allowlist
+        if self.tool_denylist and tool in self.tool_denylist:
+            return False
         return True
 
 
@@ -335,6 +335,9 @@ class DryRunResult(BaseModel):
 
     def is_allowed(self) -> bool:
         return self.decision in (Decision.ALLOW, Decision.ALLOW_WITH_CAPS)
+
+    def is_denied(self) -> bool:
+        return self.decision == Decision.DENY
 
     def has_caps(self) -> bool:
         return self.caps is not None

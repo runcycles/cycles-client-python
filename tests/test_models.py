@@ -1,5 +1,8 @@
 """Tests for Pydantic models."""
 
+import pytest
+from pydantic import ValidationError
+
 from runcycles.models import (
     Action,
     Amount,
@@ -10,6 +13,7 @@ from runcycles.models import (
     CyclesMetrics,
     Decision,
     DecisionRequest,
+    DryRunResult,
     ErrorCode,
     ErrorResponse,
     EventCreateRequest,
@@ -183,3 +187,48 @@ class TestErrorCode:
         assert ErrorCode.from_string("BUDGET_EXCEEDED") == ErrorCode.BUDGET_EXCEEDED
         assert ErrorCode.from_string("NONSENSE") == ErrorCode.UNKNOWN
         assert ErrorCode.from_string(None) is None
+
+
+class TestAmountValidation:
+    def test_rejects_negative_amount(self) -> None:
+        with pytest.raises(ValidationError):
+            Amount(unit=Unit.USD_MICROCENTS, amount=-1)
+
+    def test_allows_zero_amount(self) -> None:
+        a = Amount(unit=Unit.USD_MICROCENTS, amount=0)
+        assert a.amount == 0
+
+    def test_signed_amount_allows_negative(self) -> None:
+        s = SignedAmount(unit=Unit.USD_MICROCENTS, amount=-500)
+        assert s.amount == -500
+
+
+class TestCapsToolPrecedence:
+    def test_allowlist_takes_precedence_over_denylist(self) -> None:
+        """Spec: If tool_allowlist is non-empty, ONLY those tools are allowed (denylist ignored)."""
+        c = Caps(tool_allowlist=["search", "calc"], tool_denylist=["search"])
+        # search is on both lists — allowlist takes precedence
+        assert c.is_tool_allowed("search")
+        assert not c.is_tool_allowed("code_exec")
+
+    def test_empty_allowlist_blocks_all(self) -> None:
+        """Empty allowlist means no tools are allowed."""
+        c = Caps(tool_allowlist=[])
+        assert not c.is_tool_allowed("anything")
+
+
+class TestDryRunResult:
+    def test_is_allowed(self) -> None:
+        r = DryRunResult(decision=Decision.ALLOW)
+        assert r.is_allowed()
+        assert not r.is_denied()
+
+    def test_is_denied(self) -> None:
+        r = DryRunResult(decision=Decision.DENY, reason_code="BUDGET_EXCEEDED")
+        assert r.is_denied()
+        assert not r.is_allowed()
+
+    def test_has_caps(self) -> None:
+        r = DryRunResult(decision=Decision.ALLOW_WITH_CAPS, caps=Caps(max_tokens=100))
+        assert r.has_caps()
+        assert r.is_allowed()

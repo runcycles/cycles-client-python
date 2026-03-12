@@ -66,7 +66,7 @@ class CommitRetryEngine:
                 if response.is_success:
                     logger.info("Commit retry succeeded: reservation_id=%s, attempt=%d", pending.reservation_id, pending.attempt)
                     return
-                elif response.is_client_error and not response.is_server_error:
+                elif response.is_client_error:
                     logger.warning(
                         "Commit retry got non-retryable error: reservation_id=%s, status=%d",
                         pending.reservation_id, response.status,
@@ -130,7 +130,7 @@ class AsyncCommitRetryEngine:
                 if response.is_success:
                     logger.info("Async commit retry succeeded: reservation_id=%s, attempt=%d", pending.reservation_id, pending.attempt)
                     return
-                elif response.is_client_error and not response.is_server_error:
+                elif response.is_client_error:
                     logger.warning(
                         "Async commit retry got non-retryable error: reservation_id=%s, status=%d",
                         pending.reservation_id, response.status,

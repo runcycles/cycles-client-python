@@ -34,6 +34,7 @@ from runcycles.models import (
 )
 from runcycles.response import CyclesResponse
 from runcycles.retry import AsyncCommitRetryEngine, CommitRetryEngine
+from runcycles._validation import validate_positive, validate_subject, validate_ttl_ms
 
 logger = logging.getLogger(__name__)
 
@@ -87,6 +88,9 @@ def _evaluate_actual(
 
 def _build_reservation_body(cfg: DecoratorConfig, estimate: int, default_subject_fields: dict[str, str | None]) -> dict[str, Any]:
     """Build the reservation create request body."""
+    validate_positive(estimate, "estimate")
+    validate_ttl_ms(cfg.ttl_ms)
+
     subject: dict[str, Any] = {}
     for field_name in ("tenant", "workspace", "app", "workflow", "agent", "toolset"):
         val = getattr(cfg, field_name, None) or default_subject_fields.get(field_name)
@@ -95,21 +99,25 @@ def _build_reservation_body(cfg: DecoratorConfig, estimate: int, default_subject
     if cfg.dimensions:
         subject["dimensions"] = cfg.dimensions
 
+    subject_model = Subject(**subject)
+    validate_subject(subject_model)
+
+    action: dict[str, Any] = {
+        "kind": cfg.action_kind or "unknown",
+        "name": cfg.action_name or "unknown",
+    }
+    if cfg.action_tags:
+        action["tags"] = cfg.action_tags
+
     body: dict[str, Any] = {
         "idempotency_key": str(uuid.uuid4()),
         "subject": subject,
-        "action": {},
+        "action": action,
         "estimate": {"unit": cfg.unit, "amount": estimate},
         "ttl_ms": cfg.ttl_ms,
         "overage_policy": cfg.overage_policy,
     }
 
-    if cfg.action_kind:
-        body["action"]["kind"] = cfg.action_kind
-    if cfg.action_name:
-        body["action"]["name"] = cfg.action_name
-    if cfg.action_tags:
-        body["action"]["tags"] = cfg.action_tags
     if cfg.grace_period_ms is not None:
         body["grace_period_ms"] = cfg.grace_period_ms
     if cfg.dry_run:
@@ -146,10 +154,13 @@ def _build_protocol_exception(prefix: str, response: CyclesResponse) -> CyclesPr
     request_id = None
     retry_after_ms = None
 
+    details = None
+
     if error_resp:
         ec = error_resp.error_code
         error_code = ec.value if ec else None
         request_id = error_resp.request_id
+        details = error_resp.details
         if error_resp.message:
             message = f"{prefix}: {error_resp.message}"
     else:
@@ -188,6 +199,7 @@ def _build_protocol_exception(prefix: str, response: CyclesResponse) -> CyclesPr
         reason_code=reason_code,
         retry_after_ms=retry_after_ms,
         request_id=request_id,
+        details=details,
     )
 
 
@@ -327,6 +339,8 @@ class CyclesLifecycle:
                     error_code = error_resp.error_code.value
                 if error_code in ("RESERVATION_FINALIZED", "RESERVATION_EXPIRED"):
                     logger.warning("Reservation already finalized/expired: id=%s", reservation_id)
+                elif error_code == "IDEMPOTENCY_MISMATCH":
+                    logger.warning("Commit idempotency mismatch (not releasing): id=%s", reservation_id)
                 elif response.is_client_error:
                     self._handle_release(reservation_id, f"commit_rejected_{error_code}")
                 else:
@@ -492,6 +506,8 @@ class AsyncCyclesLifecycle:
                     error_code = error_resp.error_code.value
                 if error_code in ("RESERVATION_FINALIZED", "RESERVATION_EXPIRED"):
                     logger.warning("Reservation already finalized/expired: id=%s", reservation_id)
+                elif error_code == "IDEMPOTENCY_MISMATCH":
+                    logger.warning("Commit idempotency mismatch (not releasing): id=%s", reservation_id)
                 elif response.is_client_error:
                     await self._handle_release(reservation_id, f"commit_rejected_{error_code}")
         except Exception:
