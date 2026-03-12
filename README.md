@@ -115,6 +115,9 @@ CyclesConfig(
     tenant="acme",
     workspace="prod",
     app="chat",
+    workflow="refund-flow",
+    agent="planner",
+    toolset="search-tools",
     connect_timeout=2.0,
     read_timeout=5.0,
     retry_enabled=True,
@@ -257,7 +260,7 @@ def shadow_func() -> str:
     return "result"
 ```
 
-In dry-run mode, the server evaluates the reservation and returns a decision, but no budget is held or consumed.
+In dry-run mode, the server evaluates the reservation and returns a decision, but no budget is held or consumed. The decorated function does not execute — a `DryRunResult` is returned instead.
 
 ## Overage policies
 
