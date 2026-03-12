@@ -139,7 +139,7 @@ def cycles(
     )
 
     def decorator(fn: F) -> F:
-        is_async = asyncio.iscoroutinefunction(fn)
+        is_async = inspect.iscoroutinefunction(fn)
 
         if is_async:
 
