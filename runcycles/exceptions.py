@@ -64,6 +64,10 @@ class OverdraftLimitExceededError(CyclesProtocolError):
     """Raised when debt exceeds the overdraft limit."""
 
 
+class DebtOutstandingError(CyclesProtocolError):
+    """Raised when outstanding debt blocks new reservations."""
+
+
 class ReservationExpiredError(CyclesProtocolError):
     """Raised when operating on an expired reservation."""
 

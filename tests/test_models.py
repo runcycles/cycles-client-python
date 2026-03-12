@@ -168,7 +168,7 @@ class TestErrorResponse:
         assert e.message == "Insufficient budget"
 
     def test_unknown_error(self) -> None:
-        data = {"error": "SOME_FUTURE_ERROR", "message": "Something new"}
+        data = {"error": "SOME_FUTURE_ERROR", "message": "Something new", "request_id": "req-456"}
         e = ErrorResponse.model_validate(data)
         assert e.error_code == ErrorCode.UNKNOWN
 
