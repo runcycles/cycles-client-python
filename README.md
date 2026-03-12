@@ -1,4 +1,4 @@
-# Cyclet Python Client
+# Cycles Python Client
 
 Python client for the [Cycles](https://runcycles.io) budget-management protocol.
 
