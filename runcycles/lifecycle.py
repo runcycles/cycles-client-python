@@ -511,6 +511,8 @@ class AsyncCyclesLifecycle:
                     logger.warning("Commit idempotency mismatch (not releasing): id=%s", reservation_id)
                 elif response.is_client_error:
                     await self._handle_release(reservation_id, f"commit_rejected_{error_code}")
+                else:
+                    logger.warning("Unrecognized commit response: id=%s, response=%s", reservation_id, response)
         except Exception:
             logger.exception("Failed to commit: id=%s", reservation_id)
             self._retry_engine.schedule(reservation_id, commit_body)
