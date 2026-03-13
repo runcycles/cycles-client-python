@@ -188,3 +188,28 @@ class TestAsyncCommitRetryEngine:
         engine.schedule("rsv_1", {"idempotency_key": "k1"})
         # Let the scheduled task actually run
         await asyncio.sleep(0.1)
+
+
+class TestCommitRetryEngineSchedule:
+    def test_schedule_creates_thread(self, config: CyclesConfig) -> None:
+        engine = CommitRetryEngine(config)
+        mock_client = MagicMock()
+        # Return success immediately so the thread finishes quickly
+        mock_client.commit_reservation.return_value = CyclesResponse.success(200, {"status": "COMMITTED"})
+        engine.set_client(mock_client)
+
+        engine.schedule("rsv_1", {"idempotency_key": "k1"})
+        # Give the thread time to run
+        import time
+        time.sleep(0.1)
+        assert mock_client.commit_reservation.call_count >= 1
+
+
+class TestAsyncCommitRetryEngineScheduleNoLoop:
+    def test_schedule_without_event_loop(self, config: CyclesConfig) -> None:
+        """Schedule outside an event loop should log error, not crash."""
+        engine = AsyncCommitRetryEngine(config)
+        mock_client = MagicMock()
+        engine.set_client(mock_client)
+        # This should not raise even without an event loop
+        engine.schedule("rsv_1", {"idempotency_key": "k1"})
