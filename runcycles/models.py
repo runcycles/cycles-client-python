@@ -251,7 +251,7 @@ class EventCreateRequest(BaseModel):
 # --- Response result models ---
 
 
-class ReservationResult(BaseModel):
+class ReservationCreateResponse(BaseModel):
     model_config = _SNAKE_CASE_CONFIG
 
     decision: Decision
@@ -272,7 +272,7 @@ class ReservationResult(BaseModel):
         return self.decision == Decision.DENY
 
 
-class CommitResult(BaseModel):
+class CommitResponse(BaseModel):
     model_config = _SNAKE_CASE_CONFIG
 
     status: CommitStatus
@@ -281,7 +281,7 @@ class CommitResult(BaseModel):
     balances: list[Balance] | None = None
 
 
-class ReleaseResult(BaseModel):
+class ReleaseResponse(BaseModel):
     model_config = _SNAKE_CASE_CONFIG
 
     status: ReleaseStatus
@@ -289,7 +289,7 @@ class ReleaseResult(BaseModel):
     balances: list[Balance] | None = None
 
 
-class ExtendResult(BaseModel):
+class ReservationExtendResponse(BaseModel):
     model_config = _SNAKE_CASE_CONFIG
 
     status: ExtendStatus
@@ -297,7 +297,7 @@ class ExtendResult(BaseModel):
     balances: list[Balance] | None = None
 
 
-class DecisionResult(BaseModel):
+class DecisionResponse(BaseModel):
     model_config = _SNAKE_CASE_CONFIG
 
     decision: Decision
@@ -313,7 +313,7 @@ class DecisionResult(BaseModel):
         return self.decision == Decision.DENY
 
 
-class EventResult(BaseModel):
+class EventCreateResponse(BaseModel):
     model_config = _SNAKE_CASE_CONFIG
 
     status: EventStatus
@@ -356,7 +356,7 @@ class ErrorResponse(BaseModel):
         return ErrorCode.from_string(self.error)
 
 
-class ReservationDetailResult(BaseModel):
+class ReservationDetail(BaseModel):
     model_config = _SNAKE_CASE_CONFIG
 
     reservation_id: str
@@ -386,7 +386,7 @@ class ReservationDetailResult(BaseModel):
         return self.status == ReservationStatus.EXPIRED
 
 
-class ReservationSummaryResult(BaseModel):
+class ReservationSummary(BaseModel):
     model_config = _SNAKE_CASE_CONFIG
 
     reservation_id: str
@@ -401,15 +401,15 @@ class ReservationSummaryResult(BaseModel):
     idempotency_key: str | None = None
 
 
-class ReservationListResult(BaseModel):
+class ReservationListResponse(BaseModel):
     model_config = _SNAKE_CASE_CONFIG
 
-    reservations: list[ReservationSummaryResult]
+    reservations: list[ReservationSummary]
     has_more: bool | None = None
     next_cursor: str | None = None
 
 
-class BalanceQueryResult(BaseModel):
+class BalanceResponse(BaseModel):
     model_config = _SNAKE_CASE_CONFIG
 
     balances: list[Balance]
