@@ -28,7 +28,7 @@ from runcycles.models import (
     Decision,
     DryRunResult,
     ErrorCode,
-    ReservationResult,
+    ReservationCreateResponse,
     Subject,
     Unit,
 )
@@ -235,7 +235,7 @@ class CyclesLifecycle:
             logger.error("Reservation failed: response=%s", res_response)
             raise _build_protocol_exception("Failed to create reservation", res_response)
 
-        res_result = ReservationResult.model_validate(res_response.body)
+        res_result = ReservationCreateResponse.model_validate(res_response.body)
         res_t2 = time.monotonic()
 
         decision = res_result.decision
@@ -412,7 +412,7 @@ class AsyncCyclesLifecycle:
         if not res_response.is_success:
             raise _build_protocol_exception("Failed to create reservation", res_response)
 
-        res_result = ReservationResult.model_validate(res_response.body)
+        res_result = ReservationCreateResponse.model_validate(res_response.body)
         res_t2 = time.monotonic()
 
         decision = res_result.decision
