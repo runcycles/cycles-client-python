@@ -173,9 +173,9 @@ class CyclesMetrics(BaseModel):
 class Balance(BaseModel):
     model_config = _SNAKE_CASE_CONFIG
 
-    scope: str | None = None
-    scope_path: str | None = None
-    remaining: SignedAmount | None = None
+    scope: str
+    scope_path: str
+    remaining: SignedAmount
     reserved: Amount | None = None
     spent: Amount | None = None
     allocated: Amount | None = None
@@ -254,9 +254,9 @@ class EventCreateRequest(BaseModel):
 class ReservationResult(BaseModel):
     model_config = _SNAKE_CASE_CONFIG
 
-    decision: Decision | None = None
+    decision: Decision
     reservation_id: str | None = None
-    affected_scopes: list[str] | None = None
+    affected_scopes: list[str]
     expires_at_ms: int | None = None
     scope_path: str | None = None
     reserved: Amount | None = None
@@ -275,8 +275,8 @@ class ReservationResult(BaseModel):
 class CommitResult(BaseModel):
     model_config = _SNAKE_CASE_CONFIG
 
-    status: CommitStatus | None = None
-    charged: Amount | None = None
+    status: CommitStatus
+    charged: Amount
     released: Amount | None = None
     balances: list[Balance] | None = None
 
@@ -284,23 +284,23 @@ class CommitResult(BaseModel):
 class ReleaseResult(BaseModel):
     model_config = _SNAKE_CASE_CONFIG
 
-    status: ReleaseStatus | None = None
-    released: Amount | None = None
+    status: ReleaseStatus
+    released: Amount
     balances: list[Balance] | None = None
 
 
 class ExtendResult(BaseModel):
     model_config = _SNAKE_CASE_CONFIG
 
-    status: ExtendStatus | None = None
-    expires_at_ms: int | None = None
+    status: ExtendStatus
+    expires_at_ms: int
     balances: list[Balance] | None = None
 
 
 class DecisionResult(BaseModel):
     model_config = _SNAKE_CASE_CONFIG
 
-    decision: Decision | None = None
+    decision: Decision
     caps: Caps | None = None
     reason_code: str | None = None
     retry_after_ms: int | None = None
@@ -316,15 +316,15 @@ class DecisionResult(BaseModel):
 class EventResult(BaseModel):
     model_config = _SNAKE_CASE_CONFIG
 
-    status: EventStatus | None = None
-    event_id: str | None = None
+    status: EventStatus
+    event_id: str
     balances: list[Balance] | None = None
 
 
 class DryRunResult(BaseModel):
     model_config = _SNAKE_CASE_CONFIG
 
-    decision: Decision | None = None
+    decision: Decision
     caps: Caps | None = None
     affected_scopes: list[str] | None = None
     scope_path: str | None = None

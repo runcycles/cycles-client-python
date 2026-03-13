@@ -34,7 +34,7 @@ from runcycles.models import (
 )
 from runcycles.response import CyclesResponse
 from runcycles.retry import AsyncCommitRetryEngine, CommitRetryEngine
-from runcycles._validation import validate_grace_period_ms, validate_positive, validate_subject, validate_ttl_ms
+from runcycles._validation import validate_grace_period_ms, validate_non_negative, validate_subject, validate_ttl_ms
 
 logger = logging.getLogger(__name__)
 
@@ -88,7 +88,7 @@ def _evaluate_actual(
 
 def _build_reservation_body(cfg: DecoratorConfig, estimate: int, default_subject_fields: dict[str, str | None]) -> dict[str, Any]:
     """Build the reservation create request body."""
-    validate_positive(estimate, "estimate")
+    validate_non_negative(estimate, "estimate")
     validate_ttl_ms(cfg.ttl_ms)
 
     subject: dict[str, Any] = {}
@@ -241,9 +241,6 @@ class CyclesLifecycle:
         decision = res_result.decision
         reservation_id = res_result.reservation_id
         reason_code = res_result.reason_code
-
-        if decision is None:
-            raise CyclesProtocolError("Unrecognized decision value from server", status=res_response.status, error_code="INTERNAL_ERROR")
 
         # Handle dry-run
         if cfg.dry_run:
@@ -421,9 +418,6 @@ class AsyncCyclesLifecycle:
         decision = res_result.decision
         reservation_id = res_result.reservation_id
         reason_code = res_result.reason_code
-
-        if decision is None:
-            raise CyclesProtocolError("Unrecognized decision value from server", status=res_response.status, error_code="INTERNAL_ERROR")
 
         if cfg.dry_run:
             elapsed_ms = int((res_t2 - res_t1) * 1000)

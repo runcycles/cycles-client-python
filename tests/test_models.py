@@ -146,7 +146,7 @@ class TestReservationResult:
         assert r.reserved.amount == 500000
 
     def test_deny(self) -> None:
-        data = {"decision": "DENY", "reason_code": "BUDGET_EXCEEDED"}
+        data = {"decision": "DENY", "reason_code": "BUDGET_EXCEEDED", "affected_scopes": ["tenant:acme"]}
         r = ReservationResult.model_validate(data)
         assert r.is_denied()
         assert not r.is_allowed()
@@ -155,6 +155,7 @@ class TestReservationResult:
         data = {
             "decision": "ALLOW_WITH_CAPS",
             "reservation_id": "res_123",
+            "affected_scopes": ["tenant:acme"],
             "caps": {"max_tokens": 500, "tool_denylist": ["code_exec"]},
         }
         r = ReservationResult.model_validate(data)
@@ -272,6 +273,58 @@ class TestDecisionResult:
     def test_allow_with_caps(self) -> None:
         r = DecisionResult(decision=Decision.ALLOW_WITH_CAPS, caps=Caps(max_tokens=500))
         assert r.is_allowed()
+
+
+class TestRequiredFields:
+    """Validate spec-mandated required fields are enforced."""
+
+    def test_reservation_result_requires_decision(self) -> None:
+        with pytest.raises(ValidationError):
+            ReservationResult.model_validate({"affected_scopes": ["tenant:acme"]})
+
+    def test_reservation_result_requires_affected_scopes(self) -> None:
+        with pytest.raises(ValidationError):
+            ReservationResult.model_validate({"decision": "ALLOW"})
+
+    def test_commit_result_requires_status_and_charged(self) -> None:
+        from runcycles.models import CommitResult
+        with pytest.raises(ValidationError):
+            CommitResult.model_validate({"status": "COMMITTED"})
+        with pytest.raises(ValidationError):
+            CommitResult.model_validate({"charged": {"unit": "USD_MICROCENTS", "amount": 100}})
+
+    def test_release_result_requires_status_and_released(self) -> None:
+        from runcycles.models import ReleaseResult
+        with pytest.raises(ValidationError):
+            ReleaseResult.model_validate({"status": "RELEASED"})
+        with pytest.raises(ValidationError):
+            ReleaseResult.model_validate({"released": {"unit": "USD_MICROCENTS", "amount": 100}})
+
+    def test_extend_result_requires_status_and_expires(self) -> None:
+        from runcycles.models import ExtendResult
+        with pytest.raises(ValidationError):
+            ExtendResult.model_validate({"status": "ACTIVE"})
+        with pytest.raises(ValidationError):
+            ExtendResult.model_validate({"expires_at_ms": 9999999999})
+
+    def test_event_result_requires_status_and_event_id(self) -> None:
+        from runcycles.models import EventResult
+        with pytest.raises(ValidationError):
+            EventResult.model_validate({"status": "APPLIED"})
+        with pytest.raises(ValidationError):
+            EventResult.model_validate({"event_id": "evt_123"})
+
+    def test_balance_requires_scope_scope_path_remaining(self) -> None:
+        with pytest.raises(ValidationError):
+            Balance.model_validate({"scope_path": "/", "remaining": {"unit": "USD_MICROCENTS", "amount": 100}})
+        with pytest.raises(ValidationError):
+            Balance.model_validate({"scope": "tenant:acme", "remaining": {"unit": "USD_MICROCENTS", "amount": 100}})
+        with pytest.raises(ValidationError):
+            Balance.model_validate({"scope": "tenant:acme", "scope_path": "/"})
+
+    def test_decision_result_requires_decision(self) -> None:
+        with pytest.raises(ValidationError):
+            DecisionResult.model_validate({})
 
 
 class TestFieldConstraints:

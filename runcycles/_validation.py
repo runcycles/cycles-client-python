@@ -17,10 +17,10 @@ def validate_reservation_id(reservation_id: str | None) -> None:
         raise ValueError("reservation_id is required and must be non-empty")
 
 
-def validate_positive(value: int, name: str) -> None:
-    """Validate that a value is positive."""
-    if value <= 0:
-        raise ValueError(f"{name} must be positive, got {value}")
+def validate_non_negative(value: int, name: str) -> None:
+    """Validate that a value is non-negative (>= 0), per spec Amount minimum: 0."""
+    if value < 0:
+        raise ValueError(f"{name} must be non-negative, got {value}")
 
 
 def validate_ttl_ms(ttl_ms: int) -> None:
