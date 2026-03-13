@@ -238,24 +238,39 @@ class TestDryRunResult:
         assert r.is_allowed()
 
 
+def _make_detail(status: ReservationStatus) -> ReservationDetailResult:
+    """Helper to build a ReservationDetailResult with all required fields."""
+    return ReservationDetailResult(
+        reservation_id="rsv_1",
+        status=status,
+        subject=Subject(tenant="acme"),
+        action=Action(kind="test", name="test"),
+        reserved=Amount(unit=Unit.USD_MICROCENTS, amount=100),
+        created_at_ms=1000000,
+        expires_at_ms=2000000,
+        scope_path="tenant:acme",
+        affected_scopes=["tenant:acme"],
+    )
+
+
 class TestReservationDetailResult:
     def test_is_active(self) -> None:
-        r = ReservationDetailResult(reservation_id="rsv_1", status=ReservationStatus.ACTIVE)
+        r = _make_detail(ReservationStatus.ACTIVE)
         assert r.is_active()
         assert not r.is_committed()
         assert not r.is_released()
         assert not r.is_expired()
 
     def test_is_committed(self) -> None:
-        r = ReservationDetailResult(reservation_id="rsv_1", status=ReservationStatus.COMMITTED)
+        r = _make_detail(ReservationStatus.COMMITTED)
         assert r.is_committed()
 
     def test_is_released(self) -> None:
-        r = ReservationDetailResult(reservation_id="rsv_1", status=ReservationStatus.RELEASED)
+        r = _make_detail(ReservationStatus.RELEASED)
         assert r.is_released()
 
     def test_is_expired(self) -> None:
-        r = ReservationDetailResult(reservation_id="rsv_1", status=ReservationStatus.EXPIRED)
+        r = _make_detail(ReservationStatus.EXPIRED)
         assert r.is_expired()
 
 
@@ -390,3 +405,48 @@ class TestFieldConstraints:
     def test_metrics_model_version_max_length(self) -> None:
         with pytest.raises(ValidationError):
             CyclesMetrics(model_version="x" * 129)
+
+    def test_idempotency_key_min_length(self) -> None:
+        with pytest.raises(ValidationError):
+            ReservationCreateRequest(
+                idempotency_key="",
+                subject=Subject(tenant="acme"),
+                action=Action(kind="test", name="test"),
+                estimate=Amount(unit=Unit.USD_MICROCENTS, amount=100),
+            )
+
+    def test_idempotency_key_max_length(self) -> None:
+        with pytest.raises(ValidationError):
+            ReservationCreateRequest(
+                idempotency_key="x" * 257,
+                subject=Subject(tenant="acme"),
+                action=Action(kind="test", name="test"),
+                estimate=Amount(unit=Unit.USD_MICROCENTS, amount=100),
+            )
+
+    def test_extend_by_ms_min(self) -> None:
+        with pytest.raises(ValidationError):
+            ReservationExtendRequest(idempotency_key="key-1", extend_by_ms=0)
+
+    def test_extend_by_ms_max(self) -> None:
+        with pytest.raises(ValidationError):
+            ReservationExtendRequest(idempotency_key="key-1", extend_by_ms=86_400_001)
+
+    def test_release_reason_max_length(self) -> None:
+        with pytest.raises(ValidationError):
+            ReleaseRequest(idempotency_key="key-1", reason="x" * 257)
+
+    def test_reservation_detail_requires_all_spec_fields(self) -> None:
+        """ReservationDetail spec requires many fields."""
+        with pytest.raises(ValidationError):
+            ReservationDetailResult(reservation_id="rsv_1", status=ReservationStatus.ACTIVE)
+
+    def test_reservation_list_requires_reservations(self) -> None:
+        from runcycles.models import ReservationListResult
+        with pytest.raises(ValidationError):
+            ReservationListResult.model_validate({})
+
+    def test_balance_query_requires_balances(self) -> None:
+        from runcycles.models import BalanceQueryResult
+        with pytest.raises(ValidationError):
+            BalanceQueryResult.model_validate({})
