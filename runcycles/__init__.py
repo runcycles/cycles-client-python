@@ -112,4 +112,6 @@ __all__ = [
     "BalanceResponse",
 ]
 
-__version__ = "0.1.1"
+from importlib.metadata import version as _metadata_version
+
+__version__ = _metadata_version("runcycles")
