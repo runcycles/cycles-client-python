@@ -190,7 +190,7 @@ class Balance(BaseModel):
 class ReservationCreateRequest(BaseModel):
     model_config = _SNAKE_CASE_CONFIG
 
-    idempotency_key: str
+    idempotency_key: str = Field(min_length=1, max_length=256)
     subject: Subject
     action: Action
     estimate: Amount
@@ -204,7 +204,7 @@ class ReservationCreateRequest(BaseModel):
 class CommitRequest(BaseModel):
     model_config = _SNAKE_CASE_CONFIG
 
-    idempotency_key: str
+    idempotency_key: str = Field(min_length=1, max_length=256)
     actual: Amount
     metrics: CyclesMetrics | None = None
     metadata: dict[str, Any] | None = None
@@ -213,22 +213,22 @@ class CommitRequest(BaseModel):
 class ReleaseRequest(BaseModel):
     model_config = _SNAKE_CASE_CONFIG
 
-    idempotency_key: str
-    reason: str | None = None
+    idempotency_key: str = Field(min_length=1, max_length=256)
+    reason: Annotated[str, Field(max_length=256)] | None = None
 
 
 class ReservationExtendRequest(BaseModel):
     model_config = _SNAKE_CASE_CONFIG
 
-    idempotency_key: str
-    extend_by_ms: int
+    idempotency_key: str = Field(min_length=1, max_length=256)
+    extend_by_ms: int = Field(ge=1, le=86_400_000)
     metadata: dict[str, Any] | None = None
 
 
 class DecisionRequest(BaseModel):
     model_config = _SNAKE_CASE_CONFIG
 
-    idempotency_key: str
+    idempotency_key: str = Field(min_length=1, max_length=256)
     subject: Subject
     action: Action
     estimate: Amount
@@ -238,7 +238,7 @@ class DecisionRequest(BaseModel):
 class EventCreateRequest(BaseModel):
     model_config = _SNAKE_CASE_CONFIG
 
-    idempotency_key: str
+    idempotency_key: str = Field(min_length=1, max_length=256)
     subject: Subject
     action: Action
     actual: Amount
@@ -251,7 +251,7 @@ class EventCreateRequest(BaseModel):
 # --- Response result models ---
 
 
-class ReservationResult(BaseModel):
+class ReservationCreateResponse(BaseModel):
     model_config = _SNAKE_CASE_CONFIG
 
     decision: Decision
@@ -272,7 +272,7 @@ class ReservationResult(BaseModel):
         return self.decision == Decision.DENY
 
 
-class CommitResult(BaseModel):
+class CommitResponse(BaseModel):
     model_config = _SNAKE_CASE_CONFIG
 
     status: CommitStatus
@@ -281,7 +281,7 @@ class CommitResult(BaseModel):
     balances: list[Balance] | None = None
 
 
-class ReleaseResult(BaseModel):
+class ReleaseResponse(BaseModel):
     model_config = _SNAKE_CASE_CONFIG
 
     status: ReleaseStatus
@@ -289,7 +289,7 @@ class ReleaseResult(BaseModel):
     balances: list[Balance] | None = None
 
 
-class ExtendResult(BaseModel):
+class ReservationExtendResponse(BaseModel):
     model_config = _SNAKE_CASE_CONFIG
 
     status: ExtendStatus
@@ -297,7 +297,7 @@ class ExtendResult(BaseModel):
     balances: list[Balance] | None = None
 
 
-class DecisionResult(BaseModel):
+class DecisionResponse(BaseModel):
     model_config = _SNAKE_CASE_CONFIG
 
     decision: Decision
@@ -313,7 +313,7 @@ class DecisionResult(BaseModel):
         return self.decision == Decision.DENY
 
 
-class EventResult(BaseModel):
+class EventCreateResponse(BaseModel):
     model_config = _SNAKE_CASE_CONFIG
 
     status: EventStatus
@@ -356,21 +356,21 @@ class ErrorResponse(BaseModel):
         return ErrorCode.from_string(self.error)
 
 
-class ReservationDetailResult(BaseModel):
+class ReservationDetail(BaseModel):
     model_config = _SNAKE_CASE_CONFIG
 
-    reservation_id: str | None = None
-    status: ReservationStatus | None = None
+    reservation_id: str
+    status: ReservationStatus
+    subject: Subject
+    action: Action
+    reserved: Amount
+    created_at_ms: int
+    expires_at_ms: int
+    scope_path: str
+    affected_scopes: list[str]
     idempotency_key: str | None = None
-    subject: Subject | None = None
-    action: Action | None = None
-    reserved: Amount | None = None
     committed: Amount | None = None
-    created_at_ms: int | None = None
-    expires_at_ms: int | None = None
     finalized_at_ms: int | None = None
-    scope_path: str | None = None
-    affected_scopes: list[str] | None = None
     metadata: dict[str, Any] | None = None
 
     def is_active(self) -> bool:
@@ -386,32 +386,32 @@ class ReservationDetailResult(BaseModel):
         return self.status == ReservationStatus.EXPIRED
 
 
-class ReservationSummaryResult(BaseModel):
+class ReservationSummary(BaseModel):
     model_config = _SNAKE_CASE_CONFIG
 
-    reservation_id: str | None = None
-    status: ReservationStatus | None = None
+    reservation_id: str
+    status: ReservationStatus
+    subject: Subject
+    action: Action
+    reserved: Amount
+    created_at_ms: int
+    expires_at_ms: int
+    scope_path: str
+    affected_scopes: list[str]
     idempotency_key: str | None = None
-    subject: Subject | None = None
-    action: Action | None = None
-    reserved: Amount | None = None
-    created_at_ms: int | None = None
-    expires_at_ms: int | None = None
-    scope_path: str | None = None
-    affected_scopes: list[str] | None = None
 
 
-class ReservationListResult(BaseModel):
+class ReservationListResponse(BaseModel):
     model_config = _SNAKE_CASE_CONFIG
 
-    reservations: list[ReservationSummaryResult] | None = None
+    reservations: list[ReservationSummary]
     has_more: bool | None = None
     next_cursor: str | None = None
 
 
-class BalanceQueryResult(BaseModel):
+class BalanceResponse(BaseModel):
     model_config = _SNAKE_CASE_CONFIG
 
-    balances: list[Balance] | None = None
+    balances: list[Balance]
     has_more: bool | None = None
     next_cursor: str | None = None

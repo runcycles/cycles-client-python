@@ -13,15 +13,15 @@ from runcycles.models import (
     CyclesMetrics,
     Decision,
     DecisionRequest,
-    DecisionResult,
+    DecisionResponse,
     DryRunResult,
     ErrorCode,
     ErrorResponse,
     EventCreateRequest,
     ReservationCreateRequest,
-    ReservationDetailResult,
+    ReservationDetail,
     ReservationExtendRequest,
-    ReservationResult,
+    ReservationCreateResponse,
     ReservationStatus,
     ReleaseRequest,
     SignedAmount,
@@ -124,7 +124,7 @@ class TestCommitRequest:
         assert d["metrics"]["tokens_input"] == 100
 
 
-class TestReservationResult:
+class TestReservationCreateResponse:
     def test_from_server_response(self) -> None:
         data = {
             "decision": "ALLOW",
@@ -137,7 +137,7 @@ class TestReservationResult:
             "reason_code": None,
             "retry_after_ms": None,
         }
-        r = ReservationResult.model_validate(data)
+        r = ReservationCreateResponse.model_validate(data)
         assert r.decision == Decision.ALLOW
         assert r.reservation_id == "res_abc-123"
         assert r.is_allowed()
@@ -147,7 +147,7 @@ class TestReservationResult:
 
     def test_deny(self) -> None:
         data = {"decision": "DENY", "reason_code": "BUDGET_EXCEEDED", "affected_scopes": ["tenant:acme"]}
-        r = ReservationResult.model_validate(data)
+        r = ReservationCreateResponse.model_validate(data)
         assert r.is_denied()
         assert not r.is_allowed()
 
@@ -158,7 +158,7 @@ class TestReservationResult:
             "affected_scopes": ["tenant:acme"],
             "caps": {"max_tokens": 500, "tool_denylist": ["code_exec"]},
         }
-        r = ReservationResult.model_validate(data)
+        r = ReservationCreateResponse.model_validate(data)
         assert r.decision == Decision.ALLOW_WITH_CAPS
         assert r.caps is not None
         assert r.caps.max_tokens == 500
@@ -238,40 +238,55 @@ class TestDryRunResult:
         assert r.is_allowed()
 
 
-class TestReservationDetailResult:
+def _make_detail(status: ReservationStatus) -> ReservationDetail:
+    """Helper to build a ReservationDetail with all required fields."""
+    return ReservationDetail(
+        reservation_id="rsv_1",
+        status=status,
+        subject=Subject(tenant="acme"),
+        action=Action(kind="test", name="test"),
+        reserved=Amount(unit=Unit.USD_MICROCENTS, amount=100),
+        created_at_ms=1000000,
+        expires_at_ms=2000000,
+        scope_path="tenant:acme",
+        affected_scopes=["tenant:acme"],
+    )
+
+
+class TestReservationDetail:
     def test_is_active(self) -> None:
-        r = ReservationDetailResult(reservation_id="rsv_1", status=ReservationStatus.ACTIVE)
+        r = _make_detail(ReservationStatus.ACTIVE)
         assert r.is_active()
         assert not r.is_committed()
         assert not r.is_released()
         assert not r.is_expired()
 
     def test_is_committed(self) -> None:
-        r = ReservationDetailResult(reservation_id="rsv_1", status=ReservationStatus.COMMITTED)
+        r = _make_detail(ReservationStatus.COMMITTED)
         assert r.is_committed()
 
     def test_is_released(self) -> None:
-        r = ReservationDetailResult(reservation_id="rsv_1", status=ReservationStatus.RELEASED)
+        r = _make_detail(ReservationStatus.RELEASED)
         assert r.is_released()
 
     def test_is_expired(self) -> None:
-        r = ReservationDetailResult(reservation_id="rsv_1", status=ReservationStatus.EXPIRED)
+        r = _make_detail(ReservationStatus.EXPIRED)
         assert r.is_expired()
 
 
-class TestDecisionResult:
+class TestDecisionResponse:
     def test_allow(self) -> None:
-        r = DecisionResult(decision=Decision.ALLOW)
+        r = DecisionResponse(decision=Decision.ALLOW)
         assert r.is_allowed()
         assert not r.is_denied()
 
     def test_deny(self) -> None:
-        r = DecisionResult(decision=Decision.DENY, reason_code="BUDGET_EXCEEDED")
+        r = DecisionResponse(decision=Decision.DENY, reason_code="BUDGET_EXCEEDED")
         assert r.is_denied()
         assert not r.is_allowed()
 
     def test_allow_with_caps(self) -> None:
-        r = DecisionResult(decision=Decision.ALLOW_WITH_CAPS, caps=Caps(max_tokens=500))
+        r = DecisionResponse(decision=Decision.ALLOW_WITH_CAPS, caps=Caps(max_tokens=500))
         assert r.is_allowed()
 
 
@@ -280,39 +295,39 @@ class TestRequiredFields:
 
     def test_reservation_result_requires_decision(self) -> None:
         with pytest.raises(ValidationError):
-            ReservationResult.model_validate({"affected_scopes": ["tenant:acme"]})
+            ReservationCreateResponse.model_validate({"affected_scopes": ["tenant:acme"]})
 
     def test_reservation_result_requires_affected_scopes(self) -> None:
         with pytest.raises(ValidationError):
-            ReservationResult.model_validate({"decision": "ALLOW"})
+            ReservationCreateResponse.model_validate({"decision": "ALLOW"})
 
     def test_commit_result_requires_status_and_charged(self) -> None:
-        from runcycles.models import CommitResult
+        from runcycles.models import CommitResponse
         with pytest.raises(ValidationError):
-            CommitResult.model_validate({"status": "COMMITTED"})
+            CommitResponse.model_validate({"status": "COMMITTED"})
         with pytest.raises(ValidationError):
-            CommitResult.model_validate({"charged": {"unit": "USD_MICROCENTS", "amount": 100}})
+            CommitResponse.model_validate({"charged": {"unit": "USD_MICROCENTS", "amount": 100}})
 
     def test_release_result_requires_status_and_released(self) -> None:
-        from runcycles.models import ReleaseResult
+        from runcycles.models import ReleaseResponse
         with pytest.raises(ValidationError):
-            ReleaseResult.model_validate({"status": "RELEASED"})
+            ReleaseResponse.model_validate({"status": "RELEASED"})
         with pytest.raises(ValidationError):
-            ReleaseResult.model_validate({"released": {"unit": "USD_MICROCENTS", "amount": 100}})
+            ReleaseResponse.model_validate({"released": {"unit": "USD_MICROCENTS", "amount": 100}})
 
     def test_extend_result_requires_status_and_expires(self) -> None:
-        from runcycles.models import ExtendResult
+        from runcycles.models import ReservationExtendResponse
         with pytest.raises(ValidationError):
-            ExtendResult.model_validate({"status": "ACTIVE"})
+            ReservationExtendResponse.model_validate({"status": "ACTIVE"})
         with pytest.raises(ValidationError):
-            ExtendResult.model_validate({"expires_at_ms": 9999999999})
+            ReservationExtendResponse.model_validate({"expires_at_ms": 9999999999})
 
     def test_event_result_requires_status_and_event_id(self) -> None:
-        from runcycles.models import EventResult
+        from runcycles.models import EventCreateResponse
         with pytest.raises(ValidationError):
-            EventResult.model_validate({"status": "APPLIED"})
+            EventCreateResponse.model_validate({"status": "APPLIED"})
         with pytest.raises(ValidationError):
-            EventResult.model_validate({"event_id": "evt_123"})
+            EventCreateResponse.model_validate({"event_id": "evt_123"})
 
     def test_balance_requires_scope_scope_path_remaining(self) -> None:
         with pytest.raises(ValidationError):
@@ -324,7 +339,7 @@ class TestRequiredFields:
 
     def test_decision_result_requires_decision(self) -> None:
         with pytest.raises(ValidationError):
-            DecisionResult.model_validate({})
+            DecisionResponse.model_validate({})
 
 
 class TestFieldConstraints:
@@ -390,3 +405,48 @@ class TestFieldConstraints:
     def test_metrics_model_version_max_length(self) -> None:
         with pytest.raises(ValidationError):
             CyclesMetrics(model_version="x" * 129)
+
+    def test_idempotency_key_min_length(self) -> None:
+        with pytest.raises(ValidationError):
+            ReservationCreateRequest(
+                idempotency_key="",
+                subject=Subject(tenant="acme"),
+                action=Action(kind="test", name="test"),
+                estimate=Amount(unit=Unit.USD_MICROCENTS, amount=100),
+            )
+
+    def test_idempotency_key_max_length(self) -> None:
+        with pytest.raises(ValidationError):
+            ReservationCreateRequest(
+                idempotency_key="x" * 257,
+                subject=Subject(tenant="acme"),
+                action=Action(kind="test", name="test"),
+                estimate=Amount(unit=Unit.USD_MICROCENTS, amount=100),
+            )
+
+    def test_extend_by_ms_min(self) -> None:
+        with pytest.raises(ValidationError):
+            ReservationExtendRequest(idempotency_key="key-1", extend_by_ms=0)
+
+    def test_extend_by_ms_max(self) -> None:
+        with pytest.raises(ValidationError):
+            ReservationExtendRequest(idempotency_key="key-1", extend_by_ms=86_400_001)
+
+    def test_release_reason_max_length(self) -> None:
+        with pytest.raises(ValidationError):
+            ReleaseRequest(idempotency_key="key-1", reason="x" * 257)
+
+    def test_reservation_detail_requires_all_spec_fields(self) -> None:
+        """ReservationDetail spec requires many fields."""
+        with pytest.raises(ValidationError):
+            ReservationDetail(reservation_id="rsv_1", status=ReservationStatus.ACTIVE)
+
+    def test_reservation_list_requires_reservations(self) -> None:
+        from runcycles.models import ReservationListResponse
+        with pytest.raises(ValidationError):
+            ReservationListResponse.model_validate({})
+
+    def test_balance_query_requires_balances(self) -> None:
+        from runcycles.models import BalanceResponse
+        with pytest.raises(ValidationError):
+            BalanceResponse.model_validate({})
