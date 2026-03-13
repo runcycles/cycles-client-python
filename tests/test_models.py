@@ -272,3 +272,68 @@ class TestDecisionResult:
     def test_allow_with_caps(self) -> None:
         r = DecisionResult(decision=Decision.ALLOW_WITH_CAPS, caps=Caps(max_tokens=500))
         assert r.is_allowed()
+
+
+class TestFieldConstraints:
+    """Validate spec-mandated field constraints are enforced."""
+
+    def test_subject_tenant_max_length(self) -> None:
+        with pytest.raises(ValidationError):
+            Subject(tenant="x" * 129)
+
+    def test_subject_tenant_at_max_length(self) -> None:
+        s = Subject(tenant="x" * 128)
+        assert len(s.tenant) == 128
+
+    def test_subject_dimensions_max_entries(self) -> None:
+        dims = {f"k{i}": "v" for i in range(17)}
+        with pytest.raises(ValidationError):
+            Subject(tenant="acme", dimensions=dims)
+
+    def test_subject_dimension_value_max_length(self) -> None:
+        with pytest.raises(ValidationError):
+            Subject(tenant="acme", dimensions={"key": "v" * 257})
+
+    def test_action_kind_max_length(self) -> None:
+        with pytest.raises(ValidationError):
+            Action(kind="x" * 65, name="ok")
+
+    def test_action_name_max_length(self) -> None:
+        with pytest.raises(ValidationError):
+            Action(kind="ok", name="x" * 257)
+
+    def test_action_tags_max_items(self) -> None:
+        with pytest.raises(ValidationError):
+            Action(kind="ok", name="ok", tags=[f"t{i}" for i in range(11)])
+
+    def test_action_tag_item_max_length(self) -> None:
+        with pytest.raises(ValidationError):
+            Action(kind="ok", name="ok", tags=["x" * 65])
+
+    def test_caps_max_tokens_non_negative(self) -> None:
+        with pytest.raises(ValidationError):
+            Caps(max_tokens=-1)
+
+    def test_caps_max_steps_non_negative(self) -> None:
+        with pytest.raises(ValidationError):
+            Caps(max_steps_remaining=-1)
+
+    def test_caps_cooldown_non_negative(self) -> None:
+        with pytest.raises(ValidationError):
+            Caps(cooldown_ms=-1)
+
+    def test_metrics_tokens_input_non_negative(self) -> None:
+        with pytest.raises(ValidationError):
+            CyclesMetrics(tokens_input=-1)
+
+    def test_metrics_tokens_output_non_negative(self) -> None:
+        with pytest.raises(ValidationError):
+            CyclesMetrics(tokens_output=-1)
+
+    def test_metrics_latency_non_negative(self) -> None:
+        with pytest.raises(ValidationError):
+            CyclesMetrics(latency_ms=-1)
+
+    def test_metrics_model_version_max_length(self) -> None:
+        with pytest.raises(ValidationError):
+            CyclesMetrics(model_version="x" * 129)

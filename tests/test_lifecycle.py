@@ -51,6 +51,16 @@ class TestBuildReservationBody:
         with pytest.raises(ValueError, match="at least one standard field"):
             _build_reservation_body(cfg, 1000, {})
 
+    def test_validates_grace_period_ms_range(self) -> None:
+        cfg = DecoratorConfig(estimate=1000, grace_period_ms=60001, tenant="acme")
+        with pytest.raises(ValueError, match="grace_period_ms"):
+            _build_reservation_body(cfg, 1000, {})
+
+    def test_validates_grace_period_ms_negative(self) -> None:
+        cfg = DecoratorConfig(estimate=1000, grace_period_ms=-1, tenant="acme")
+        with pytest.raises(ValueError, match="grace_period_ms"):
+            _build_reservation_body(cfg, 1000, {})
+
     def test_merges_default_subject_fields(self) -> None:
         cfg = DecoratorConfig(estimate=1000, workflow="task-1")
         defaults = {"tenant": "acme", "workspace": "prod"}

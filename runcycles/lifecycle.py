@@ -34,7 +34,7 @@ from runcycles.models import (
 )
 from runcycles.response import CyclesResponse
 from runcycles.retry import AsyncCommitRetryEngine, CommitRetryEngine
-from runcycles._validation import validate_positive, validate_subject, validate_ttl_ms
+from runcycles._validation import validate_grace_period_ms, validate_positive, validate_subject, validate_ttl_ms
 
 logger = logging.getLogger(__name__)
 
@@ -118,6 +118,7 @@ def _build_reservation_body(cfg: DecoratorConfig, estimate: int, default_subject
         "overage_policy": cfg.overage_policy,
     }
 
+    validate_grace_period_ms(cfg.grace_period_ms)
     if cfg.grace_period_ms is not None:
         body["grace_period_ms"] = cfg.grace_period_ms
     if cfg.dry_run:

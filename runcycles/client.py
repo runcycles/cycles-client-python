@@ -36,6 +36,27 @@ def _extract_idempotency_key(body: dict[str, Any]) -> str | None:
     return body.get("idempotency_key")
 
 
+_RESPONSE_HEADERS = ("x-request-id", "x-ratelimit-remaining", "x-ratelimit-reset", "x-cycles-tenant")
+
+_BALANCE_FILTER_PARAMS = {"tenant", "workspace", "app", "workflow", "agent", "toolset"}
+
+
+def _extract_response_headers(resp: httpx.Response) -> dict[str, str]:
+    """Extract protocol-relevant headers from an httpx response."""
+    result: dict[str, str] = {}
+    for name in _RESPONSE_HEADERS:
+        val = resp.headers.get(name)
+        if val is not None:
+            result[name] = val
+    return result
+
+
+def _validate_balance_filters(params: dict[str, str]) -> None:
+    """Validate that at least one subject filter is provided for balance queries."""
+    if not any(k in _BALANCE_FILTER_PARAMS for k in params):
+        raise ValueError("get_balances requires at least one subject filter (tenant, workspace, app, workflow, agent, or toolset)")
+
+
 class CyclesClient:
     """Synchronous Cycles API client.
 
@@ -76,6 +97,7 @@ class CyclesClient:
         return self._get(f"{RESERVATIONS_PATH}/{reservation_id}")
 
     def get_balances(self, **query_params: str) -> CyclesResponse:
+        _validate_balance_filters(query_params)
         return self._get(BALANCES_PATH, query_params)
 
     def create_event(self, request: BaseModel | dict[str, Any]) -> CyclesResponse:
@@ -119,13 +141,14 @@ class CyclesClient:
         except Exception:
             body = None
 
+        headers = _extract_response_headers(resp)
         if 200 <= resp.status_code < 300:
-            return CyclesResponse.success(resp.status_code, body or {})
+            return CyclesResponse.success(resp.status_code, body or {}, headers=headers)
         else:
             error_msg = None
             if body and isinstance(body, dict):
                 error_msg = body.get("message") or body.get("error")
-            return CyclesResponse.http_error(resp.status_code, error_msg or resp.reason_phrase or "Unknown error", body)
+            return CyclesResponse.http_error(resp.status_code, error_msg or resp.reason_phrase or "Unknown error", body, headers=headers)
 
 
 class AsyncCyclesClient:
@@ -168,6 +191,7 @@ class AsyncCyclesClient:
         return await self._get(f"{RESERVATIONS_PATH}/{reservation_id}")
 
     async def get_balances(self, **query_params: str) -> CyclesResponse:
+        _validate_balance_filters(query_params)
         return await self._get(BALANCES_PATH, query_params)
 
     async def create_event(self, request: BaseModel | dict[str, Any]) -> CyclesResponse:
@@ -211,10 +235,11 @@ class AsyncCyclesClient:
         except Exception:
             body = None
 
+        headers = _extract_response_headers(resp)
         if 200 <= resp.status_code < 300:
-            return CyclesResponse.success(resp.status_code, body or {})
+            return CyclesResponse.success(resp.status_code, body or {}, headers=headers)
         else:
             error_msg = None
             if body and isinstance(body, dict):
                 error_msg = body.get("message") or body.get("error")
-            return CyclesResponse.http_error(resp.status_code, error_msg or resp.reason_phrase or "Unknown error", body)
+            return CyclesResponse.http_error(resp.status_code, error_msg or resp.reason_phrase or "Unknown error", body, headers=headers)
