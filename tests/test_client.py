@@ -211,6 +211,31 @@ class TestCyclesClientSync:
         assert request.headers.get("X-Idempotency-Key") == "my-key"
         assert request.headers.get("X-Cycles-API-Key") == "test-key"
 
+    def test_get_balances_requires_filter(self, config: CyclesConfig) -> None:
+        with CyclesClient(config) as client:
+            with pytest.raises(ValueError, match="at least one subject filter"):
+                client.get_balances()
+
+    def test_get_balances_non_subject_params_rejected(self, config: CyclesConfig) -> None:
+        with CyclesClient(config) as client:
+            with pytest.raises(ValueError, match="at least one subject filter"):
+                client.get_balances(limit="10")
+
+    def test_response_headers_extracted(self, config: CyclesConfig, httpx_mock) -> None:  # type: ignore[no-untyped-def]
+        httpx_mock.add_response(
+            method="POST",
+            url="http://localhost:7878/v1/reservations",
+            json={"decision": "ALLOW"},
+            status_code=200,
+            headers={"X-Request-Id": "req-abc", "X-RateLimit-Remaining": "42"},
+        )
+
+        with CyclesClient(config) as client:
+            response = client.create_reservation({"idempotency_key": "hdr-test", "subject": {"tenant": "acme"}})
+
+        assert response.request_id == "req-abc"
+        assert response.rate_limit_remaining == 42
+
     def test_dict_body(self, config: CyclesConfig, httpx_mock) -> None:  # type: ignore[no-untyped-def]
         httpx_mock.add_response(
             method="POST",

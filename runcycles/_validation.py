@@ -27,3 +27,9 @@ def validate_ttl_ms(ttl_ms: int) -> None:
     """Validate TTL is within allowed range (1s to 24h)."""
     if ttl_ms < 1000 or ttl_ms > 86_400_000:
         raise ValueError(f"ttl_ms must be between 1000 and 86400000, got {ttl_ms}")
+
+
+def validate_grace_period_ms(grace_period_ms: int | None) -> None:
+    """Validate grace period is within allowed range (0 to 60s)."""
+    if grace_period_ms is not None and (grace_period_ms < 0 or grace_period_ms > 60_000):
+        raise ValueError(f"grace_period_ms must be between 0 and 60000, got {grace_period_ms}")

@@ -2,10 +2,9 @@
 
 from __future__ import annotations
 
-import asyncio
 import functools
 import inspect
-from typing import Any, Callable, TypeVar, overload
+from typing import Any, Callable, TypeVar
 
 from runcycles.client import AsyncCyclesClient, CyclesClient
 from runcycles.config import CyclesConfig
@@ -139,7 +138,7 @@ def cycles(
     )
 
     def decorator(fn: F) -> F:
-        is_async = asyncio.iscoroutinefunction(fn)
+        is_async = inspect.iscoroutinefunction(fn)
 
         if is_async:
 

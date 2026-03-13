@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from enum import Enum
-from typing import Any
+from typing import Annotated, Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -96,7 +96,7 @@ class Amount(BaseModel):
     model_config = _SNAKE_CASE_CONFIG
 
     unit: Unit
-    amount: int
+    amount: int = Field(ge=0)
 
 
 class SignedAmount(BaseModel):
@@ -109,13 +109,13 @@ class SignedAmount(BaseModel):
 class Subject(BaseModel):
     model_config = _SNAKE_CASE_CONFIG
 
-    tenant: str | None = None
-    workspace: str | None = None
-    app: str | None = None
-    workflow: str | None = None
-    agent: str | None = None
-    toolset: str | None = None
-    dimensions: dict[str, str] | None = None
+    tenant: Annotated[str, Field(max_length=128)] | None = None
+    workspace: Annotated[str, Field(max_length=128)] | None = None
+    app: Annotated[str, Field(max_length=128)] | None = None
+    workflow: Annotated[str, Field(max_length=128)] | None = None
+    agent: Annotated[str, Field(max_length=128)] | None = None
+    toolset: Annotated[str, Field(max_length=128)] | None = None
+    dimensions: dict[str, Annotated[str, Field(max_length=256)]] | None = Field(default=None, max_length=16)
 
     def has_at_least_one_standard_field(self) -> bool:
         return any([self.tenant, self.workspace, self.app, self.workflow, self.agent, self.toolset])
@@ -124,35 +124,35 @@ class Subject(BaseModel):
 class Action(BaseModel):
     model_config = _SNAKE_CASE_CONFIG
 
-    kind: str
-    name: str
-    tags: list[str] | None = None
+    kind: str = Field(max_length=64)
+    name: str = Field(max_length=256)
+    tags: list[Annotated[str, Field(max_length=64)]] | None = Field(default=None, max_length=10)
 
 
 class Caps(BaseModel):
     model_config = _SNAKE_CASE_CONFIG
 
-    max_tokens: int | None = None
-    max_steps_remaining: int | None = None
-    tool_allowlist: list[str] | None = None
-    tool_denylist: list[str] | None = None
-    cooldown_ms: int | None = None
+    max_tokens: Annotated[int, Field(ge=0)] | None = None
+    max_steps_remaining: Annotated[int, Field(ge=0)] | None = None
+    tool_allowlist: list[Annotated[str, Field(max_length=256)]] | None = None
+    tool_denylist: list[Annotated[str, Field(max_length=256)]] | None = None
+    cooldown_ms: Annotated[int, Field(ge=0)] | None = None
 
     def is_tool_allowed(self, tool: str) -> bool:
-        if self.tool_denylist and tool in self.tool_denylist:
-            return False
         if self.tool_allowlist is not None:
             return tool in self.tool_allowlist
+        if self.tool_denylist and tool in self.tool_denylist:
+            return False
         return True
 
 
 class CyclesMetrics(BaseModel):
     model_config = _SNAKE_CASE_CONFIG
 
-    tokens_input: int | None = None
-    tokens_output: int | None = None
-    latency_ms: int | None = None
-    model_version: str | None = None
+    tokens_input: Annotated[int, Field(ge=0)] | None = None
+    tokens_output: Annotated[int, Field(ge=0)] | None = None
+    latency_ms: Annotated[int, Field(ge=0)] | None = None
+    model_version: Annotated[str, Field(max_length=128)] | None = None
     custom: dict[str, Any] | None = None
 
     def put_custom(self, key: str, value: Any) -> None:
@@ -335,6 +335,9 @@ class DryRunResult(BaseModel):
 
     def is_allowed(self) -> bool:
         return self.decision in (Decision.ALLOW, Decision.ALLOW_WITH_CAPS)
+
+    def is_denied(self) -> bool:
+        return self.decision == Decision.DENY
 
     def has_caps(self) -> bool:
         return self.caps is not None

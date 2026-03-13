@@ -1,5 +1,8 @@
 """Tests for Pydantic models."""
 
+import pytest
+from pydantic import ValidationError
+
 from runcycles.models import (
     Action,
     Amount,
@@ -10,12 +13,16 @@ from runcycles.models import (
     CyclesMetrics,
     Decision,
     DecisionRequest,
+    DecisionResult,
+    DryRunResult,
     ErrorCode,
     ErrorResponse,
     EventCreateRequest,
     ReservationCreateRequest,
+    ReservationDetailResult,
     ReservationExtendRequest,
     ReservationResult,
+    ReservationStatus,
     ReleaseRequest,
     SignedAmount,
     Subject,
@@ -183,3 +190,150 @@ class TestErrorCode:
         assert ErrorCode.from_string("BUDGET_EXCEEDED") == ErrorCode.BUDGET_EXCEEDED
         assert ErrorCode.from_string("NONSENSE") == ErrorCode.UNKNOWN
         assert ErrorCode.from_string(None) is None
+
+
+class TestAmountValidation:
+    def test_rejects_negative_amount(self) -> None:
+        with pytest.raises(ValidationError):
+            Amount(unit=Unit.USD_MICROCENTS, amount=-1)
+
+    def test_allows_zero_amount(self) -> None:
+        a = Amount(unit=Unit.USD_MICROCENTS, amount=0)
+        assert a.amount == 0
+
+    def test_signed_amount_allows_negative(self) -> None:
+        s = SignedAmount(unit=Unit.USD_MICROCENTS, amount=-500)
+        assert s.amount == -500
+
+
+class TestCapsToolPrecedence:
+    def test_allowlist_takes_precedence_over_denylist(self) -> None:
+        """Spec: If tool_allowlist is non-empty, ONLY those tools are allowed (denylist ignored)."""
+        c = Caps(tool_allowlist=["search", "calc"], tool_denylist=["search"])
+        # search is on both lists — allowlist takes precedence
+        assert c.is_tool_allowed("search")
+        assert not c.is_tool_allowed("code_exec")
+
+    def test_empty_allowlist_blocks_all(self) -> None:
+        """Empty allowlist means no tools are allowed."""
+        c = Caps(tool_allowlist=[])
+        assert not c.is_tool_allowed("anything")
+
+
+class TestDryRunResult:
+    def test_is_allowed(self) -> None:
+        r = DryRunResult(decision=Decision.ALLOW)
+        assert r.is_allowed()
+        assert not r.is_denied()
+
+    def test_is_denied(self) -> None:
+        r = DryRunResult(decision=Decision.DENY, reason_code="BUDGET_EXCEEDED")
+        assert r.is_denied()
+        assert not r.is_allowed()
+
+    def test_has_caps(self) -> None:
+        r = DryRunResult(decision=Decision.ALLOW_WITH_CAPS, caps=Caps(max_tokens=100))
+        assert r.has_caps()
+        assert r.is_allowed()
+
+
+class TestReservationDetailResult:
+    def test_is_active(self) -> None:
+        r = ReservationDetailResult(reservation_id="rsv_1", status=ReservationStatus.ACTIVE)
+        assert r.is_active()
+        assert not r.is_committed()
+        assert not r.is_released()
+        assert not r.is_expired()
+
+    def test_is_committed(self) -> None:
+        r = ReservationDetailResult(reservation_id="rsv_1", status=ReservationStatus.COMMITTED)
+        assert r.is_committed()
+
+    def test_is_released(self) -> None:
+        r = ReservationDetailResult(reservation_id="rsv_1", status=ReservationStatus.RELEASED)
+        assert r.is_released()
+
+    def test_is_expired(self) -> None:
+        r = ReservationDetailResult(reservation_id="rsv_1", status=ReservationStatus.EXPIRED)
+        assert r.is_expired()
+
+
+class TestDecisionResult:
+    def test_allow(self) -> None:
+        r = DecisionResult(decision=Decision.ALLOW)
+        assert r.is_allowed()
+        assert not r.is_denied()
+
+    def test_deny(self) -> None:
+        r = DecisionResult(decision=Decision.DENY, reason_code="BUDGET_EXCEEDED")
+        assert r.is_denied()
+        assert not r.is_allowed()
+
+    def test_allow_with_caps(self) -> None:
+        r = DecisionResult(decision=Decision.ALLOW_WITH_CAPS, caps=Caps(max_tokens=500))
+        assert r.is_allowed()
+
+
+class TestFieldConstraints:
+    """Validate spec-mandated field constraints are enforced."""
+
+    def test_subject_tenant_max_length(self) -> None:
+        with pytest.raises(ValidationError):
+            Subject(tenant="x" * 129)
+
+    def test_subject_tenant_at_max_length(self) -> None:
+        s = Subject(tenant="x" * 128)
+        assert len(s.tenant) == 128
+
+    def test_subject_dimensions_max_entries(self) -> None:
+        dims = {f"k{i}": "v" for i in range(17)}
+        with pytest.raises(ValidationError):
+            Subject(tenant="acme", dimensions=dims)
+
+    def test_subject_dimension_value_max_length(self) -> None:
+        with pytest.raises(ValidationError):
+            Subject(tenant="acme", dimensions={"key": "v" * 257})
+
+    def test_action_kind_max_length(self) -> None:
+        with pytest.raises(ValidationError):
+            Action(kind="x" * 65, name="ok")
+
+    def test_action_name_max_length(self) -> None:
+        with pytest.raises(ValidationError):
+            Action(kind="ok", name="x" * 257)
+
+    def test_action_tags_max_items(self) -> None:
+        with pytest.raises(ValidationError):
+            Action(kind="ok", name="ok", tags=[f"t{i}" for i in range(11)])
+
+    def test_action_tag_item_max_length(self) -> None:
+        with pytest.raises(ValidationError):
+            Action(kind="ok", name="ok", tags=["x" * 65])
+
+    def test_caps_max_tokens_non_negative(self) -> None:
+        with pytest.raises(ValidationError):
+            Caps(max_tokens=-1)
+
+    def test_caps_max_steps_non_negative(self) -> None:
+        with pytest.raises(ValidationError):
+            Caps(max_steps_remaining=-1)
+
+    def test_caps_cooldown_non_negative(self) -> None:
+        with pytest.raises(ValidationError):
+            Caps(cooldown_ms=-1)
+
+    def test_metrics_tokens_input_non_negative(self) -> None:
+        with pytest.raises(ValidationError):
+            CyclesMetrics(tokens_input=-1)
+
+    def test_metrics_tokens_output_non_negative(self) -> None:
+        with pytest.raises(ValidationError):
+            CyclesMetrics(tokens_output=-1)
+
+    def test_metrics_latency_non_negative(self) -> None:
+        with pytest.raises(ValidationError):
+            CyclesMetrics(latency_ms=-1)
+
+    def test_metrics_model_version_max_length(self) -> None:
+        with pytest.raises(ValidationError):
+            CyclesMetrics(model_version="x" * 129)

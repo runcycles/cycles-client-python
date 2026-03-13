@@ -15,16 +15,17 @@ class CyclesResponse:
     status: int
     body: dict[str, Any] | None = None
     error_message: str | None = None
+    headers: dict[str, str] = field(default_factory=dict, repr=False)
     _is_transport_error: bool = field(default=False, repr=False)
     transport_exception: Exception | None = field(default=None, repr=False)
 
     @classmethod
-    def success(cls, status: int, body: dict[str, Any]) -> CyclesResponse:
-        return cls(status=status, body=body)
+    def success(cls, status: int, body: dict[str, Any], headers: dict[str, str] | None = None) -> CyclesResponse:
+        return cls(status=status, body=body, headers=headers or {})
 
     @classmethod
-    def http_error(cls, status: int, error_message: str, body: dict[str, Any] | None = None) -> CyclesResponse:
-        return cls(status=status, body=body, error_message=error_message)
+    def http_error(cls, status: int, error_message: str, body: dict[str, Any] | None = None, headers: dict[str, str] | None = None) -> CyclesResponse:
+        return cls(status=status, body=body, error_message=error_message, headers=headers or {})
 
     @classmethod
     def transport_error(cls, ex: Exception) -> CyclesResponse:
@@ -34,6 +35,24 @@ class CyclesResponse:
             _is_transport_error=True,
             transport_exception=ex,
         )
+
+    @property
+    def request_id(self) -> str | None:
+        return self.headers.get("x-request-id")
+
+    @property
+    def rate_limit_remaining(self) -> int | None:
+        val = self.headers.get("x-ratelimit-remaining")
+        return int(val) if val is not None else None
+
+    @property
+    def rate_limit_reset(self) -> int | None:
+        val = self.headers.get("x-ratelimit-reset")
+        return int(val) if val is not None else None
+
+    @property
+    def cycles_tenant(self) -> str | None:
+        return self.headers.get("x-cycles-tenant")
 
     @property
     def is_success(self) -> bool:

@@ -153,27 +153,23 @@ def my_func() -> str:
 from runcycles import (
     CyclesClient, CyclesConfig, ReservationCreateRequest,
     Subject, Action, Amount, Unit,
-    BudgetExceededError, OverdraftLimitExceededError,
-    CyclesProtocolError, CyclesTransportError,
 )
 
 config = CyclesConfig(base_url="http://localhost:7878", api_key="your-key")
 
 with CyclesClient(config) as client:
-    try:
-        response = client.create_reservation(ReservationCreateRequest(
-            idempotency_key="req-002",
-            subject=Subject(tenant="acme"),
-            action=Action(kind="llm.completion", name="gpt-4"),
-            estimate=Amount(unit=Unit.USD_MICROCENTS, amount=500_000),
-        ))
+    response = client.create_reservation(ReservationCreateRequest(
+        idempotency_key="req-002",
+        subject=Subject(tenant="acme"),
+        action=Action(kind="llm.completion", name="gpt-4"),
+        estimate=Amount(unit=Unit.USD_MICROCENTS, amount=500_000),
+    ))
 
-        if not response.is_success:
-            print(f"Error {response.status_code}: {response.error_message}")
-
-    except CyclesTransportError as e:
-        # Network-level failure (DNS, connection refused, timeout)
-        print(f"Transport error: {e}, cause: {e.cause}")
+    if response.is_transport_error:
+        print(f"Transport error: {response.error_message}")
+    elif not response.is_success:
+        print(f"Error {response.status}: {response.error_message}")
+        print(f"Request ID: {response.request_id}")
 ```
 
 With the `@cycles` decorator, protocol errors are raised as typed exceptions:
@@ -244,10 +240,24 @@ response = client.create_event(EventCreateRequest(
 
 ## Querying balances
 
+At least one subject filter (``tenant``, ``workspace``, ``app``, ``workflow``, ``agent``, or ``toolset``) is required:
+
 ```python
 response = client.get_balances(tenant="acme")
 if response.is_success:
     print(response.body)
+```
+
+## Response metadata
+
+Every response exposes protocol headers for debugging and rate-limit awareness:
+
+```python
+response = client.create_reservation(request)
+print(response.request_id)            # X-Request-Id
+print(response.rate_limit_remaining)   # X-RateLimit-Remaining (int or None)
+print(response.rate_limit_reset)       # X-RateLimit-Reset (int or None)
+print(response.cycles_tenant)          # X-Cycles-Tenant
 ```
 
 ## Dry run (shadow mode)
@@ -269,8 +279,8 @@ Control what happens when actual usage exceeds the estimate at commit time:
 ```python
 from runcycles import CommitOveragePolicy
 
-# REJECT (default) — commit fails if actual > estimate
-# ALLOW_IF_AVAILABLE — commit succeeds if budget is available for the overage
+# REJECT (default) — commit fails if budget is insufficient for the overage
+# ALLOW_IF_AVAILABLE — commit succeeds if remaining budget covers the overage
 # ALLOW_WITH_OVERDRAFT — commit always succeeds, may create debt
 
 @cycles(estimate=1000, overage_policy="ALLOW_WITH_OVERDRAFT", client=client)
@@ -287,7 +297,8 @@ def overdraft_func() -> str:
 - **Commit retry**: Failed commits are retried with exponential backoff
 - **Context access**: `get_cycles_context()` provides reservation details inside guarded functions
 - **Typed exceptions**: `BudgetExceededError`, `OverdraftLimitExceededError`, etc. for precise error handling
-- **Pydantic models**: Typed request/response models with validation
+- **Pydantic models**: Typed request/response models with spec-enforced validation constraints
+- **Response metadata**: Access `request_id`, `rate_limit_remaining`, and `rate_limit_reset` on every response
 - **Environment config**: `CyclesConfig.from_env()` for 12-factor apps
 
 ## Requirements
