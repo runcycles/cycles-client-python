@@ -4,7 +4,7 @@ import pytest
 
 from runcycles._validation import (
     validate_grace_period_ms,
-    validate_positive,
+    validate_non_negative,
     validate_reservation_id,
     validate_subject,
     validate_ttl_ms,
@@ -42,17 +42,17 @@ class TestValidateReservationId:
             validate_reservation_id(None)
 
 
-class TestValidatePositive:
-    def test_valid(self) -> None:
-        validate_positive(1, "amount")
+class TestValidateNonNegative:
+    def test_positive_valid(self) -> None:
+        validate_non_negative(1, "amount")
 
-    def test_zero_rejected(self) -> None:
-        with pytest.raises(ValueError, match="amount"):
-            validate_positive(0, "amount")
+    def test_zero_valid(self) -> None:
+        # Spec Amount.amount has minimum: 0, so 0 is valid
+        validate_non_negative(0, "amount")
 
     def test_negative_rejected(self) -> None:
         with pytest.raises(ValueError, match="estimate"):
-            validate_positive(-1, "estimate")
+            validate_non_negative(-1, "estimate")
 
 
 class TestValidateTtlMs:

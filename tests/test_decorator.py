@@ -55,13 +55,13 @@ class TestCyclesDecoratorSync:
         httpx_mock.add_response(
             method="POST",
             url="http://localhost:7878/v1/reservations",
-            json={"decision": "ALLOW", "reservation_id": "res_dec_2", "expires_at_ms": 9999999999},
+            json={"decision": "ALLOW", "reservation_id": "res_dec_2", "expires_at_ms": 9999999999, "affected_scopes": ["tenant:acme"]},
             status_code=200,
         )
         httpx_mock.add_response(
             method="POST",
             url="http://localhost:7878/v1/reservations/res_dec_2/commit",
-            json={"status": "COMMITTED"},
+            json={"status": "COMMITTED", "charged": {"unit": "USD_MICROCENTS", "amount": 500}},
             status_code=200,
         )
 
@@ -101,13 +101,13 @@ class TestCyclesDecoratorSync:
         httpx_mock.add_response(
             method="POST",
             url="http://localhost:7878/v1/reservations",
-            json={"decision": "ALLOW", "reservation_id": "res_dec_3", "expires_at_ms": 9999999999},
+            json={"decision": "ALLOW", "reservation_id": "res_dec_3", "expires_at_ms": 9999999999, "affected_scopes": ["tenant:acme"]},
             status_code=200,
         )
         httpx_mock.add_response(
             method="POST",
             url="http://localhost:7878/v1/reservations/res_dec_3/release",
-            json={"status": "RELEASED"},
+            json={"status": "RELEASED", "released": {"unit": "USD_MICROCENTS", "amount": 1000}},
             status_code=200,
         )
 
@@ -125,13 +125,13 @@ class TestCyclesDecoratorSync:
         httpx_mock.add_response(
             method="POST",
             url="http://localhost:7878/v1/reservations",
-            json={"decision": "ALLOW", "reservation_id": "res_dec_4", "expires_at_ms": 9999999999},
+            json={"decision": "ALLOW", "reservation_id": "res_dec_4", "expires_at_ms": 9999999999, "affected_scopes": ["tenant:acme"]},
             status_code=200,
         )
         httpx_mock.add_response(
             method="POST",
             url="http://localhost:7878/v1/reservations/res_dec_4/commit",
-            json={"status": "COMMITTED"},
+            json={"status": "COMMITTED", "charged": {"unit": "USD_MICROCENTS", "amount": 1000}},
             status_code=200,
         )
 
@@ -153,13 +153,13 @@ class TestCyclesDecoratorAsync:
         httpx_mock.add_response(
             method="POST",
             url="http://localhost:7878/v1/reservations",
-            json={"decision": "ALLOW", "reservation_id": "res_async_1", "expires_at_ms": 9999999999},
+            json={"decision": "ALLOW", "reservation_id": "res_async_1", "expires_at_ms": 9999999999, "affected_scopes": ["tenant:acme"]},
             status_code=200,
         )
         httpx_mock.add_response(
             method="POST",
             url="http://localhost:7878/v1/reservations/res_async_1/commit",
-            json={"status": "COMMITTED"},
+            json={"status": "COMMITTED", "charged": {"unit": "USD_MICROCENTS", "amount": 1000}},
             status_code=200,
         )
 
@@ -181,13 +181,13 @@ class TestDefaultClientConfig:
         httpx_mock.add_response(
             method="POST",
             url="http://localhost:7878/v1/reservations",
-            json={"decision": "ALLOW", "reservation_id": "res_def_1", "expires_at_ms": 9999999999},
+            json={"decision": "ALLOW", "reservation_id": "res_def_1", "expires_at_ms": 9999999999, "affected_scopes": ["tenant:acme"]},
             status_code=200,
         )
         httpx_mock.add_response(
             method="POST",
             url="http://localhost:7878/v1/reservations/res_def_1/commit",
-            json={"status": "COMMITTED"},
+            json={"status": "COMMITTED", "charged": {"unit": "USD_MICROCENTS", "amount": 1000}},
             status_code=200,
         )
 
@@ -206,13 +206,13 @@ class TestDefaultClientConfig:
         httpx_mock.add_response(
             method="POST",
             url="http://localhost:7878/v1/reservations",
-            json={"decision": "ALLOW", "reservation_id": "res_lazy_1", "expires_at_ms": 9999999999},
+            json={"decision": "ALLOW", "reservation_id": "res_lazy_1", "expires_at_ms": 9999999999, "affected_scopes": ["tenant:acme"]},
             status_code=200,
         )
         httpx_mock.add_response(
             method="POST",
             url="http://localhost:7878/v1/reservations/res_lazy_1/commit",
-            json={"status": "COMMITTED"},
+            json={"status": "COMMITTED", "charged": {"unit": "USD_MICROCENTS", "amount": 1000}},
             status_code=200,
         )
 

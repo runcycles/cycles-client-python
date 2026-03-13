@@ -36,10 +36,16 @@ class TestBuildReservationBody:
         assert body["action"]["name"] == "gpt-4"
         assert body["action"]["tags"] == ["prod"]
 
-    def test_validates_estimate_positive(self) -> None:
+    def test_validates_estimate_non_negative(self) -> None:
+        """Spec: Amount.amount has minimum: 0, so 0 is valid but negative is not."""
         cfg = DecoratorConfig(estimate=0, tenant="acme")
+        # 0 should be valid per spec
+        body = _build_reservation_body(cfg, 0, {})
+        assert body["estimate"]["amount"] == 0
+
+        cfg_neg = DecoratorConfig(estimate=-1, tenant="acme")
         with pytest.raises(ValueError, match="estimate"):
-            _build_reservation_body(cfg, 0, {})
+            _build_reservation_body(cfg_neg, -1, {})
 
     def test_validates_ttl_range(self) -> None:
         cfg = DecoratorConfig(estimate=1000, ttl_ms=500, tenant="acme")
