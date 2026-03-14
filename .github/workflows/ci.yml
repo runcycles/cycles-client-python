@@ -34,5 +34,5 @@ jobs:
       - name: Type check with mypy
         run: mypy runcycles
 
-      - name: Run tests
-        run: pytest
+      - name: Run tests with coverage
+        run: pytest --cov runcycles --cov-fail-under=85

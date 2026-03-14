@@ -312,8 +312,8 @@ ruff check .
 # Type check (strict mode)
 mypy runcycles
 
-# Run tests
-pytest
+# Run tests with coverage (85% threshold enforced in CI)
+pytest --cov runcycles --cov-fail-under=85
 ```
 
 CI runs all three checks on Python 3.10 and 3.12 for every push and pull request.
