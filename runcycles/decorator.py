@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import functools
 import inspect
-from typing import Any, Callable, TypeVar
+from collections.abc import Callable
+from typing import Any, TypeVar
 
 from runcycles.client import AsyncCyclesClient, CyclesClient
 from runcycles.config import CyclesConfig
@@ -31,7 +32,9 @@ def set_default_config(config: CyclesConfig) -> None:
     _default_config = config
 
 
-def _get_effective_client(explicit_client: CyclesClient | AsyncCyclesClient | None, is_async: bool) -> CyclesClient | AsyncCyclesClient:
+def _get_effective_client(
+    explicit_client: CyclesClient | AsyncCyclesClient | None, is_async: bool,
+) -> CyclesClient | AsyncCyclesClient:
     global _default_client
     if explicit_client is not None:
         return explicit_client

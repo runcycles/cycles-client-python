@@ -8,7 +8,10 @@ from runcycles.models import Subject
 def validate_subject(subject: Subject | None) -> None:
     """Validate that a subject has at least one standard field."""
     if subject is not None and not subject.has_at_least_one_standard_field():
-        raise ValueError("Subject must have at least one standard field (tenant, workspace, app, workflow, agent, or toolset)")
+        raise ValueError(
+            "Subject must have at least one standard field"
+            " (tenant, workspace, app, workflow, agent, or toolset)"
+        )
 
 
 def validate_reservation_id(reservation_id: str | None) -> None:

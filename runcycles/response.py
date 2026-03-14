@@ -24,7 +24,9 @@ class CyclesResponse:
         return cls(status=status, body=body, headers=headers or {})
 
     @classmethod
-    def http_error(cls, status: int, error_message: str, body: dict[str, Any] | None = None, headers: dict[str, str] | None = None) -> CyclesResponse:
+    def http_error(
+        cls, status: int, error_message: str, body: dict[str, Any] | None = None, headers: dict[str, str] | None = None,
+    ) -> CyclesResponse:
         return cls(status=status, body=body, error_message=error_message, headers=headers or {})
 
     @classmethod

@@ -8,7 +8,6 @@ from runcycles import (
     get_cycles_context,
 )
 
-
 config = CyclesConfig(
     base_url="http://localhost:7878",
     api_key="your-api-key",

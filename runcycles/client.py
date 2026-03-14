@@ -54,7 +54,10 @@ def _extract_response_headers(resp: httpx.Response) -> dict[str, str]:
 def _validate_balance_filters(params: dict[str, str]) -> None:
     """Validate that at least one subject filter is provided for balance queries."""
     if not any(k in _BALANCE_FILTER_PARAMS for k in params):
-        raise ValueError("get_balances requires at least one subject filter (tenant, workspace, app, workflow, agent, or toolset)")
+        raise ValueError(
+            "get_balances requires at least one subject filter"
+            " (tenant, workspace, app, workflow, agent, or toolset)"
+        )
 
 
 class CyclesClient:
@@ -148,7 +151,9 @@ class CyclesClient:
             error_msg = None
             if body and isinstance(body, dict):
                 error_msg = body.get("message") or body.get("error")
-            return CyclesResponse.http_error(resp.status_code, error_msg or resp.reason_phrase or "Unknown error", body, headers=headers)
+            return CyclesResponse.http_error(
+                resp.status_code, error_msg or resp.reason_phrase or "Unknown error", body, headers=headers,
+            )
 
 
 class AsyncCyclesClient:
@@ -242,4 +247,6 @@ class AsyncCyclesClient:
             error_msg = None
             if body and isinstance(body, dict):
                 error_msg = body.get("message") or body.get("error")
-            return CyclesResponse.http_error(resp.status_code, error_msg or resp.reason_phrase or "Unknown error", body, headers=headers)
+            return CyclesResponse.http_error(
+                resp.status_code, error_msg or resp.reason_phrase or "Unknown error", body, headers=headers,
+            )

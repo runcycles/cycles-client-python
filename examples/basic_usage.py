@@ -8,7 +8,6 @@ from runcycles import (
     CyclesConfig,
     CyclesMetrics,
     ReservationCreateRequest,
-    ReleaseRequest,
     Subject,
     Unit,
 )
@@ -40,8 +39,8 @@ def main() -> None:
         reservation_id = response.get_body_attribute("reservation_id")
         print(f"Reserved: {reservation_id}")
 
-        # Simulate work
-        result = "Generated response text"
+        # Simulate work (result would be used in a real application)
+        _ = "Generated response text"
 
         # Commit actual usage
         commit_response = client.commit_reservation(reservation_id, CommitRequest(

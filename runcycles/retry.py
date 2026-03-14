@@ -64,7 +64,10 @@ class CommitRetryEngine:
                     return
                 response = self._client.commit_reservation(pending.reservation_id, pending.commit_body)
                 if response.is_success:
-                    logger.info("Commit retry succeeded: reservation_id=%s, attempt=%d", pending.reservation_id, pending.attempt)
+                    logger.info(
+                        "Commit retry succeeded: reservation_id=%s, attempt=%d",
+                        pending.reservation_id, pending.attempt,
+                    )
                     return
                 elif response.is_client_error:
                     logger.warning(
@@ -78,9 +81,15 @@ class CommitRetryEngine:
                         pending.reservation_id, pending.attempt, response.status,
                     )
             except Exception:
-                logger.exception("Commit retry error: reservation_id=%s, attempt=%d", pending.reservation_id, pending.attempt)
+                logger.exception(
+                    "Commit retry error: reservation_id=%s, attempt=%d",
+                    pending.reservation_id, pending.attempt,
+                )
 
-        logger.error("Commit retry exhausted: reservation_id=%s, attempts=%d", pending.reservation_id, self._max_attempts)
+        logger.error(
+            "Commit retry exhausted: reservation_id=%s, attempts=%d",
+            pending.reservation_id, self._max_attempts,
+        )
 
 
 class AsyncCommitRetryEngine:
@@ -128,7 +137,10 @@ class AsyncCommitRetryEngine:
                     return
                 response = await self._client.commit_reservation(pending.reservation_id, pending.commit_body)
                 if response.is_success:
-                    logger.info("Async commit retry succeeded: reservation_id=%s, attempt=%d", pending.reservation_id, pending.attempt)
+                    logger.info(
+                        "Async commit retry succeeded: reservation_id=%s, attempt=%d",
+                        pending.reservation_id, pending.attempt,
+                    )
                     return
                 elif response.is_client_error:
                     logger.warning(
@@ -142,6 +154,12 @@ class AsyncCommitRetryEngine:
                         pending.reservation_id, pending.attempt, response.status,
                     )
             except Exception:
-                logger.exception("Async commit retry error: reservation_id=%s, attempt=%d", pending.reservation_id, pending.attempt)
+                logger.exception(
+                    "Async commit retry error: reservation_id=%s, attempt=%d",
+                    pending.reservation_id, pending.attempt,
+                )
 
-        logger.error("Async commit retry exhausted: reservation_id=%s, attempts=%d", pending.reservation_id, self._max_attempts)
+        logger.error(
+            "Async commit retry exhausted: reservation_id=%s, attempts=%d",
+            pending.reservation_id, self._max_attempts,
+        )
