@@ -34,6 +34,7 @@ from runcycles.models import (
     EventCreateRequest,
     EventCreateResponse,
     EventStatus,
+    ExtendStatus,
     ReleaseRequest,
     ReleaseResponse,
     ReleaseStatus,
