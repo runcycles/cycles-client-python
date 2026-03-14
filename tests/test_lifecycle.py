@@ -2,7 +2,7 @@
 
 import asyncio
 import time
-from unittest.mock import MagicMock, AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -28,7 +28,7 @@ from runcycles.lifecycle import (
     _evaluate_actual,
     _evaluate_amount,
 )
-from runcycles.models import CyclesMetrics, Decision
+from runcycles.models import CyclesMetrics
 from runcycles.response import CyclesResponse
 from runcycles.retry import AsyncCommitRetryEngine, CommitRetryEngine
 
@@ -179,7 +179,6 @@ class TestBuildProtocolException:
         assert exc.request_id == "req-123"
 
     def test_maps_to_typed_exception(self) -> None:
-        from runcycles.exceptions import BudgetExceededError
 
         response = CyclesResponse.http_error(
             409,
@@ -593,7 +592,7 @@ class TestSyncLifecycleExecution:
         mock_client.create_reservation.return_value = _allow_response()
         mock_client.commit_reservation.return_value = _commit_success()
 
-        cfg = _make_cfg(ttl_ms=1000)
+        _make_cfg(ttl_ms=1000)
         # We can't easily set ttl_ms=0 since validation rejects it, but we can test
         # the heartbeat path by calling _start_heartbeat directly
         import threading

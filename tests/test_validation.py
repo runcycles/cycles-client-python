@@ -3,6 +3,7 @@
 import pytest
 
 from runcycles._validation import (
+    validate_extend_by_ms,
     validate_grace_period_ms,
     validate_non_negative,
     validate_reservation_id,
@@ -68,6 +69,29 @@ class TestValidateTtlMs:
     def test_above_maximum(self) -> None:
         with pytest.raises(ValueError, match="ttl_ms"):
             validate_ttl_ms(86_400_001)
+
+
+class TestValidateExtendByMs:
+    def test_valid_minimum(self) -> None:
+        validate_extend_by_ms(1)
+
+    def test_valid_mid_range(self) -> None:
+        validate_extend_by_ms(60_000)
+
+    def test_valid_maximum(self) -> None:
+        validate_extend_by_ms(86_400_000)
+
+    def test_zero_rejected(self) -> None:
+        with pytest.raises(ValueError, match="extend_by_ms"):
+            validate_extend_by_ms(0)
+
+    def test_negative_rejected(self) -> None:
+        with pytest.raises(ValueError, match="extend_by_ms"):
+            validate_extend_by_ms(-1)
+
+    def test_above_maximum(self) -> None:
+        with pytest.raises(ValueError, match="extend_by_ms"):
+            validate_extend_by_ms(86_400_001)
 
 
 class TestValidateGracePeriodMs:

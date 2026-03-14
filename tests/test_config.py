@@ -1,6 +1,5 @@
 """Tests for CyclesConfig."""
 
-import os
 
 import pytest
 

@@ -1,7 +1,7 @@
 """Tests for CyclesContext."""
 
 from runcycles.context import CyclesContext, _clear_context, _set_context, get_cycles_context
-from runcycles.models import Amount, Caps, CyclesMetrics, Decision, Unit
+from runcycles.models import Caps, CyclesMetrics, Decision
 
 
 class TestCyclesContext:

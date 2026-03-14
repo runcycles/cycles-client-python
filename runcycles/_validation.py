@@ -8,7 +8,10 @@ from runcycles.models import Subject
 def validate_subject(subject: Subject | None) -> None:
     """Validate that a subject has at least one standard field."""
     if subject is not None and not subject.has_at_least_one_standard_field():
-        raise ValueError("Subject must have at least one standard field (tenant, workspace, app, workflow, agent, or toolset)")
+        raise ValueError(
+            "Subject must have at least one standard field"
+            " (tenant, workspace, app, workflow, agent, or toolset)"
+        )
 
 
 def validate_reservation_id(reservation_id: str | None) -> None:
@@ -27,6 +30,12 @@ def validate_ttl_ms(ttl_ms: int) -> None:
     """Validate TTL is within allowed range (1s to 24h)."""
     if ttl_ms < 1000 or ttl_ms > 86_400_000:
         raise ValueError(f"ttl_ms must be between 1000 and 86400000, got {ttl_ms}")
+
+
+def validate_extend_by_ms(extend_by_ms: int) -> None:
+    """Validate extend_by_ms is within allowed range (1ms to 24h)."""
+    if extend_by_ms < 1 or extend_by_ms > 86_400_000:
+        raise ValueError(f"extend_by_ms must be between 1 and 86400000, got {extend_by_ms}")
 
 
 def validate_grace_period_ms(grace_period_ms: int | None) -> None:

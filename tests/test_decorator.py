@@ -6,7 +6,7 @@ from runcycles.client import AsyncCyclesClient, CyclesClient
 from runcycles.config import CyclesConfig
 from runcycles.context import get_cycles_context
 from runcycles.decorator import cycles, set_default_client, set_default_config
-from runcycles.exceptions import BudgetExceededError, CyclesProtocolError
+from runcycles.exceptions import CyclesProtocolError
 
 
 @pytest.fixture
@@ -55,7 +55,10 @@ class TestCyclesDecoratorSync:
         httpx_mock.add_response(
             method="POST",
             url="http://localhost:7878/v1/reservations",
-            json={"decision": "ALLOW", "reservation_id": "res_dec_2", "expires_at_ms": 9999999999, "affected_scopes": ["tenant:acme"]},
+            json={
+                "decision": "ALLOW", "reservation_id": "res_dec_2",
+                "expires_at_ms": 9999999999, "affected_scopes": ["tenant:acme"],
+            },
             status_code=200,
         )
         httpx_mock.add_response(
@@ -101,7 +104,10 @@ class TestCyclesDecoratorSync:
         httpx_mock.add_response(
             method="POST",
             url="http://localhost:7878/v1/reservations",
-            json={"decision": "ALLOW", "reservation_id": "res_dec_3", "expires_at_ms": 9999999999, "affected_scopes": ["tenant:acme"]},
+            json={
+                "decision": "ALLOW", "reservation_id": "res_dec_3",
+                "expires_at_ms": 9999999999, "affected_scopes": ["tenant:acme"],
+            },
             status_code=200,
         )
         httpx_mock.add_response(
@@ -125,7 +131,10 @@ class TestCyclesDecoratorSync:
         httpx_mock.add_response(
             method="POST",
             url="http://localhost:7878/v1/reservations",
-            json={"decision": "ALLOW", "reservation_id": "res_dec_4", "expires_at_ms": 9999999999, "affected_scopes": ["tenant:acme"]},
+            json={
+                "decision": "ALLOW", "reservation_id": "res_dec_4",
+                "expires_at_ms": 9999999999, "affected_scopes": ["tenant:acme"],
+            },
             status_code=200,
         )
         httpx_mock.add_response(
@@ -153,7 +162,10 @@ class TestCyclesDecoratorAsync:
         httpx_mock.add_response(
             method="POST",
             url="http://localhost:7878/v1/reservations",
-            json={"decision": "ALLOW", "reservation_id": "res_async_1", "expires_at_ms": 9999999999, "affected_scopes": ["tenant:acme"]},
+            json={
+                "decision": "ALLOW", "reservation_id": "res_async_1",
+                "expires_at_ms": 9999999999, "affected_scopes": ["tenant:acme"],
+            },
             status_code=200,
         )
         httpx_mock.add_response(
@@ -181,7 +193,10 @@ class TestDefaultClientConfig:
         httpx_mock.add_response(
             method="POST",
             url="http://localhost:7878/v1/reservations",
-            json={"decision": "ALLOW", "reservation_id": "res_def_1", "expires_at_ms": 9999999999, "affected_scopes": ["tenant:acme"]},
+            json={
+                "decision": "ALLOW", "reservation_id": "res_def_1",
+                "expires_at_ms": 9999999999, "affected_scopes": ["tenant:acme"],
+            },
             status_code=200,
         )
         httpx_mock.add_response(
@@ -206,7 +221,10 @@ class TestDefaultClientConfig:
         httpx_mock.add_response(
             method="POST",
             url="http://localhost:7878/v1/reservations",
-            json={"decision": "ALLOW", "reservation_id": "res_lazy_1", "expires_at_ms": 9999999999, "affected_scopes": ["tenant:acme"]},
+            json={
+                "decision": "ALLOW", "reservation_id": "res_lazy_1",
+                "expires_at_ms": 9999999999, "affected_scopes": ["tenant:acme"],
+            },
             status_code=200,
         )
         httpx_mock.add_response(
@@ -249,7 +267,10 @@ class TestDefaultClientConfig:
         httpx_mock.add_response(
             method="POST",
             url="http://localhost:7878/v1/reservations",
-            json={"decision": "ALLOW", "reservation_id": "res_lazy_a1", "expires_at_ms": 9999999999, "affected_scopes": ["tenant:acme"]},
+            json={
+                "decision": "ALLOW", "reservation_id": "res_lazy_a1",
+                "expires_at_ms": 9999999999, "affected_scopes": ["tenant:acme"],
+            },
             status_code=200,
         )
         httpx_mock.add_response(

@@ -1,6 +1,5 @@
 """Tests for CyclesClient and AsyncCyclesClient."""
 
-import json
 
 import httpx
 import pytest
@@ -13,9 +12,9 @@ from runcycles.models import (
     CommitRequest,
     DecisionRequest,
     EventCreateRequest,
+    ReleaseRequest,
     ReservationCreateRequest,
     ReservationExtendRequest,
-    ReleaseRequest,
     Subject,
     Unit,
 )

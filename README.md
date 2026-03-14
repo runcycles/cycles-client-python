@@ -301,6 +301,23 @@ def overdraft_func() -> str:
 - **Response metadata**: Access `request_id`, `rate_limit_remaining`, and `rate_limit_reset` on every response
 - **Environment config**: `CyclesConfig.from_env()` for 12-factor apps
 
+## Development
+
+```bash
+pip install -e ".[dev]"
+
+# Lint
+ruff check .
+
+# Type check (strict mode)
+mypy runcycles
+
+# Run tests
+pytest
+```
+
+CI runs all three checks on Python 3.10 and 3.12 for every push and pull request.
+
 ## Requirements
 
 - Python 3.10+

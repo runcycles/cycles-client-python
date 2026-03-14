@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import functools
 import inspect
-from typing import Any, Callable, TypeVar
+from collections.abc import Callable
+from typing import Any, TypeVar
 
 from runcycles.client import AsyncCyclesClient, CyclesClient
 from runcycles.config import CyclesConfig
@@ -31,7 +32,9 @@ def set_default_config(config: CyclesConfig) -> None:
     _default_config = config
 
 
-def _get_effective_client(explicit_client: CyclesClient | AsyncCyclesClient | None, is_async: bool) -> CyclesClient | AsyncCyclesClient:
+def _get_effective_client(
+    explicit_client: CyclesClient | AsyncCyclesClient | None, is_async: bool,
+) -> CyclesClient | AsyncCyclesClient:
     global _default_client
     if explicit_client is not None:
         return explicit_client
@@ -137,50 +140,53 @@ def cycles(
         use_estimate_if_actual_not_provided=use_estimate_if_actual_not_provided,
     )
 
+    def _build_default_subject(
+        effective_client: CyclesClient | AsyncCyclesClient,
+    ) -> dict[str, str | None]:
+        config = effective_client._config
+        return {
+            "tenant": config.tenant,
+            "workspace": config.workspace,
+            "app": config.app,
+            "workflow": config.workflow,
+            "agent": config.agent,
+            "toolset": config.toolset,
+        }
+
     def decorator(fn: F) -> F:
         is_async = inspect.iscoroutinefunction(fn)
 
         if is_async:
+            _cached_async: list[AsyncCyclesLifecycle | None] = [None]
 
             @functools.wraps(fn)
             async def async_wrapper(*args: Any, **kwargs: Any) -> Any:
-                effective_client = _get_effective_client(client, is_async=True)
-                if not isinstance(effective_client, AsyncCyclesClient):
-                    raise TypeError("Async function requires an AsyncCyclesClient")
-
-                config = effective_client._config
-                default_subject = {
-                    "tenant": config.tenant,
-                    "workspace": config.workspace,
-                    "app": config.app,
-                    "workflow": config.workflow,
-                    "agent": config.agent,
-                    "toolset": config.toolset,
-                }
-                retry_engine = AsyncCommitRetryEngine(config)
-                lifecycle = AsyncCyclesLifecycle(effective_client, retry_engine, default_subject)
+                lifecycle = _cached_async[0]
+                if lifecycle is None:
+                    effective_client = _get_effective_client(client, is_async=True)
+                    if not isinstance(effective_client, AsyncCyclesClient):
+                        raise TypeError("Async function requires an AsyncCyclesClient")
+                    subject = _build_default_subject(effective_client)
+                    engine = AsyncCommitRetryEngine(effective_client._config)
+                    lifecycle = AsyncCyclesLifecycle(effective_client, engine, subject)
+                    _cached_async[0] = lifecycle
                 return await lifecycle.execute(fn, args, kwargs, cfg)
 
             return async_wrapper  # type: ignore[return-value]
         else:
+            _cached_sync: list[CyclesLifecycle | None] = [None]
 
             @functools.wraps(fn)
             def sync_wrapper(*args: Any, **kwargs: Any) -> Any:
-                effective_client = _get_effective_client(client, is_async=False)
-                if not isinstance(effective_client, CyclesClient):
-                    raise TypeError("Sync function requires a CyclesClient")
-
-                config = effective_client._config
-                default_subject = {
-                    "tenant": config.tenant,
-                    "workspace": config.workspace,
-                    "app": config.app,
-                    "workflow": config.workflow,
-                    "agent": config.agent,
-                    "toolset": config.toolset,
-                }
-                retry_engine = CommitRetryEngine(config)
-                lifecycle = CyclesLifecycle(effective_client, retry_engine, default_subject)
+                lifecycle = _cached_sync[0]
+                if lifecycle is None:
+                    effective_client = _get_effective_client(client, is_async=False)
+                    if not isinstance(effective_client, CyclesClient):
+                        raise TypeError("Sync function requires a CyclesClient")
+                    subject = _build_default_subject(effective_client)
+                    engine = CommitRetryEngine(effective_client._config)
+                    lifecycle = CyclesLifecycle(effective_client, engine, subject)
+                    _cached_sync[0] = lifecycle
                 return lifecycle.execute(fn, args, kwargs, cfg)
 
             return sync_wrapper  # type: ignore[return-value]

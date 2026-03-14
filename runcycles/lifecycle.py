@@ -7,9 +7,17 @@ import logging
 import threading
 import time
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any
 
+from runcycles._validation import (
+    validate_extend_by_ms,
+    validate_grace_period_ms,
+    validate_non_negative,
+    validate_subject,
+    validate_ttl_ms,
+)
 from runcycles.client import AsyncCyclesClient, CyclesClient
 from runcycles.context import CyclesContext, _clear_context, _set_context
 from runcycles.exceptions import (
@@ -21,20 +29,14 @@ from runcycles.exceptions import (
     ReservationFinalizedError,
 )
 from runcycles.models import (
-    Action,
-    Amount,
-    Caps,
     CyclesMetrics,
     Decision,
     DryRunResult,
-    ErrorCode,
     ReservationCreateResponse,
     Subject,
-    Unit,
 )
 from runcycles.response import CyclesResponse
 from runcycles.retry import AsyncCommitRetryEngine, CommitRetryEngine
-from runcycles._validation import validate_grace_period_ms, validate_non_negative, validate_subject, validate_ttl_ms
 
 logger = logging.getLogger(__name__)
 
@@ -86,7 +88,9 @@ def _evaluate_actual(
     raise ValueError("actual expression is required when use_estimate_if_actual_not_provided is False")
 
 
-def _build_reservation_body(cfg: DecoratorConfig, estimate: int, default_subject_fields: dict[str, str | None]) -> dict[str, Any]:
+def _build_reservation_body(
+    cfg: DecoratorConfig, estimate: int, default_subject_fields: dict[str, str | None],
+) -> dict[str, Any]:
     """Build the reservation create request body."""
     validate_non_negative(estimate, "estimate")
     validate_ttl_ms(cfg.ttl_ms)
@@ -127,7 +131,9 @@ def _build_reservation_body(cfg: DecoratorConfig, estimate: int, default_subject
     return body
 
 
-def _build_commit_body(actual: int, unit: str, metrics: CyclesMetrics | None, metadata: dict[str, Any] | None) -> dict[str, Any]:
+def _build_commit_body(
+    actual: int, unit: str, metrics: CyclesMetrics | None, metadata: dict[str, Any] | None,
+) -> dict[str, Any]:
     body: dict[str, Any] = {
         "idempotency_key": str(uuid.uuid4()),
         "actual": {"unit": unit, "amount": actual},
@@ -144,6 +150,7 @@ def _build_release_body(reason: str) -> dict[str, Any]:
 
 
 def _build_extend_body(ttl_ms: int) -> dict[str, Any]:
+    validate_extend_by_ms(ttl_ms)
     return {"idempotency_key": str(uuid.uuid4()), "extend_by_ms": ttl_ms}
 
 
@@ -207,7 +214,9 @@ def _build_protocol_exception(prefix: str, response: CyclesResponse) -> CyclesPr
 class CyclesLifecycle:
     """Synchronous lifecycle orchestrator: reserve → execute → commit/release."""
 
-    def __init__(self, client: CyclesClient, retry_engine: CommitRetryEngine, default_subject: dict[str, str | None]) -> None:
+    def __init__(
+        self, client: CyclesClient, retry_engine: CommitRetryEngine, default_subject: dict[str, str | None],
+    ) -> None:
         self._client = client
         self._retry_engine = retry_engine
         self._retry_engine.set_client(client)
@@ -311,7 +320,7 @@ class CyclesLifecycle:
 
             return result
 
-        except Exception as ex:
+        except Exception:
             logger.error("Guarded action failed, releasing: id=%s", reservation_id, exc_info=True)
             self._handle_release(reservation_id, "guarded_method_failed")
             raise
@@ -389,7 +398,9 @@ class CyclesLifecycle:
 class AsyncCyclesLifecycle:
     """Asynchronous lifecycle orchestrator: reserve → execute → commit/release."""
 
-    def __init__(self, client: AsyncCyclesClient, retry_engine: AsyncCommitRetryEngine, default_subject: dict[str, str | None]) -> None:
+    def __init__(
+        self, client: AsyncCyclesClient, retry_engine: AsyncCommitRetryEngine, default_subject: dict[str, str | None],
+    ) -> None:
         self._client = client
         self._retry_engine = retry_engine
         self._retry_engine.set_client(client)
@@ -406,7 +417,6 @@ class AsyncCyclesLifecycle:
         logger.debug("Estimated usage: estimate=%d", estimate)
 
         create_body = _build_reservation_body(cfg, estimate, self._default_subject)
-        res_t1 = time.monotonic()
         res_response = await self._client.create_reservation(create_body)
 
         if not res_response.is_success:
@@ -420,7 +430,6 @@ class AsyncCyclesLifecycle:
         reason_code = res_result.reason_code
 
         if cfg.dry_run:
-            elapsed_ms = int((res_t2 - res_t1) * 1000)
             if decision == Decision.DENY:
                 raise _build_protocol_exception("Dry-run denied", res_response)
             return DryRunResult(
