@@ -34,7 +34,7 @@ from runcycles.models import (
 )
 from runcycles.response import CyclesResponse
 from runcycles.retry import AsyncCommitRetryEngine, CommitRetryEngine
-from runcycles._validation import validate_grace_period_ms, validate_non_negative, validate_subject, validate_ttl_ms
+from runcycles._validation import validate_extend_by_ms, validate_grace_period_ms, validate_non_negative, validate_subject, validate_ttl_ms
 
 logger = logging.getLogger(__name__)
 
@@ -144,6 +144,7 @@ def _build_release_body(reason: str) -> dict[str, Any]:
 
 
 def _build_extend_body(ttl_ms: int) -> dict[str, Any]:
+    validate_extend_by_ms(ttl_ms)
     return {"idempotency_key": str(uuid.uuid4()), "extend_by_ms": ttl_ms}
 
 
