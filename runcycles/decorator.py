@@ -140,50 +140,53 @@ def cycles(
         use_estimate_if_actual_not_provided=use_estimate_if_actual_not_provided,
     )
 
+    def _build_lifecycle(
+        effective_client: CyclesClient | AsyncCyclesClient,
+    ) -> CyclesLifecycle | AsyncCyclesLifecycle:
+        config = effective_client._config
+        default_subject = {
+            "tenant": config.tenant,
+            "workspace": config.workspace,
+            "app": config.app,
+            "workflow": config.workflow,
+            "agent": config.agent,
+            "toolset": config.toolset,
+        }
+        if isinstance(effective_client, AsyncCyclesClient):
+            retry_engine = AsyncCommitRetryEngine(config)
+            return AsyncCyclesLifecycle(effective_client, retry_engine, default_subject)
+        retry_engine = CommitRetryEngine(config)
+        return CyclesLifecycle(effective_client, retry_engine, default_subject)
+
     def decorator(fn: F) -> F:
         is_async = inspect.iscoroutinefunction(fn)
+        _cached: list[CyclesLifecycle | AsyncCyclesLifecycle | None] = [None]
 
         if is_async:
 
             @functools.wraps(fn)
             async def async_wrapper(*args: Any, **kwargs: Any) -> Any:
-                effective_client = _get_effective_client(client, is_async=True)
-                if not isinstance(effective_client, AsyncCyclesClient):
-                    raise TypeError("Async function requires an AsyncCyclesClient")
-
-                config = effective_client._config
-                default_subject = {
-                    "tenant": config.tenant,
-                    "workspace": config.workspace,
-                    "app": config.app,
-                    "workflow": config.workflow,
-                    "agent": config.agent,
-                    "toolset": config.toolset,
-                }
-                retry_engine = AsyncCommitRetryEngine(config)
-                lifecycle = AsyncCyclesLifecycle(effective_client, retry_engine, default_subject)
-                return await lifecycle.execute(fn, args, kwargs, cfg)
+                lifecycle = _cached[0]
+                if lifecycle is None:
+                    effective_client = _get_effective_client(client, is_async=True)
+                    if not isinstance(effective_client, AsyncCyclesClient):
+                        raise TypeError("Async function requires an AsyncCyclesClient")
+                    lifecycle = _build_lifecycle(effective_client)
+                    _cached[0] = lifecycle
+                return await lifecycle.execute(fn, args, kwargs, cfg)  # type: ignore[union-attr]
 
             return async_wrapper  # type: ignore[return-value]
         else:
 
             @functools.wraps(fn)
             def sync_wrapper(*args: Any, **kwargs: Any) -> Any:
-                effective_client = _get_effective_client(client, is_async=False)
-                if not isinstance(effective_client, CyclesClient):
-                    raise TypeError("Sync function requires a CyclesClient")
-
-                config = effective_client._config
-                default_subject = {
-                    "tenant": config.tenant,
-                    "workspace": config.workspace,
-                    "app": config.app,
-                    "workflow": config.workflow,
-                    "agent": config.agent,
-                    "toolset": config.toolset,
-                }
-                retry_engine = CommitRetryEngine(config)
-                lifecycle = CyclesLifecycle(effective_client, retry_engine, default_subject)
+                lifecycle = _cached[0]
+                if lifecycle is None:
+                    effective_client = _get_effective_client(client, is_async=False)
+                    if not isinstance(effective_client, CyclesClient):
+                        raise TypeError("Sync function requires a CyclesClient")
+                    lifecycle = _build_lifecycle(effective_client)
+                    _cached[0] = lifecycle
                 return lifecycle.execute(fn, args, kwargs, cfg)
 
             return sync_wrapper  # type: ignore[return-value]
