@@ -88,12 +88,19 @@ def stream_with_budget(
         error = reserve_response.get_error_response()
         if error and error.error_code == "BUDGET_EXCEEDED":
             raise BudgetExceededError(
+                error.message,
                 status=reserve_response.status,
-                error_response=error,
+                error_code=error.error,
+                request_id=error.request_id,
+                details=error.details,
             )
+        msg = error.message if error else (reserve_response.error_message or "Reservation failed")
         raise CyclesProtocolError(
+            msg,
             status=reserve_response.status,
-            error_response=error,
+            error_code=error.error if error else None,
+            request_id=error.request_id if error else None,
+            details=error.details if error else None,
         )
 
     reservation_id = reserve_response.get_body_attribute("reservation_id")
