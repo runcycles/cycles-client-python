@@ -38,4 +38,9 @@ strict = true
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
-addopts = "--cov=runcycles --cov-fail-under=95"
+
+[tool.coverage.run]
+source = ["runcycles"]
+
+[tool.coverage.report]
+fail_under = 95

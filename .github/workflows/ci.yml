@@ -35,4 +35,4 @@ jobs:
         run: mypy runcycles
 
       - name: Run tests with coverage
-        run: pytest
+        run: pytest --cov
