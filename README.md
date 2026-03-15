@@ -301,6 +301,23 @@ def overdraft_func() -> str:
 - **Response metadata**: Access `request_id`, `rate_limit_remaining`, and `rate_limit_reset` on every response
 - **Environment config**: `CyclesConfig.from_env()` for 12-factor apps
 
+## Examples
+
+The [`examples/`](examples/) directory contains runnable integration examples:
+
+| Example | Description |
+|---------|-------------|
+| [basic_usage.py](examples/basic_usage.py) | Programmatic reserve → commit lifecycle |
+| [decorator_usage.py](examples/decorator_usage.py) | `@cycles` decorator with estimates, caps, and metrics |
+| [async_usage.py](examples/async_usage.py) | Async client and async decorator |
+| [openai_integration.py](examples/openai_integration.py) | Guard OpenAI chat completions with budget checks |
+| [anthropic_integration.py](examples/anthropic_integration.py) | Guard Anthropic messages with per-tool budget tracking |
+| [streaming_usage.py](examples/streaming_usage.py) | Budget-managed streaming with token accumulation |
+| [fastapi_integration.py](examples/fastapi_integration.py) | FastAPI middleware, dependency injection, per-tenant budgets |
+| [langchain_integration.py](examples/langchain_integration.py) | LangChain callback handler for budget-aware agents |
+
+See [examples/README.md](examples/README.md) for setup instructions.
+
 ## Development
 
 ```bash
