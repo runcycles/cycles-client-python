@@ -86,7 +86,7 @@ def stream_with_budget(
 
     if not reserve_response.is_success:
         error = reserve_response.get_error_response()
-        if error and error.error_code == "BUDGET_EXCEEDED":
+        if error and error.error == "BUDGET_EXCEEDED":
             raise BudgetExceededError(
                 error.message,
                 status=reserve_response.status,

@@ -153,7 +153,7 @@ def chat_with_tools(prompt: str) -> str:
 
         if not reserve_response.is_success:
             error_resp = reserve_response.get_error_response()
-            if error_resp and error_resp.error_code == "BUDGET_EXCEEDED":
+            if error_resp and error_resp.error == "BUDGET_EXCEEDED":
                 return "Budget exhausted — cannot continue conversation."
             return f"Reservation failed: {reserve_response.error_message}"
 
