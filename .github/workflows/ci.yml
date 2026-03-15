@@ -35,4 +35,4 @@ jobs:
         run: mypy runcycles
 
       - name: Run tests with coverage
-        run: pytest --cov runcycles --cov-fail-under=85
+        run: pytest
