@@ -46,6 +46,15 @@ def call_llm(prompt: str, tokens: int) -> str:
 result = call_llm("Hello", tokens=100)
 ```
 
+> **Need an API key?** API keys are created via the Cycles Admin Server (port 7979). See the [deployment guide](https://docs.runcycles.io/quickstart/deploying-the-full-cycles-stack#step-3-create-an-api-key) to create one, or run:
+> ```bash
+> curl -s -X POST http://localhost:7979/v1/admin/api-keys \
+>   -H "Content-Type: application/json" \
+>   -H "X-Admin-API-Key: admin-bootstrap-key" \
+>   -d '{"tenant_id":"acme-corp","name":"dev-key","permissions":["reservations:create","reservations:commit","reservations:release","reservations:extend","reservations:list","balances:read","decide","events:create"]}' | jq -r '.key_secret'
+> ```
+> The key (e.g. `cyc_live_abc123...`) is shown only once — save it immediately. For key rotation and lifecycle details, see [API Key Management](https://docs.runcycles.io/how-to/api-key-management-in-cycles).
+
 ### Programmatic client
 
 ```python
@@ -105,6 +114,8 @@ from runcycles import CyclesConfig
 config = CyclesConfig.from_env()
 # Reads: CYCLES_BASE_URL, CYCLES_API_KEY, CYCLES_TENANT, etc.
 ```
+
+> **Need an API key?** See the [deployment guide](https://docs.runcycles.io/quickstart/deploying-the-full-cycles-stack#step-3-create-an-api-key) or [API Key Management](https://docs.runcycles.io/how-to/api-key-management-in-cycles).
 
 ### All options
 
