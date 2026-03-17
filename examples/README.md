@@ -4,12 +4,12 @@ Runnable examples demonstrating how to integrate the `runcycles` client into rea
 
 ## Prerequisites
 
-1. A running Cycles server (see [Deploy the Full Stack](https://runcycles.github.io/docs/quickstart/deploying-the-full-cycles-stack))
+1. A running Cycles server (see [Deploy the Full Stack](https://runcycles.io/quickstart/deploying-the-full-cycles-stack))
 2. Set environment variables:
 
 ```bash
 export CYCLES_BASE_URL="http://localhost:7878"
-export CYCLES_API_KEY="your-api-key"
+export CYCLES_API_KEY="your-api-key"   # create via Admin Server — see link above
 export CYCLES_TENANT="acme"
 ```
 
