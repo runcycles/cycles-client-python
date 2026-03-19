@@ -1,3 +1,7 @@
+[![PyPI](https://img.shields.io/pypi/v/runcycles)](https://pypi.org/project/runcycles/)
+[![CI](https://github.com/runcycles/cycles-client-python/actions/workflows/ci.yml/badge.svg)](https://github.com/runcycles/cycles-client-python/actions)
+[![License](https://img.shields.io/badge/license-Apache%202.0-blue)](LICENSE)
+
 # Cycles Python Client
 
 Python client for the [Cycles](https://runcycles.io) budget-management protocol.
