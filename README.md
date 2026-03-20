@@ -350,6 +350,13 @@ pytest --cov runcycles --cov-fail-under=85
 
 CI runs all three checks on Python 3.10 and 3.12 for every push and pull request.
 
+## Documentation
+
+- [Cycles Documentation](https://runcycles.io) — full docs site
+- [Python Quickstart](https://runcycles.io/quickstart/getting-started-with-the-python-client) — getting started guide
+- [Python Client Configuration Reference](https://runcycles.io/configuration/python-client-configuration-reference) — all configuration options
+- [Error Handling Patterns in Python](https://runcycles.io/how-to/error-handling-patterns-in-python) — handling budget errors
+
 ## Requirements
 
 - Python 3.10+
