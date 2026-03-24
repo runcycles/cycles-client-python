@@ -65,7 +65,7 @@ The `@cycles` decorator wraps your function in a reserve → execute → commit/
 
 | Scenario | Outcome | Detail |
 |---|---|---|
-| Reservation denied (409) | **Neither** | `BudgetExceededError` (or similar) raised; function never executes |
+| Reservation denied | **Neither** | `BudgetExceededError`, `OverdraftLimitExceededError`, or `DebtOutstandingError` raised; function never executes |
 | `dry_run=True`, any decision | **Neither** | Returns `DryRunResult` or raises; no real reservation created |
 | Function returns successfully | **Commit** | Actual amount charged; unused remainder auto-released |
 | Function raises any exception | **Release** | Full reserved amount returned to budget; exception re-raised |
@@ -73,6 +73,7 @@ The `@cycles` decorator wraps your function in a reserve → execute → commit/
 | Commit fails (non-retryable 4xx) | **Release** | Reservation released after non-retryable client error |
 | Commit gets RESERVATION_EXPIRED | **Neither** | Server already reclaimed budget on TTL expiry |
 | Commit gets RESERVATION_FINALIZED | **Neither** | Already committed or released (idempotent replay) |
+| Commit gets IDEMPOTENCY_MISMATCH | **Neither** | Previous commit already processed; no release attempted |
 
 All raised exceptions from the guarded function trigger release. See [How Reserve-Commit Works](https://runcycles.io/protocol/how-reserve-commit-works-in-cycles) for the full protocol-level explanation.
 
