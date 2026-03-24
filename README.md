@@ -312,8 +312,8 @@ Control what happens when actual usage exceeds the estimate at commit time:
 ```python
 from runcycles import CommitOveragePolicy
 
-# REJECT (default) — commit fails if budget is insufficient for the overage
-# ALLOW_IF_AVAILABLE — commit succeeds if remaining budget covers the overage
+# REJECT — commit fails if budget is insufficient for the overage
+# ALLOW_IF_AVAILABLE (default) — commit succeeds if remaining budget covers the overage
 # ALLOW_WITH_OVERDRAFT — commit always succeeds, may create debt
 
 @cycles(estimate=1000, overage_policy="ALLOW_WITH_OVERDRAFT", client=client)
