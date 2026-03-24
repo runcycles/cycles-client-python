@@ -62,7 +62,7 @@ def cycles(
     unit: Unit | str = Unit.USD_MICROCENTS,
     ttl_ms: int = 60_000,
     grace_period_ms: int | None = None,
-    overage_policy: str = "REJECT",
+    overage_policy: str = "ALLOW_IF_AVAILABLE",
     dry_run: bool = False,
     tenant: str | None = None,
     workspace: str | None = None,
@@ -87,7 +87,7 @@ def cycles(
         unit: Cost unit. Default: USD_MICROCENTS.
         ttl_ms: Reservation TTL in milliseconds. Default: 60000.
         grace_period_ms: Grace period after TTL expiry in milliseconds.
-        overage_policy: REJECT, ALLOW_IF_AVAILABLE, or ALLOW_WITH_OVERDRAFT.
+        overage_policy: REJECT, ALLOW_IF_AVAILABLE (default), or ALLOW_WITH_OVERDRAFT.
         dry_run: If True, evaluate without persisting (method won't execute).
         tenant: Subject tenant override.
         workspace: Subject workspace override.

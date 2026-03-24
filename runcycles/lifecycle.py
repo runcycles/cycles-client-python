@@ -53,7 +53,7 @@ class DecoratorConfig:
     unit: str = "USD_MICROCENTS"
     ttl_ms: int = 60_000
     grace_period_ms: int | None = None
-    overage_policy: str = "REJECT"
+    overage_policy: str = "ALLOW_IF_AVAILABLE"
     dry_run: bool = False
     tenant: str | None = None
     workspace: str | None = None
