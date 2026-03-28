@@ -2,9 +2,8 @@
 
 from __future__ import annotations
 
-import pathlib
-
 import copy
+import pathlib
 
 import pytest
 import yaml
