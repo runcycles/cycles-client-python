@@ -167,3 +167,18 @@ All spec constraints are validated both via Pydantic Field validators (on typed 
 ## Verdict
 
 The client is **fully protocol-conformant** with the Cycles Protocol v0.1.23 OpenAPI spec. All 9 endpoints, 6 request schemas, 10 response schemas, 5 enum types, and all nested object serializations match the spec exactly. JSON field names use correct snake_case throughout. Auth headers, idempotency handling, subject validation, response header capture, and spec constraint validation all follow spec normative rules. No open issues.
+
+---
+
+## OpenAPI Contract Tests (added 2026-03-28)
+
+**Spec version:** v0.1.24
+**Test file:** `tests/test_contract.py` (34 tests, all passing)
+
+Automated contract tests validate sample request/response payloads against the OpenAPI spec schemas using `jsonschema.Draft202012Validator` with recursive `$ref` resolution:
+
+- **Request schemas validated:** DecisionRequest, ReservationCreateRequest, CommitRequest, ReleaseRequest, EventCreateRequest
+- **Response schemas validated:** DecisionResponse, ReservationCreateResponse, CommitResponse, ReleaseResponse, EventCreateResponse, ErrorResponse
+- **Negative tests:** missing required fields, extra fields (additionalProperties), invalid enum values
+- **Enum value tests:** UnitEnum, ErrorCode, DecisionEnum, ReservationStatus, CommitOveragePolicy
+- **Spec fixture:** `tests/fixtures/cycles-protocol-v0.yaml` (copy of canonical spec)
