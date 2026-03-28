@@ -3,6 +3,7 @@ Integration tests against a live Cycles server.
 Skipped unless CYCLES_BASE_URL is set.
 """
 import os
+
 import pytest
 
 pytestmark = pytest.mark.skipif(

@@ -2,9 +2,8 @@
 
 from __future__ import annotations
 
-import pathlib
-
 import copy
+import pathlib
 
 import pytest
 import yaml
@@ -20,7 +19,7 @@ JSON_SCHEMA_2020_12 = "https://json-schema.org/draft/2020-12/schema"
 # ---------------------------------------------------------------------------
 
 def _load_spec() -> dict:
-    with open(SPEC_PATH) as f:
+    with open(SPEC_PATH, encoding="utf-8") as f:
         return yaml.safe_load(f)
 
 
