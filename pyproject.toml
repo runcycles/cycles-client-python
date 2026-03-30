@@ -40,6 +40,13 @@ dependencies = [
     "pydantic>=2.0",
 ]
 
+[project.urls]
+Homepage = "https://runcycles.io"
+Documentation = "https://runcycles.io/quickstart/getting-started-with-the-python-client"
+Repository = "https://github.com/runcycles/cycles-client-python"
+Changelog = "https://runcycles.io/changelog"
+"Bug Tracker" = "https://github.com/runcycles/cycles-client-python/issues"
+
 [project.optional-dependencies]
 dev = [
     "pytest>=7.0",
