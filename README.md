@@ -1,4 +1,5 @@
 [![PyPI](https://img.shields.io/pypi/v/runcycles)](https://pypi.org/project/runcycles/)
+[![PyPI Downloads](https://img.shields.io/pypi/dm/runcycles)](https://pypi.org/project/runcycles/)
 [![CI](https://github.com/runcycles/cycles-client-python/actions/workflows/ci.yml/badge.svg)](https://github.com/runcycles/cycles-client-python/actions)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue)](LICENSE)
 [![Coverage](https://img.shields.io/badge/coverage-100%25-brightgreen)](https://github.com/runcycles/cycles-client-python/actions)
