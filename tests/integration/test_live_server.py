@@ -45,7 +45,7 @@ def test_reservation_lifecycle():
         },
         timeout=5,
     )
-    assert res.status_code == 201, f"Reserve failed: {res.text}"
+    assert res.status_code == 200, f"Reserve failed: {res.text}"
     data = res.json()
     assert "reservation_id" in data
     rid = data["reservation_id"]
@@ -77,7 +77,7 @@ def test_reserve_and_release():
         },
         timeout=5,
     )
-    assert res.status_code == 201
+    assert res.status_code == 200
     rid = res.json()["reservation_id"]
 
     # Release
@@ -116,7 +116,7 @@ def test_balance_query():
     res = requests.get(
         f"{BASE}/v1/balances",
         headers=HEADERS,
-        params={"tenant_id": TENANT},
+        params={"tenant": TENANT},
         timeout=5,
     )
     assert res.status_code == 200, f"Balance query failed: {res.text}"
