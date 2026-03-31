@@ -11,7 +11,8 @@ import os
 from uuid import uuid4
 
 import pytest
-import requests
+
+requests = pytest.importorskip("requests")
 
 pytestmark = pytest.mark.skipif(
     not os.environ.get("CYCLES_BASE_URL"),
