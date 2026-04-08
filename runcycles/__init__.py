@@ -51,6 +51,7 @@ from runcycles.models import (
     Unit,
 )
 from runcycles.response import CyclesResponse
+from runcycles.streaming import AsyncStreamReservation, StreamReservation, StreamUsage
 
 __all__ = [
     # Client
@@ -67,6 +68,10 @@ __all__ = [
     "get_cycles_context",
     # Response
     "CyclesResponse",
+    # Streaming
+    "StreamReservation",
+    "AsyncStreamReservation",
+    "StreamUsage",
     # Exceptions
     "CyclesError",
     "CyclesProtocolError",
