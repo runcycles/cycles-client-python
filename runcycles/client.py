@@ -3,10 +3,15 @@
 from __future__ import annotations
 
 import logging
-from typing import Any
+from collections.abc import Callable
+from typing import TYPE_CHECKING, Any
 
 import httpx
 from pydantic import BaseModel
+
+if TYPE_CHECKING:
+    from runcycles.models import Action, Amount, Subject
+    from runcycles.streaming import AsyncStreamReservation, StreamReservation, StreamUsage
 
 from runcycles._constants import (
     API_KEY_HEADER,
@@ -55,8 +60,7 @@ def _validate_balance_filters(params: dict[str, str]) -> None:
     """Validate that at least one subject filter is provided for balance queries."""
     if not any(k in _BALANCE_FILTER_PARAMS for k in params):
         raise ValueError(
-            "get_balances requires at least one subject filter"
-            " (tenant, workspace, app, workflow, agent, or toolset)"
+            "get_balances requires at least one subject filter (tenant, workspace, app, workflow, agent, or toolset)"
         )
 
 
@@ -106,6 +110,43 @@ class CyclesClient:
     def create_event(self, request: BaseModel | dict[str, Any]) -> CyclesResponse:
         return self._post(EVENTS_PATH, request)
 
+    def stream_reservation(
+        self,
+        *,
+        subject: Subject | None = None,
+        action: Action,
+        estimate: Amount,
+        ttl_ms: int = 120_000,
+        grace_period_ms: int | None = None,
+        overage_policy: str = "ALLOW_IF_AVAILABLE",
+        cost_fn: Callable[[StreamUsage], int] | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> StreamReservation:
+        """Return a context manager that reserves budget on enter and commits/releases on exit."""
+        from runcycles.models import Subject as _Subject
+        from runcycles.streaming import StreamReservation as _SR
+
+        if subject is None:
+            subject = _Subject(
+                tenant=self._config.tenant,
+                workspace=self._config.workspace,
+                app=self._config.app,
+                workflow=self._config.workflow,
+                agent=self._config.agent,
+                toolset=self._config.toolset,
+            )
+        return _SR(
+            self,
+            subject=subject,
+            action=action,
+            estimate=estimate,
+            ttl_ms=ttl_ms,
+            grace_period_ms=grace_period_ms,
+            overage_policy=overage_policy,
+            cost_fn=cost_fn,
+            metadata=metadata,
+        )
+
     def close(self) -> None:
         self._http.close()
 
@@ -152,7 +193,10 @@ class CyclesClient:
             if body and isinstance(body, dict):
                 error_msg = body.get("message") or body.get("error")
             return CyclesResponse.http_error(
-                resp.status_code, error_msg or resp.reason_phrase or "Unknown error", body, headers=headers,
+                resp.status_code,
+                error_msg or resp.reason_phrase or "Unknown error",
+                body,
+                headers=headers,
             )
 
 
@@ -202,6 +246,43 @@ class AsyncCyclesClient:
     async def create_event(self, request: BaseModel | dict[str, Any]) -> CyclesResponse:
         return await self._post(EVENTS_PATH, request)
 
+    def stream_reservation(
+        self,
+        *,
+        subject: Subject | None = None,
+        action: Action,
+        estimate: Amount,
+        ttl_ms: int = 120_000,
+        grace_period_ms: int | None = None,
+        overage_policy: str = "ALLOW_IF_AVAILABLE",
+        cost_fn: Callable[[StreamUsage], int] | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> AsyncStreamReservation:
+        """Return an async context manager that reserves budget on enter and commits/releases on exit."""
+        from runcycles.models import Subject as _Subject
+        from runcycles.streaming import AsyncStreamReservation as _ASR
+
+        if subject is None:
+            subject = _Subject(
+                tenant=self._config.tenant,
+                workspace=self._config.workspace,
+                app=self._config.app,
+                workflow=self._config.workflow,
+                agent=self._config.agent,
+                toolset=self._config.toolset,
+            )
+        return _ASR(
+            self,
+            subject=subject,
+            action=action,
+            estimate=estimate,
+            ttl_ms=ttl_ms,
+            grace_period_ms=grace_period_ms,
+            overage_policy=overage_policy,
+            cost_fn=cost_fn,
+            metadata=metadata,
+        )
+
     async def aclose(self) -> None:
         await self._http.aclose()
 
@@ -248,5 +329,8 @@ class AsyncCyclesClient:
             if body and isinstance(body, dict):
                 error_msg = body.get("message") or body.get("error")
             return CyclesResponse.http_error(
-                resp.status_code, error_msg or resp.reason_phrase or "Unknown error", body, headers=headers,
+                resp.status_code,
+                error_msg or resp.reason_phrase or "Unknown error",
+                body,
+                headers=headers,
             )

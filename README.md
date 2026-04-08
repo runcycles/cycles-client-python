@@ -128,6 +128,34 @@ async def call_llm(prompt: str) -> str:
 result = await call_llm("Hello")
 ```
 
+### Streaming
+
+For streaming LLM responses, use the `stream_reservation()` context manager. It reserves budget on enter, auto-commits on successful exit, and auto-releases on exception:
+
+```python
+from runcycles import CyclesClient, CyclesConfig, Action, Amount, Unit
+
+config = CyclesConfig(base_url="http://localhost:7878", api_key="your-api-key", tenant="acme")
+client = CyclesClient(config)
+
+with client.stream_reservation(
+    action=Action(kind="llm.completion", name="gpt-4o"),
+    estimate=Amount(unit=Unit.USD_MICROCENTS, amount=max_tokens * 1000),
+    cost_fn=lambda u: u.tokens_input * 250 + u.tokens_output * 1000,
+) as reservation:
+    # Caps available immediately
+    if reservation.caps and reservation.caps.max_tokens:
+        max_tokens = min(max_tokens, reservation.caps.max_tokens)
+
+    for chunk in openai_stream:
+        if chunk.usage:
+            reservation.usage.tokens_input = chunk.usage.prompt_tokens
+            reservation.usage.tokens_output = chunk.usage.completion_tokens
+# Committed automatically with actual cost from cost_fn
+```
+
+Also available as `async with client.stream_reservation(...)` for async clients. See [streaming_usage.py](examples/streaming_usage.py) for a complete example.
+
 ## Configuration
 
 ### From environment variables
