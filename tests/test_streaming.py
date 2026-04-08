@@ -754,10 +754,11 @@ class TestAsyncStreamReservation:
         )
 
         async with asr as reservation:
-            reservation.usage.tokens_input = 200
+            reservation.usage.tokens_input = 300
 
         commit_body = mock.commit_reservation.call_args[0][1]
-        assert commit_body["actual"]["amount"] == 1000
+        # 300 * 5 = 1500, distinct from estimate (1000)
+        assert commit_body["actual"]["amount"] == 1500
 
     @pytest.mark.asyncio
     async def test_context_set_and_cleared(self) -> None:

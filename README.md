@@ -133,25 +133,38 @@ result = await call_llm("Hello")
 For streaming LLM responses, use the `stream_reservation()` context manager. It reserves budget on enter, auto-commits on successful exit, and auto-releases on exception:
 
 ```python
+from openai import OpenAI
 from runcycles import CyclesClient, CyclesConfig, Action, Amount, Unit
 
 config = CyclesConfig(base_url="http://localhost:7878", api_key="your-api-key", tenant="acme")
-client = CyclesClient(config)
+cycles_client = CyclesClient(config)
+openai_client = OpenAI()
+max_tokens = 1024
 
-with client.stream_reservation(
+with cycles_client.stream_reservation(
     action=Action(kind="llm.completion", name="gpt-4o"),
     estimate=Amount(unit=Unit.USD_MICROCENTS, amount=max_tokens * 1000),
     cost_fn=lambda u: u.tokens_input * 250 + u.tokens_output * 1000,
 ) as reservation:
-    # Caps available immediately
+    # Caps available immediately after entering the context
     if reservation.caps and reservation.caps.max_tokens:
         max_tokens = min(max_tokens, reservation.caps.max_tokens)
 
-    for chunk in openai_stream:
+    stream = openai_client.chat.completions.create(
+        model="gpt-4o",
+        messages=[{"role": "user", "content": "Hello"}],
+        max_tokens=max_tokens,
+        stream=True,
+        stream_options={"include_usage": True},
+    )
+
+    for chunk in stream:
+        if chunk.choices and chunk.choices[0].delta.content:
+            print(chunk.choices[0].delta.content, end="", flush=True)
         if chunk.usage:
             reservation.usage.tokens_input = chunk.usage.prompt_tokens
             reservation.usage.tokens_output = chunk.usage.completion_tokens
-# Committed automatically with actual cost from cost_fn
+# Committed automatically with actual cost computed by cost_fn
 ```
 
 Also available as `async with client.stream_reservation(...)` for async clients. See [streaming_usage.py](examples/streaming_usage.py) for a complete example.
@@ -402,7 +415,7 @@ The [`examples/`](examples/) directory contains runnable integration examples:
 | [async_usage.py](examples/async_usage.py) | Async client and async decorator |
 | [openai_integration.py](examples/openai_integration.py) | Guard OpenAI chat completions with budget checks |
 | [anthropic_integration.py](examples/anthropic_integration.py) | Guard Anthropic messages with per-tool budget tracking |
-| [streaming_usage.py](examples/streaming_usage.py) | Budget-managed streaming with token accumulation |
+| [streaming_usage.py](examples/streaming_usage.py) | `stream_reservation()` context manager with auto-commit |
 | [fastapi_integration.py](examples/fastapi_integration.py) | FastAPI middleware, dependency injection, per-tenant budgets |
 | [langchain_integration.py](examples/langchain_integration.py) | LangChain callback handler for budget-aware agents |
 

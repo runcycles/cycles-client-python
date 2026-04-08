@@ -188,7 +188,8 @@ Automated contract tests validate sample request/response payloads against the O
 ## Streaming Convenience Module (added 2026-04-08)
 
 **Module:** `runcycles/streaming.py`
-**Test file:** `tests/test_streaming.py` (57 tests, all passing)
+**Test file:** `tests/test_streaming.py` (64 tests, all passing)
+**Version:** 0.3.0
 
 Added `StreamReservation` and `AsyncStreamReservation` context managers that automate the reserve → commit/release lifecycle for streaming use cases. This is a DX convenience layer — no protocol changes.
 
@@ -197,8 +198,10 @@ Added `StreamReservation` and `AsyncStreamReservation` context managers that aut
 - **`StreamUsage`** — mutable accumulator for token counts and cost during streaming
 - **Client convenience methods:** `CyclesClient.stream_reservation()` and `AsyncCyclesClient.stream_reservation()` — thin factories that build Subject from config defaults
 - **Cost resolution:** explicit `usage.actual_cost` > `cost_fn(usage)` > estimate fallback
-- **Heartbeat:** automatic TTL extension, same interval formula as decorator lifecycle
+- **Heartbeat:** automatic TTL extension, same interval formula as decorator lifecycle (`max(ttl_ms / 2, 1000)` ms)
 - **Commit retry:** uses existing `CommitRetryEngine`/`AsyncCommitRetryEngine`
-- **Context propagation:** sets/clears `CyclesContext` via `ContextVar`, accessible via `get_cycles_context()`
+- **Context propagation:** sets/clears `CyclesContext` via `ContextVar`, accessible via `get_cycles_context()`; respects user-set `ctx.metrics` during streaming
+- **Spec validation:** `validate_ttl_ms()` (1000–86400000), `validate_grace_period_ms()` (0–60000), `validate_subject()` (at least one standard field) — matches lifecycle.py
+- **Error handling:** `RESERVATION_FINALIZED`, `RESERVATION_EXPIRED`, and `IDEMPOTENCY_MISMATCH` do not trigger release; other 4xx client errors do trigger release — matches lifecycle.py behavior exactly
 
-Protocol conformance: No new endpoints or protocol changes. All reservation, commit, release, and extend calls use the same client methods and body formats as the decorator path. Verified by 57 unit tests covering success, deny, error, retry, heartbeat, cost resolution, and context propagation.
+Protocol conformance: No new endpoints or protocol changes. All reservation, commit, release, and extend calls use the same client methods and body formats as the decorator path. Verified by 64 unit tests covering success, deny, error, retry, heartbeat, cost resolution, context propagation, spec validation, and all commit error-code branches.

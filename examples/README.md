@@ -28,7 +28,7 @@ pip install runcycles
 | [async_usage.py](async_usage.py) | Async client and async decorator | — |
 | [openai_integration.py](openai_integration.py) | Guard OpenAI chat completions with budget checks | `openai` |
 | [anthropic_integration.py](anthropic_integration.py) | Guard Anthropic messages with per-tool budget tracking | `anthropic` |
-| [streaming_usage.py](streaming_usage.py) | Budget-managed streaming with token accumulation | `openai` |
+| [streaming_usage.py](streaming_usage.py) | `stream_reservation()` context manager with auto-commit | `openai` |
 | [fastapi_integration.py](fastapi_integration.py) | FastAPI middleware, dependency injection, per-tenant budgets | `fastapi`, `uvicorn` |
 | [langchain_integration.py](langchain_integration.py) | LangChain callback handler for budget-aware agents | `langchain`, `langchain-openai` |
 
