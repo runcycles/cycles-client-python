@@ -15,6 +15,10 @@ on:
           - testpypi
           - pypi
 
+# Default least-privilege; publish-* jobs override with id-token: write.
+permissions:
+  contents: read
+
 jobs:
   build:
     name: Build distributions
