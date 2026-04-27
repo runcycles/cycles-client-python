@@ -213,6 +213,7 @@ Protocol conformance: No new endpoints or protocol changes. All reservation, com
 **Issue:** [#45](https://github.com/runcycles/cycles-client-python/issues/45)
 **Files:** `runcycles/lifecycle.py`, `runcycles/decorator.py`
 **Test files:** `tests/test_lifecycle.py`, `tests/test_decorator.py`
+**Version:** 0.4.0
 
 Widened the `@cycles` decorator to accept callables — in addition to constants — for every field that previously had to be static at decoration time. Mirrors the existing `estimate` / `actual` callable contract and re-aligns the Python client with the Java client's `@Cycles(workspace = "#workspaceId")` SpEL behavior shipped in `cycles-spring-boot-starter` 0.2.1 ([java#50](https://github.com/runcycles/cycles-spring-boot-starter/pull/50)).
 

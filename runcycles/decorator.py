@@ -127,6 +127,17 @@ def cycles(
         )
         def call_llm(prompt: str, tokens: int) -> str:
             return openai.complete(prompt, max_tokens=tokens)
+
+        # Per-call subject/action routing via callables
+        @cycles(
+            estimate=1000,
+            workspace=lambda req, workspace_id: workspace_id,
+            action_kind=lambda req, *_: f"llm.{req.provider}",
+            action_name=lambda req, *_: req.model,
+            client=my_client,
+        )
+        def run_request(req: Request, workspace_id: str) -> Response:
+            ...
     """
     unit_str = unit.value if isinstance(unit, Unit) else str(unit)
 
