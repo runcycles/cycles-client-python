@@ -56,46 +56,57 @@ def cycles(
     estimate: int | Callable[..., int],
     *,
     actual: int | Callable[..., int] | None = None,
-    action_kind: str | None = None,
-    action_name: str | None = None,
-    action_tags: list[str] | None = None,
+    action_kind: str | Callable[..., str | None] | None = None,
+    action_name: str | Callable[..., str | None] | None = None,
+    action_tags: list[str] | Callable[..., list[str] | None] | None = None,
     unit: Unit | str = Unit.USD_MICROCENTS,
     ttl_ms: int = 60_000,
     grace_period_ms: int | None = None,
     overage_policy: str = "ALLOW_IF_AVAILABLE",
     dry_run: bool = False,
-    tenant: str | None = None,
-    workspace: str | None = None,
-    app: str | None = None,
-    workflow: str | None = None,
-    agent: str | None = None,
-    toolset: str | None = None,
-    dimensions: dict[str, str] | None = None,
+    tenant: str | Callable[..., str | None] | None = None,
+    workspace: str | Callable[..., str | None] | None = None,
+    app: str | Callable[..., str | None] | None = None,
+    workflow: str | Callable[..., str | None] | None = None,
+    agent: str | Callable[..., str | None] | None = None,
+    toolset: str | Callable[..., str | None] | None = None,
+    dimensions: dict[str, str] | Callable[..., dict[str, str] | None] | None = None,
     client: CyclesClient | AsyncCyclesClient | None = None,
     use_estimate_if_actual_not_provided: bool = True,
 ) -> Callable[[F], F]:
     """Decorator that wraps a function with the Cycles reserve/execute/commit lifecycle.
+
+    Subject and action fields accept either a constant or a callable. When given a
+    callable, it is invoked with the decorated function's ``*args, **kwargs`` at
+    reservation time. Subject callables returning ``None`` fall through to the
+    client-config default; ``action_kind`` / ``action_name`` returning ``None`` fall
+    through to ``"unknown"``; ``action_tags`` / ``dimensions`` returning ``None`` are
+    omitted.
 
     Args:
         estimate: Estimated cost. Either an int constant or a callable that receives
             the decorated function's ``*args, **kwargs`` and returns an int.
         actual: Actual cost. Either an int constant or a callable that receives
             the function's return value and returns an int. Defaults to the estimate.
-        action_kind: Action category (e.g. "llm.completion").
-        action_name: Action identifier (e.g. "gpt-4").
-        action_tags: Optional tags for filtering/reporting.
+        action_kind: Action category (e.g. "llm.completion"). Constant or callable
+            receiving ``*args, **kwargs``.
+        action_name: Action identifier (e.g. "gpt-4"). Constant or callable
+            receiving ``*args, **kwargs``.
+        action_tags: Optional tags for filtering/reporting. Constant list or callable
+            receiving ``*args, **kwargs`` returning a list.
         unit: Cost unit. Default: USD_MICROCENTS.
         ttl_ms: Reservation TTL in milliseconds. Default: 60000.
         grace_period_ms: Grace period after TTL expiry in milliseconds.
         overage_policy: REJECT, ALLOW_IF_AVAILABLE (default), or ALLOW_WITH_OVERDRAFT.
         dry_run: If True, evaluate without persisting (method won't execute).
-        tenant: Subject tenant override.
-        workspace: Subject workspace override.
-        app: Subject app override.
-        workflow: Subject workflow override.
-        agent: Subject agent override.
-        toolset: Subject toolset override.
-        dimensions: Custom dimensions for the subject.
+        tenant: Subject tenant override. Constant or callable receiving ``*args, **kwargs``.
+        workspace: Subject workspace override. Constant or callable receiving ``*args, **kwargs``.
+        app: Subject app override. Constant or callable receiving ``*args, **kwargs``.
+        workflow: Subject workflow override. Constant or callable receiving ``*args, **kwargs``.
+        agent: Subject agent override. Constant or callable receiving ``*args, **kwargs``.
+        toolset: Subject toolset override. Constant or callable receiving ``*args, **kwargs``.
+        dimensions: Custom dimensions for the subject. Constant dict or callable
+            receiving ``*args, **kwargs`` returning a dict.
         client: Explicit Cycles client to use. Falls back to module-level default.
         use_estimate_if_actual_not_provided: If True and actual is None, use estimate as actual.
 

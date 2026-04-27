@@ -82,6 +82,49 @@ class TestCyclesDecoratorSync:
         assert result == "hello"
         client.close()
 
+    def test_callable_subject_and_action_fields(self, config: CyclesConfig, httpx_mock) -> None:  # type: ignore[no-untyped-def]
+        """Per-call subject/action callables resolve against function args at reservation time."""
+        import json
+
+        httpx_mock.add_response(
+            method="POST",
+            url="http://localhost:7878/v1/reservations",
+            json={
+                "decision": "ALLOW", "reservation_id": "res_dec_dyn",
+                "expires_at_ms": 9999999999, "affected_scopes": ["tenant:acme"],
+            },
+            status_code=200,
+        )
+        httpx_mock.add_response(
+            method="POST",
+            url="http://localhost:7878/v1/reservations/res_dec_dyn/commit",
+            json={"status": "COMMITTED", "charged": {"unit": "USD_MICROCENTS", "amount": 1000}},
+            status_code=200,
+        )
+
+        client = CyclesClient(config)
+
+        @cycles(
+            estimate=1000,
+            workspace=lambda req, workspace_id: workspace_id,
+            action_kind=lambda req, workspace_id: f"llm.{req['provider']}",
+            action_name=lambda req, workspace_id: req["model"],
+            client=client,
+        )
+        def run_request(req: dict[str, str], workspace_id: str) -> str:
+            return "ok"
+
+        result = run_request({"provider": "openai", "model": "gpt-4"}, workspace_id="ws-42")
+        assert result == "ok"
+
+        sent = httpx_mock.get_request(method="POST", url="http://localhost:7878/v1/reservations")
+        assert sent is not None
+        body = json.loads(sent.content)
+        assert body["subject"]["workspace"] == "ws-42"
+        assert body["action"]["kind"] == "llm.openai"
+        assert body["action"]["name"] == "gpt-4"
+        client.close()
+
     def test_denied_raises(self, config: CyclesConfig, httpx_mock) -> None:  # type: ignore[no-untyped-def]
         httpx_mock.add_response(
             method="POST",

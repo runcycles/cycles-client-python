@@ -61,6 +61,30 @@ result = call_llm("Hello", tokens=100)
 > ```
 > The key (e.g. `cyc_live_abc123...`) is shown only once — save it immediately. For key rotation and lifecycle details, see [API Key Management](https://runcycles.io/how-to/api-key-management-in-cycles).
 
+### Dynamic subject and action fields
+
+Subject fields (`tenant`, `workspace`, `app`, `workflow`, `agent`, `toolset`), action fields (`action_kind`, `action_name`, `action_tags`), and `dimensions` all accept either a constant or a callable. When given a callable, it is invoked with the decorated function's `*args, **kwargs` at reservation time — useful for routing per-call to different budget scopes or labeling actions dynamically:
+
+```python
+@cycles(
+    estimate=lambda req, workspace_id: req.tokens * 10,
+    workspace=lambda req, workspace_id: workspace_id,        # per-call budget routing
+    action_kind=lambda req, *_: f"llm.{req.provider}",       # dynamic action label
+    action_name=lambda req, *_: req.model,
+    dimensions=lambda req, *_: {"region": req.region},
+    client=client,
+)
+def run_request(req: ResponseRequest, workspace_id: str) -> Response:
+    ...
+```
+
+Fallback semantics mirror the constant case:
+
+- Subject callables returning `None` fall through to the client-config default (`CyclesConfig(workspace=...)`).
+- `action_kind` / `action_name` returning `None` fall through to `"unknown"`.
+- `action_tags` / `dimensions` returning `None` are omitted from the request.
+- A callable that raises propagates the exception — fail-fast — without creating a reservation.
+
 ### Budget lifecycle
 
 The `@cycles` decorator wraps your function in a reserve → execute → commit/release lifecycle:

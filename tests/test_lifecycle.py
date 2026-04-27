@@ -37,7 +37,7 @@ class TestBuildReservationBody:
     def test_action_defaults_to_unknown(self) -> None:
         """When action_kind and action_name are not provided, they default to 'unknown'."""
         cfg = DecoratorConfig(estimate=1000, tenant="acme")
-        body = _build_reservation_body(cfg, 1000, {})
+        body = _build_reservation_body(cfg, 1000, {}, (), {})
         assert body["action"]["kind"] == "unknown"
         assert body["action"]["name"] == "unknown"
 
@@ -49,7 +49,7 @@ class TestBuildReservationBody:
             action_tags=["prod"],
             tenant="acme",
         )
-        body = _build_reservation_body(cfg, 1000, {})
+        body = _build_reservation_body(cfg, 1000, {}, (), {})
         assert body["action"]["kind"] == "llm.completion"
         assert body["action"]["name"] == "gpt-4"
         assert body["action"]["tags"] == ["prod"]
@@ -58,37 +58,37 @@ class TestBuildReservationBody:
         """Spec: Amount.amount has minimum: 0, so 0 is valid but negative is not."""
         cfg = DecoratorConfig(estimate=0, tenant="acme")
         # 0 should be valid per spec
-        body = _build_reservation_body(cfg, 0, {})
+        body = _build_reservation_body(cfg, 0, {}, (), {})
         assert body["estimate"]["amount"] == 0
 
         cfg_neg = DecoratorConfig(estimate=-1, tenant="acme")
         with pytest.raises(ValueError, match="estimate"):
-            _build_reservation_body(cfg_neg, -1, {})
+            _build_reservation_body(cfg_neg, -1, {}, (), {})
 
     def test_validates_ttl_range(self) -> None:
         cfg = DecoratorConfig(estimate=1000, ttl_ms=500, tenant="acme")
         with pytest.raises(ValueError, match="ttl_ms"):
-            _build_reservation_body(cfg, 1000, {})
+            _build_reservation_body(cfg, 1000, {}, (), {})
 
     def test_validates_subject_has_standard_field(self) -> None:
         cfg = DecoratorConfig(estimate=1000, dimensions={"custom": "val"})
         with pytest.raises(ValueError, match="at least one standard field"):
-            _build_reservation_body(cfg, 1000, {})
+            _build_reservation_body(cfg, 1000, {}, (), {})
 
     def test_validates_grace_period_ms_range(self) -> None:
         cfg = DecoratorConfig(estimate=1000, grace_period_ms=60001, tenant="acme")
         with pytest.raises(ValueError, match="grace_period_ms"):
-            _build_reservation_body(cfg, 1000, {})
+            _build_reservation_body(cfg, 1000, {}, (), {})
 
     def test_validates_grace_period_ms_negative(self) -> None:
         cfg = DecoratorConfig(estimate=1000, grace_period_ms=-1, tenant="acme")
         with pytest.raises(ValueError, match="grace_period_ms"):
-            _build_reservation_body(cfg, 1000, {})
+            _build_reservation_body(cfg, 1000, {}, (), {})
 
     def test_merges_default_subject_fields(self) -> None:
         cfg = DecoratorConfig(estimate=1000, workflow="task-1")
         defaults = {"tenant": "acme", "workspace": "prod"}
-        body = _build_reservation_body(cfg, 1000, defaults)
+        body = _build_reservation_body(cfg, 1000, defaults, (), {})
         assert body["subject"]["tenant"] == "acme"
         assert body["subject"]["workspace"] == "prod"
         assert body["subject"]["workflow"] == "task-1"
@@ -96,18 +96,126 @@ class TestBuildReservationBody:
     def test_decorator_subject_overrides_defaults(self) -> None:
         cfg = DecoratorConfig(estimate=1000, tenant="override")
         defaults = {"tenant": "default-tenant"}
-        body = _build_reservation_body(cfg, 1000, defaults)
+        body = _build_reservation_body(cfg, 1000, defaults, (), {})
         assert body["subject"]["tenant"] == "override"
 
     def test_dry_run_flag(self) -> None:
         cfg = DecoratorConfig(estimate=1000, dry_run=True, tenant="acme")
-        body = _build_reservation_body(cfg, 1000, {})
+        body = _build_reservation_body(cfg, 1000, {}, (), {})
         assert body["dry_run"] is True
 
     def test_grace_period_included(self) -> None:
         cfg = DecoratorConfig(estimate=1000, grace_period_ms=10000, tenant="acme")
-        body = _build_reservation_body(cfg, 1000, {})
+        body = _build_reservation_body(cfg, 1000, {}, (), {})
         assert body["grace_period_ms"] == 10000
+
+
+class TestCallableSubjectFields:
+    def test_callable_resolves_against_args_kwargs(self) -> None:
+        cfg = DecoratorConfig(
+            estimate=1000,
+            workspace=lambda req, workspace_id: workspace_id,
+            tenant="acme",
+        )
+        body = _build_reservation_body(cfg, 1000, {}, ("req-payload",), {"workspace_id": "ws-42"})
+        assert body["subject"]["workspace"] == "ws-42"
+
+    def test_callable_returning_none_falls_through_to_default(self) -> None:
+        cfg = DecoratorConfig(
+            estimate=1000,
+            workspace=lambda *_, **__: None,
+            tenant="acme",
+        )
+        body = _build_reservation_body(cfg, 1000, {"workspace": "fallback"}, (), {})
+        assert body["subject"]["workspace"] == "fallback"
+
+    def test_constant_subject_field_regression(self) -> None:
+        cfg = DecoratorConfig(estimate=1000, workspace="prod", tenant="acme")
+        body = _build_reservation_body(cfg, 1000, {}, (), {})
+        assert body["subject"]["workspace"] == "prod"
+
+    def test_callable_exception_propagates(self) -> None:
+        def boom(*_: object, **__: object) -> str:
+            raise RuntimeError("boom")
+
+        cfg = DecoratorConfig(estimate=1000, workspace=boom, tenant="acme")
+        with pytest.raises(RuntimeError, match="boom"):
+            _build_reservation_body(cfg, 1000, {}, (), {})
+
+    @pytest.mark.parametrize("field_name", ["tenant", "app", "workflow", "agent", "toolset"])
+    def test_callable_resolves_for_all_subject_fields(self, field_name: str) -> None:
+        cfg = DecoratorConfig(estimate=1000, workspace="ws")
+        setattr(cfg, field_name, lambda *_, **__: f"resolved-{field_name}")
+        body = _build_reservation_body(cfg, 1000, {}, (), {})
+        assert body["subject"][field_name] == f"resolved-{field_name}"
+
+
+class TestCallableActionFields:
+    def test_callable_action_kind_resolves(self) -> None:
+        cfg = DecoratorConfig(
+            estimate=1000,
+            action_kind=lambda req: f"llm.{req['provider']}",
+            tenant="acme",
+        )
+        body = _build_reservation_body(cfg, 1000, {}, ({"provider": "openai"},), {})
+        assert body["action"]["kind"] == "llm.openai"
+
+    def test_callable_action_name_resolves(self) -> None:
+        cfg = DecoratorConfig(
+            estimate=1000,
+            action_name=lambda req: req["model"],
+            tenant="acme",
+        )
+        body = _build_reservation_body(cfg, 1000, {}, ({"model": "gpt-4"},), {})
+        assert body["action"]["name"] == "gpt-4"
+
+    def test_callable_action_kind_returning_none_falls_through_to_unknown(self) -> None:
+        cfg = DecoratorConfig(
+            estimate=1000,
+            action_kind=lambda *_, **__: None,
+            tenant="acme",
+        )
+        body = _build_reservation_body(cfg, 1000, {}, (), {})
+        assert body["action"]["kind"] == "unknown"
+
+    def test_callable_action_tags_resolves(self) -> None:
+        cfg = DecoratorConfig(
+            estimate=1000,
+            action_tags=lambda req: [f"env:{req['env']}"],
+            tenant="acme",
+        )
+        body = _build_reservation_body(cfg, 1000, {}, ({"env": "prod"},), {})
+        assert body["action"]["tags"] == ["env:prod"]
+
+    def test_constant_action_kind_regression(self) -> None:
+        cfg = DecoratorConfig(estimate=1000, action_kind="llm.completion", tenant="acme")
+        body = _build_reservation_body(cfg, 1000, {}, (), {})
+        assert body["action"]["kind"] == "llm.completion"
+
+
+class TestCallableDimensions:
+    def test_callable_dimensions_resolves(self) -> None:
+        cfg = DecoratorConfig(
+            estimate=1000,
+            dimensions=lambda req: {"region": req["region"]},
+            tenant="acme",
+        )
+        body = _build_reservation_body(cfg, 1000, {}, ({"region": "us-east-1"},), {})
+        assert body["subject"]["dimensions"] == {"region": "us-east-1"}
+
+    def test_callable_dimensions_returning_none_omits_key(self) -> None:
+        cfg = DecoratorConfig(
+            estimate=1000,
+            dimensions=lambda *_, **__: None,
+            tenant="acme",
+        )
+        body = _build_reservation_body(cfg, 1000, {}, (), {})
+        assert "dimensions" not in body["subject"]
+
+    def test_constant_dimensions_regression(self) -> None:
+        cfg = DecoratorConfig(estimate=1000, dimensions={"k": "v"}, tenant="acme")
+        body = _build_reservation_body(cfg, 1000, {}, (), {})
+        assert body["subject"]["dimensions"] == {"k": "v"}
 
 
 class TestBuildCommitBody:

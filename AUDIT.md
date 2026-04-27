@@ -205,3 +205,21 @@ Added `StreamReservation` and `AsyncStreamReservation` context managers that aut
 - **Error handling:** `RESERVATION_FINALIZED`, `RESERVATION_EXPIRED`, and `IDEMPOTENCY_MISMATCH` do not trigger release; other 4xx client errors do trigger release — matches lifecycle.py behavior exactly
 
 Protocol conformance: No new endpoints or protocol changes. All reservation, commit, release, and extend calls use the same client methods and body formats as the decorator path. Verified by 64 unit tests covering success, deny, error, retry, heartbeat, cost resolution, context propagation, spec validation, and all commit error-code branches.
+
+---
+
+## Dynamic Subject & Action Fields on `@cycles` (added 2026-04-27)
+
+**Issue:** [#45](https://github.com/runcycles/cycles-client-python/issues/45)
+**Files:** `runcycles/lifecycle.py`, `runcycles/decorator.py`
+**Test files:** `tests/test_lifecycle.py`, `tests/test_decorator.py`
+
+Widened the `@cycles` decorator to accept callables — in addition to constants — for every field that previously had to be static at decoration time. Mirrors the existing `estimate` / `actual` callable contract and re-aligns the Python client with the Java client's `@Cycles(workspace = "#workspaceId")` SpEL behavior shipped in `cycles-spring-boot-starter` 0.2.1 ([java#50](https://github.com/runcycles/cycles-spring-boot-starter/pull/50)).
+
+- **Newly callable fields:** `tenant`, `workspace`, `app`, `workflow`, `agent`, `toolset`, `action_kind`, `action_name`, `action_tags`, `dimensions`. Each accepts `T | Callable[..., T | None] | None`.
+- **Resolution:** new `_resolve_value(val, args, kwargs)` helper in `lifecycle.py` invokes the callable with the decorated function's `*args, **kwargs` at reservation time; constants pass through untouched.
+- **Fallback semantics preserved:** subject callables returning `None` fall through to `default_subject_fields` (client config); `action_kind` / `action_name` returning `None` fall through to `"unknown"`; `action_tags` / `dimensions` returning `None` are omitted. Constants behave identically to today (regression-tested).
+- **Fail-fast:** exceptions raised inside a user callable propagate to the decorator caller without creating a reservation.
+- **Signature change:** `_build_reservation_body` now takes `args` and `kwargs` parameters; both `CyclesLifecycle.execute` and `AsyncCyclesLifecycle.execute` thread them through.
+
+Protocol conformance: No protocol or wire-format changes. The reservation request body shape is unchanged — only the source of each field's value is widened. Verified by new unit tests in `TestCallableSubjectFields`, `TestCallableActionFields`, `TestCallableDimensions` plus an end-to-end decorator test asserting the captured request body.

@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog 1.1.0](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2026-04-27
+
+Dynamic subject and action fields on the `@cycles` decorator.
+
+### Added
+
+- Subject fields (`tenant`, `workspace`, `app`, `workflow`, `agent`, `toolset`), action fields (`action_kind`, `action_name`, `action_tags`), and `dimensions` now accept callables in addition to constants. Callables are invoked with the decorated function's `*args, **kwargs` at reservation time, enabling per-call budget routing and dynamic action labeling. Mirrors the Java client's SpEL behavior. (#45)
+
+### Changed
+
+- `_build_reservation_body` signature widened to thread `args` / `kwargs` through to the new `_resolve_value` helper. Internal API only; no protocol or wire-format changes.
+
 ## [0.3.0] - 2026-04-08
 
 Add streaming support.
