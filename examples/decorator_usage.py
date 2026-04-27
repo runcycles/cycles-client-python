@@ -49,6 +49,19 @@ def call_llm(prompt: str, tokens: int) -> str:
     return "Generated response for: " + prompt
 
 
+# Per-call subject / action routing via callables — resolved at reservation time
+# against the wrapped function's *args, **kwargs
+@cycles(
+    estimate=1000,
+    workspace=lambda req, workspace_id: workspace_id,
+    action_kind=lambda req, *_: f"llm.{req['provider']}",
+    action_name=lambda req, *_: req["model"],
+    client=client,
+)
+def run_request(req: dict[str, str], workspace_id: str) -> str:
+    return f"Routed {req['model']} to {workspace_id}"
+
+
 def main() -> None:
     print("Simple call:")
     result1 = simple_call()
@@ -57,6 +70,10 @@ def main() -> None:
     print("\nLLM call with metrics:")
     result2 = call_llm("Tell me a joke", tokens=200)
     print(f"  Result: {result2}")
+
+    print("\nPer-call subject/action routing:")
+    result3 = run_request({"provider": "openai", "model": "gpt-4"}, workspace_id="ws-42")
+    print(f"  Result: {result3}")
 
 
 if __name__ == "__main__":

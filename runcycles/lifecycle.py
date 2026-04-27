@@ -47,21 +47,21 @@ class DecoratorConfig:
 
     estimate: int | Callable[..., int]
     actual: int | Callable[..., int] | None = None
-    action_kind: str | None = None
-    action_name: str | None = None
-    action_tags: list[str] | None = None
+    action_kind: str | Callable[..., str | None] | None = None
+    action_name: str | Callable[..., str | None] | None = None
+    action_tags: list[str] | Callable[..., list[str] | None] | None = None
     unit: str = "USD_MICROCENTS"
     ttl_ms: int = 60_000
     grace_period_ms: int | None = None
     overage_policy: str = "ALLOW_IF_AVAILABLE"
     dry_run: bool = False
-    tenant: str | None = None
-    workspace: str | None = None
-    app: str | None = None
-    workflow: str | None = None
-    agent: str | None = None
-    toolset: str | None = None
-    dimensions: dict[str, str] | None = None
+    tenant: str | Callable[..., str | None] | None = None
+    workspace: str | Callable[..., str | None] | None = None
+    app: str | Callable[..., str | None] | None = None
+    workflow: str | Callable[..., str | None] | None = None
+    agent: str | Callable[..., str | None] | None = None
+    toolset: str | Callable[..., str | None] | None = None
+    dimensions: dict[str, str] | Callable[..., dict[str, str] | None] | None = None
     use_estimate_if_actual_not_provided: bool = True
 
 
@@ -70,6 +70,13 @@ def _evaluate_amount(expr: int | Callable[..., int], args: tuple[Any, ...], kwar
     if callable(expr):
         return expr(*args, **kwargs)
     return int(expr)
+
+
+def _resolve_value(val: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> Any:
+    """Resolve a decorator value: invoke if callable, else return as-is."""
+    if callable(val):
+        return val(*args, **kwargs)
+    return val
 
 
 def _evaluate_actual(
@@ -89,7 +96,11 @@ def _evaluate_actual(
 
 
 def _build_reservation_body(
-    cfg: DecoratorConfig, estimate: int, default_subject_fields: dict[str, str | None],
+    cfg: DecoratorConfig,
+    estimate: int,
+    default_subject_fields: dict[str, str | None],
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
 ) -> dict[str, Any]:
     """Build the reservation create request body."""
     validate_non_negative(estimate, "estimate")
@@ -97,21 +108,27 @@ def _build_reservation_body(
 
     subject: dict[str, Any] = {}
     for field_name in ("tenant", "workspace", "app", "workflow", "agent", "toolset"):
-        val = getattr(cfg, field_name, None) or default_subject_fields.get(field_name)
+        val = _resolve_value(getattr(cfg, field_name, None), args, kwargs)
+        if not val:
+            val = default_subject_fields.get(field_name)
         if val:
             subject[field_name] = val
-    if cfg.dimensions:
-        subject["dimensions"] = cfg.dimensions
+    dims = _resolve_value(cfg.dimensions, args, kwargs)
+    if dims:
+        subject["dimensions"] = dims
 
     subject_model = Subject(**subject)
     validate_subject(subject_model)
 
+    kind = _resolve_value(cfg.action_kind, args, kwargs)
+    name = _resolve_value(cfg.action_name, args, kwargs)
+    tags = _resolve_value(cfg.action_tags, args, kwargs)
     action: dict[str, Any] = {
-        "kind": cfg.action_kind or "unknown",
-        "name": cfg.action_name or "unknown",
+        "kind": kind or "unknown",
+        "name": name or "unknown",
     }
-    if cfg.action_tags:
-        action["tags"] = cfg.action_tags
+    if tags:
+        action["tags"] = tags
 
     body: dict[str, Any] = {
         "idempotency_key": str(uuid.uuid4()),
@@ -234,7 +251,7 @@ class CyclesLifecycle:
         logger.debug("Estimated usage: estimate=%d", estimate)
 
         # Create reservation
-        create_body = _build_reservation_body(cfg, estimate, self._default_subject)
+        create_body = _build_reservation_body(cfg, estimate, self._default_subject, args, kwargs)
         logger.debug("Creating reservation: body=%s", create_body)
 
         res_t1 = time.monotonic()
@@ -416,7 +433,7 @@ class AsyncCyclesLifecycle:
         estimate = _evaluate_amount(cfg.estimate, args, kwargs)
         logger.debug("Estimated usage: estimate=%d", estimate)
 
-        create_body = _build_reservation_body(cfg, estimate, self._default_subject)
+        create_body = _build_reservation_body(cfg, estimate, self._default_subject, args, kwargs)
         res_response = await self._client.create_reservation(create_body)
 
         if not res_response.is_success:
