@@ -671,6 +671,57 @@ class TestStreamReservation:
 
         mock.extend_reservation.assert_called()
 
+    def test_heartbeat_skipped_when_ttl_zero(self) -> None:
+        mock = _make_mock_client()
+        sr = StreamReservation(
+            mock,
+            subject=_default_subject(),
+            action=_default_action(),
+            estimate=_default_estimate(),
+            ttl_ms=0,
+        )
+        assert sr._start_heartbeat() is None
+
+    def test_heartbeat_extend_failure_logged(self) -> None:
+        mock = _make_mock_client()
+        mock.create_reservation.return_value = _allow_response()
+        mock.commit_reservation.return_value = _commit_success()
+        mock.extend_reservation.return_value = CyclesResponse.http_error(
+            500, "Server error", body={"error": "INTERNAL"},
+        )
+
+        sr = StreamReservation(
+            mock,
+            subject=_default_subject(),
+            action=_default_action(),
+            estimate=_default_estimate(),
+            ttl_ms=2000,
+        )
+
+        with sr:
+            time.sleep(1.2)
+
+        mock.extend_reservation.assert_called()
+
+    def test_heartbeat_extend_exception_logged(self) -> None:
+        mock = _make_mock_client()
+        mock.create_reservation.return_value = _allow_response()
+        mock.commit_reservation.return_value = _commit_success()
+        mock.extend_reservation.side_effect = RuntimeError("boom")
+
+        sr = StreamReservation(
+            mock,
+            subject=_default_subject(),
+            action=_default_action(),
+            estimate=_default_estimate(),
+            ttl_ms=2000,
+        )
+
+        with sr:
+            time.sleep(1.2)
+
+        mock.extend_reservation.assert_called()
+
 
 # ---------------------------------------------------------------------------
 # AsyncStreamReservation tests
@@ -1280,6 +1331,77 @@ class TestAsyncStreamReservationEdgeCases:
         async with asr as reservation:
             assert reservation.caps is not None
             assert reservation.caps.max_tokens == 256
+
+    @pytest.mark.asyncio
+    async def test_decision_property(self) -> None:
+        mock = _make_async_mock_client()
+        mock.create_reservation.return_value = _allow_response()
+        mock.commit_reservation.return_value = _commit_success()
+
+        asr = AsyncStreamReservation(
+            mock,
+            subject=_default_subject(),
+            action=_default_action(),
+            estimate=_default_estimate(),
+            ttl_ms=1000,
+        )
+
+        async with asr as reservation:
+            assert reservation.decision is not None
+
+    @pytest.mark.asyncio
+    async def test_heartbeat_skipped_when_ttl_zero(self) -> None:
+        mock = _make_async_mock_client()
+        asr = AsyncStreamReservation(
+            mock,
+            subject=_default_subject(),
+            action=_default_action(),
+            estimate=_default_estimate(),
+            ttl_ms=0,
+        )
+        assert asr._start_heartbeat() is None
+
+    @pytest.mark.asyncio
+    async def test_heartbeat_extend_failure_logged(self) -> None:
+        mock = _make_async_mock_client()
+        mock.create_reservation.return_value = _allow_response()
+        mock.commit_reservation.return_value = _commit_success()
+        mock.extend_reservation.return_value = CyclesResponse.http_error(
+            500, "Server error", body={"error": "INTERNAL"},
+        )
+
+        asr = AsyncStreamReservation(
+            mock,
+            subject=_default_subject(),
+            action=_default_action(),
+            estimate=_default_estimate(),
+            ttl_ms=2000,
+        )
+
+        async with asr:
+            await asyncio.sleep(1.2)
+
+        mock.extend_reservation.assert_called()
+
+    @pytest.mark.asyncio
+    async def test_heartbeat_extend_exception_logged(self) -> None:
+        mock = _make_async_mock_client()
+        mock.create_reservation.return_value = _allow_response()
+        mock.commit_reservation.return_value = _commit_success()
+        mock.extend_reservation.side_effect = RuntimeError("boom")
+
+        asr = AsyncStreamReservation(
+            mock,
+            subject=_default_subject(),
+            action=_default_action(),
+            estimate=_default_estimate(),
+            ttl_ms=2000,
+        )
+
+        async with asr:
+            await asyncio.sleep(1.2)
+
+        mock.extend_reservation.assert_called()
 
 
 class TestBudgetExceeded:
