@@ -4,9 +4,11 @@
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue)](LICENSE)
 [![Coverage](https://img.shields.io/badge/coverage-100%25-brightgreen)](https://github.com/runcycles/cycles-client-python/actions)
 
-# Cycles Python Client
+# Cycles Python Client — AI agent budget and action authority SDK
 
-Python client for the [Cycles](https://runcycles.io) budget-management protocol.
+**Python SDK for AI agent budget governance — enforce cost limits, tool permissions, and multi-tenant policies before LLM calls or agent actions execute.** Works with OpenAI, Anthropic, LangChain, OpenAI Agents SDK, CrewAI, and any Python agent framework.
+
+Decorator-based API for the [Cycles Protocol](https://github.com/runcycles/cycles-protocol): reserve budget up front, execute your agent code, commit or release — with concurrency-safe enforcement, automatic heartbeats, and typed reservation contexts. Install via `pip install runcycles`.
 
 ## Installation
 
