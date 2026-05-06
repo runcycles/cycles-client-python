@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog 1.1.0](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.1] - 2026-05-08
+
+PyPI metadata refresh for category-search discovery. No code changes; package wire format and API are identical to 0.4.0.
+
+### Changed
+
+- `pyproject.toml`: rewrote `description` to lead with the literal category-search phrase ("Python AI agent budget control — enforce LLM cost limits, tool permissions, and multi-tenant policies before agent actions execute"). Expanded `keywords` from 12 to 21, organized into category-search terms, framework targeting (`langgraph`, `crewai`, `autogen`, `openai-agents`, `mcp`, etc.), and brand. Added `Topic :: Scientific/Engineering :: Artificial Intelligence` classifier for PyPI browse-by-category surfacing.
+
 ## [0.4.0] - 2026-04-27
 
 Dynamic subject and action fields on the `@cycles` decorator.
@@ -120,6 +128,7 @@ Initial public release.
 
 - Comprehensive error handling and improved API model validation (#1)
 
+[0.4.1]: https://github.com/runcycles/cycles-client-python/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/runcycles/cycles-client-python/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/runcycles/cycles-client-python/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/runcycles/cycles-client-python/compare/v0.1.3...v0.2.0

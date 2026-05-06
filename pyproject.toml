@@ -4,23 +4,35 @@ build-backend = "hatchling.build"
 
 [project]
 name = "runcycles"
-version = "0.4.0"
-description = "Python client for the Cycles budget-management protocol"
+version = "0.4.1"
+description = "Python AI agent budget control — enforce LLM cost limits, tool permissions, and multi-tenant policies before agent actions execute."
 readme = "README.md"
 license = "Apache-2.0"
 requires-python = ">=3.10"
 keywords = [
-    "cycles",
-    "budget",
+    # Category-search keywords (lead with these — what people actually type)
+    "ai-agent",
+    "agent-budget",
+    "agent-governance",
+    "budget-control",
     "cost-control",
-    "metering",
-    "ai",
-    "llm",
-    "agents",
-    "governance",
+    "cost-enforcement",
+    "spending-limit",
+    "llm-cost",
+    "runtime-authority",
+    "action-control",
+    "multi-tenant",
+    # Framework-specific (the integrations we want to surface for)
+    "langchain",
+    "langgraph",
+    "crewai",
+    "autogen",
+    "openai-agents",
+    "mcp",
     "openai",
     "anthropic",
-    "langchain",
+    # Brand
+    "cycles",
     "runcycles",
 ]
 classifiers = [
@@ -32,6 +44,7 @@ classifiers = [
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Topic :: Software Development :: Libraries",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
     "Framework :: AsyncIO",
     "Typing :: Typed",
 ]
