@@ -224,3 +224,18 @@ Widened the `@cycles` decorator to accept callables — in addition to constants
 - **Signature change:** `_build_reservation_body` now takes `args` and `kwargs` parameters; both `CyclesLifecycle.execute` and `AsyncCyclesLifecycle.execute` thread them through.
 
 Protocol conformance: No protocol or wire-format changes. The reservation request body shape is unchanged — only the source of each field's value is widened. Verified by new unit tests in `TestCallableSubjectFields`, `TestCallableActionFields`, `TestCallableDimensions` plus an end-to-end decorator test asserting the captured request body.
+
+## PyPI Metadata Refresh (added 2026-05-08)
+
+**Files:** `pyproject.toml`
+**Version:** 0.4.1
+
+Metadata-only release retargeting the package for category-search discovery on PyPI. No code, no test, no protocol changes — wire format and API are identical to 0.4.0.
+
+- **Description rewritten** to lead with the literal category-search phrase: `"Python AI agent budget control — enforce LLM cost limits, tool permissions, and multi-tenant policies before agent actions execute."`
+- **Keywords expanded 12 → 21**, organized into category-search terms (`ai-agent`, `agent-budget`, `budget-control`, `cost-control`, `cost-enforcement`, `spending-limit`, `llm-cost`, `runtime-authority`, `action-control`, `multi-tenant`), framework targeting (`langchain`, `langgraph`, `crewai`, `autogen`, `openai-agents`, `mcp`, `openai`, `anthropic`), and brand (`cycles`, `runcycles`).
+- **Classifier added:** `Topic :: Scientific/Engineering :: Artificial Intelligence`.
+
+Driven by Python-side adoption diagnostic finding the biggest sub-gap was discovery, not SDK feature parity. Companion changes: GitHub topics on this repo (`governance` dropped, `mcp` added) and Python framework integration guide retitling on `runcycles/docs` (PR #568).
+
+Protocol conformance: No protocol or wire-format changes. Existing test suite at 100% coverage; no test additions.
