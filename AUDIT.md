@@ -239,3 +239,17 @@ Metadata-only release retargeting the package for category-search discovery on P
 Driven by Python-side adoption diagnostic finding the biggest sub-gap was discovery, not SDK feature parity. Companion changes: GitHub topics on this repo (`governance` dropped, `mcp` added) and Python framework integration guide retitling on `runcycles/docs` (PR #568).
 
 Protocol conformance: No protocol or wire-format changes. Existing test suite at 100% coverage; no test additions.
+
+## LangChain Agent Middleware Integration Pointer (added 2026-05-10)
+
+**Files:** `README.md`, `examples/langchain_integration.py`
+**Version:** unreleased (next 0.4.x — docs/examples only)
+
+Documentation-only update pointing users at the new sibling package [`langchain-runcycles`](https://github.com/runcycles/langchain-runcycles) for LangChain **agent middleware** integration. No SDK code changes; no protocol changes.
+
+- **README.md**: Added a new `## Integrations` section listing `langchain-runcycles` (PyPI: `langchain-runcycles`) as the canonical path for `langchain.agents.create_agent` workflows. The existing `examples/langchain_integration.py` row is reframed as the right fit for **non-agent** LangChain runnables (bare `ChatOpenAI`, chains, RAG); middleware requires `create_agent` so the two patterns serve different surfaces and both remain supported.
+- **examples/langchain_integration.py**: Updated the file-level docstring to point at `langchain-runcycles` for agent workflows while preserving the callback-handler example as-is. No code changes.
+
+Background: LangChain 1.x introduced an `AgentMiddleware` API with `wrap_tool_call`, `before_model`, and `wrap_model_call` hooks. The new package wraps that API on top of this SDK's existing `decide` / `create_reservation` / `commit_reservation` / `release_reservation` surface — no new SDK methods needed. Splitting into a sibling repo follows LangChain's [publishing guidance](https://docs.langchain.com/oss/python/contributing/publish-langchain) ("New integrations should be published as standalone PyPI packages") and the `langchain-<service>` naming convention used by `langchain-anthropic`, `langchain-openai`, etc.
+
+Protocol conformance: No protocol or wire-format changes. The new sibling package consumes this SDK as a normal dependency.

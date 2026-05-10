@@ -443,9 +443,17 @@ The [`examples/`](examples/) directory contains runnable integration examples:
 | [anthropic_integration.py](examples/anthropic_integration.py) | Guard Anthropic messages with per-tool budget tracking |
 | [streaming_usage.py](examples/streaming_usage.py) | `stream_reservation()` context manager with auto-commit |
 | [fastapi_integration.py](examples/fastapi_integration.py) | FastAPI middleware, dependency injection, per-tenant budgets |
-| [langchain_integration.py](examples/langchain_integration.py) | LangChain callback handler for budget-aware agents |
+| [langchain_integration.py](examples/langchain_integration.py) | LangChain callback handler for non-agent runnables (`ChatOpenAI` etc.) — for agents using `create_agent`, see [`langchain-runcycles`](https://pypi.org/project/langchain-runcycles/) below |
 
 See [examples/README.md](examples/README.md) for setup instructions.
+
+## Integrations
+
+Sibling packages and integrations published separately:
+
+| Package | Purpose |
+|---|---|
+| [`langchain-runcycles`](https://github.com/runcycles/langchain-runcycles) (PyPI: [`langchain-runcycles`](https://pypi.org/project/langchain-runcycles/)) | LangChain agent middleware — pre-tool-call authorization (`CyclesToolGate`) and fan-out caps (`CyclesFanOutGate`) for `create_agent` workflows. Use this for agent-style LangChain code; the [callback handler example](examples/langchain_integration.py) in this repo remains the right fit for bare-runnable (non-agent) LangChain usage. |
 
 ## Development
 
