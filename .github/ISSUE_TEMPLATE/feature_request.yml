@@ -13,6 +13,7 @@ body:
         - cycles-protocol
         - cycles-client-python
         - cycles-client-typescript
+        - langchain-runcycles
         - cycles-spring-boot-starter
         - cycles-mcp-server
         - cycles-openai-agents

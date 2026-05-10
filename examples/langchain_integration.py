@@ -1,7 +1,21 @@
-"""Integrating Cycles with LangChain.
+"""Integrating Cycles with LangChain via the BaseCallbackHandler API.
 
-Demonstrates a custom callback handler that creates budget reservations
-for every LLM call in a LangChain chain or agent.
+This example uses LangChain's traditional callback-handler pattern to wrap each
+LLM call with a Cycles reservation. It is the right fit for **non-agent**
+LangChain workflows — bare ``ChatOpenAI``/``ChatAnthropic`` runnables, chains,
+RAG pipelines, etc.
+
+For LangChain **agents** built with ``langchain.agents.create_agent`` (the
+``wrap_tool_call`` / ``before_model`` middleware API introduced in LangChain
+1.x), use the dedicated middleware package instead:
+
+    pip install langchain-runcycles
+    # https://github.com/runcycles/langchain-runcycles
+
+That package exposes ``CyclesToolGate`` (pre-tool-call authorization) and
+``CyclesFanOutGate`` (turn-cap / fan-out halts) — both work with sync and
+async agents and offer features the callback handler cannot, such as denying
+a tool call before it runs and halting an agent loop on remote policy.
 
 Requirements:
     pip install runcycles langchain langchain-openai
