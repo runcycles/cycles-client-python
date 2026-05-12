@@ -11,6 +11,6 @@ permissions:
 
 jobs:
   ci:
-    uses: runcycles/.github/.github/workflows/ci-python.yml@main
+    uses: runcycles/.github/.github/workflows/ci-python.yml@v1
     with:
       mypy-target: runcycles
