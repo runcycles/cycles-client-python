@@ -253,3 +253,18 @@ Documentation-only update pointing users at the new sibling package [`langchain-
 Background: LangChain 1.x introduced an `AgentMiddleware` API with `wrap_tool_call`, `before_model`, and `wrap_model_call` hooks. The new package wraps that API on top of this SDK's existing `decide` / `create_reservation` / `commit_reservation` / `release_reservation` surface — no new SDK methods needed. Splitting into a sibling repo follows LangChain's [publishing guidance](https://docs.langchain.com/oss/python/contributing/publish-langchain) ("New integrations should be published as standalone PyPI packages") and the `langchain-<service>` naming convention used by `langchain-anthropic`, `langchain-openai`, etc.
 
 Protocol conformance: No protocol or wire-format changes. The new sibling package consumes this SDK as a normal dependency.
+
+## Infrastructure Hardening (added 2026-05-12)
+
+**Files:** `.claude/session-start-global-deny.sh`, `.github/workflows/python-publish.yml`
+**Version:** unreleased (CI/Claude-config only — no package version change)
+
+Cross-cutting hardening landed in response to org-wide tracking issues filed in `runcycles/.github`. Two distinct changes; both are infra-only.
+
+- **`.claude/session-start-global-deny.sh`** synced from the new canonical at `runcycles/.github/shared-config/`. The script now (a) carries a top-of-file callout explaining that Part 2 mutates the `origin` remote of every sibling repo under `/home/user/*`, not just the current checkout, and (b) honors a `CYCLES_CLAUDE_SKIP_REMOTE_REWRITE=1` opt-out env var. Part 1 (MCP deny rules) is unchanged. Tracks `runcycles/.github#63`.
+
+- **`.github/workflows/python-publish.yml`** gained a `Verify pyproject version matches tag` step that runs on tag-triggered builds (`refs/tags/v*`). The step parses `pyproject.toml` via `tomllib` and fails the workflow before the build phase if the declared version doesn't match the tag (e.g., tag `v0.5.0` against `pyproject.toml` still on `0.4.1` or a `dev0` pre-release). PyPI already rejects duplicate versions server-side, but this surfaces operator error earlier in the pipeline. Python analog of the Java SNAPSHOT-guard tracked in `runcycles/.github#61`.
+
+Not included in this change: bumping the reusable-workflow ref `runcycles/.github/.github/workflows/ci-python.yml@main` to `@v1` (`runcycles/.github#60`). That bump is intentionally split into a separate follow-up PR — it depends on the `v1` tag existing in `runcycles/.github`, which is being cut after the canonical-script PR (`runcycles/.github#64`) merges.
+
+Protocol conformance: No protocol or wire-format changes. No SDK source touched. Test suite unaffected.

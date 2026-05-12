@@ -32,6 +32,24 @@ jobs:
         with:
           python-version: "3.12"
 
+      # Fail-fast before build/publish if (a) pyproject.toml declares a pre-release
+      # version (e.g. 1.0.0.dev0, 1.0.0a1) when a final-version tag (vX.Y.Z) was
+      # pushed, or (b) the tag version doesn't match pyproject.toml. PyPI rejects
+      # duplicate versions server-side, but a local guard surfaces the operator
+      # error before the upload phase. See runcycles/.github#61.
+      - name: Verify pyproject version matches tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          python -c "import tomllib,sys; v=tomllib.load(open('pyproject.toml','rb'))['project']['version']; print(v)" > /tmp/pyproject_version
+          PYPROJECT_VERSION=$(cat /tmp/pyproject_version)
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          echo "pyproject.toml version: ${PYPROJECT_VERSION}"
+          echo "Git tag version:        ${TAG_VERSION}"
+          if [ "${PYPROJECT_VERSION}" != "${TAG_VERSION}" ]; then
+            echo "::error::Version mismatch: pyproject.toml has '${PYPROJECT_VERSION}' but tag is 'v${TAG_VERSION}'. Bump pyproject.toml or retag."
+            exit 1
+          fi
+
       - name: Install build tool
         run: python -m pip install --upgrade pip build
 
