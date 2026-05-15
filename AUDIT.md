@@ -236,7 +236,7 @@ Metadata-only release retargeting the package for category-search discovery on P
 - **Keywords expanded 12 → 21**, organized into category-search terms (`ai-agent`, `agent-budget`, `budget-control`, `cost-control`, `cost-enforcement`, `spending-limit`, `llm-cost`, `runtime-authority`, `action-control`, `multi-tenant`), framework targeting (`langchain`, `langgraph`, `crewai`, `autogen`, `openai-agents`, `mcp`, `openai`, `anthropic`), and brand (`cycles`, `runcycles`).
 - **Classifier added:** `Topic :: Scientific/Engineering :: Artificial Intelligence`.
 
-Driven by Python-side adoption diagnostic finding the biggest sub-gap was discovery, not SDK feature parity. Companion changes: GitHub topics on this repo (`governance` dropped, `mcp` added) and Python framework integration guide retitling on `runcycles/docs` (PR #568).
+Driven by Python-side adoption diagnostic finding the biggest sub-gap was discovery, not SDK feature parity. Companion changes: GitHub topics on this repo (`governance` dropped, `mcp` added) and Python framework integration guide retitling on `runcycles/cycles-docs` (PR #568).
 
 Protocol conformance: No protocol or wire-format changes. Existing test suite at 100% coverage; no test additions.
 
