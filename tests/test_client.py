@@ -154,6 +154,30 @@ class TestCyclesClientSync:
 
         assert response.is_success
 
+    def test_list_reservations_with_from_to_window(self, config: CyclesConfig, httpx_mock) -> None:  # type: ignore[no-untyped-def]
+        """`from`/`to` ISO-8601 window filter passthrough (cycles-protocol v0.1.25 revision 2026-05-21).
+
+        `from` is a Python reserved keyword so callers must use the dict-unpack form
+        `**{"from": ..., "to": ...}` rather than a direct kwarg. The client forwards
+        the params byte-exactly to the URL query string."""
+        httpx_mock.add_response(
+            method="GET",
+            url="http://localhost:7878/v1/reservations?tenant=acme&from=2026-05-21T00%3A00%3A00Z&to=2026-05-22T00%3A00%3A00Z",
+            json={"reservations": [], "has_more": False},
+            status_code=200,
+        )
+
+        with CyclesClient(config) as client:
+            response = client.list_reservations(
+                **{
+                    "tenant": "acme",
+                    "from": "2026-05-21T00:00:00Z",
+                    "to": "2026-05-22T00:00:00Z",
+                }
+            )
+
+        assert response.is_success
+
     def test_get_reservation(self, config: CyclesConfig, httpx_mock) -> None:  # type: ignore[no-untyped-def]
         httpx_mock.add_response(
             method="GET",
@@ -394,6 +418,28 @@ class TestAsyncCyclesClient:
 
         async with AsyncCyclesClient(config) as client:
             response = await client.list_reservations(tenant="acme")
+
+        assert response.is_success
+
+    async def test_list_reservations_with_from_to_window(self, config: CyclesConfig, httpx_mock) -> None:  # type: ignore[no-untyped-def]
+        """Async parity for the `from`/`to` window-filter passthrough.
+
+        See sync sibling for the reserved-keyword caveat on `from`."""
+        httpx_mock.add_response(
+            method="GET",
+            url="http://localhost:7878/v1/reservations?tenant=acme&from=2026-05-21T00%3A00%3A00Z&to=2026-05-22T00%3A00%3A00Z",
+            json={"reservations": [], "has_more": False},
+            status_code=200,
+        )
+
+        async with AsyncCyclesClient(config) as client:
+            response = await client.list_reservations(
+                **{
+                    "tenant": "acme",
+                    "from": "2026-05-21T00:00:00Z",
+                    "to": "2026-05-22T00:00:00Z",
+                }
+            )
 
         assert response.is_success
 

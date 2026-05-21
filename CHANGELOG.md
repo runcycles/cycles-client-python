@@ -5,6 +5,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog 1.1.0](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.2] - 2026-05-21
+
+Wire-passthrough verification for the new `from` / `to` query params on `list_reservations`. Implements `cycles-protocol-v0.yaml` revision 2026-05-21 ([runcycles/cycles-protocol#97](https://github.com/runcycles/cycles-protocol/pull/97)) on the client side; runcycles/cycles-server#160 ships the server impl.
+
+### Added
+
+- Sync + async regression tests confirming `list_reservations` forwards `from` / `to` ISO-8601 date-time values to the URL query string byte-exactly. The client's `**query_params` signature already accepted these — the tests lock that in so future tightening cannot drop the params silently.
+
+### Notes
+
+- **`from` is a Python reserved keyword.** Callers cannot write `client.list_reservations(from="...", to="...")` directly. The supported pattern is the dict-unpack form:
+  ```python
+  client.list_reservations(**{"from": "2026-05-21T00:00:00Z", "to": "2026-05-22T00:00:00Z"})
+  ```
+  The wire format is identical; only the Python call-site syntax differs.
+- No protocol or wire-format change. Servers older than v0.1.25.20 will silently ignore the params per the additive-parameter guarantee in `cycles-protocol-v0.yaml`.
+- 391 tests pass at 100% coverage (gate ≥95%).
+
 ## [0.4.1] - 2026-05-08
 
 PyPI metadata refresh for category-search discovery. No code changes; package wire format and API are identical to 0.4.0.
