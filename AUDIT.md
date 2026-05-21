@@ -1,7 +1,8 @@
-# Cycles Protocol v0.1.23 — Client (Python) Audit
+# Cycles Protocol v0.1.25 — Client (Python) Audit
 
-**Date:** 2026-03-14
-**Spec:** `cycles-protocol-v0.yaml` (OpenAPI 3.1.0, v0.1.23)
+**Date:** 2026-05-21 (v0.4.2 — `from` / `to` ISO-8601 window-filter passthrough on `list_reservations` per `cycles-protocol-v0.yaml` revision 2026-05-21; closes the client side of runcycles/cycles-server#159. No code change — the existing `**query_params` signature already forwards arbitrary kwargs to the URL query string. Added sync + async regression tests that lock the passthrough in (using the `**{"from": ..., "to": ...}` dict-unpack form because `from` is a Python reserved keyword). 391 tests pass at 100% coverage.),
+2026-03-14
+**Spec:** `cycles-protocol-v0.yaml` (OpenAPI 3.1.0, v0.1.25)
 **Client:** `runcycles` (Python 3.10+ / httpx / Pydantic v2)
 **Server audit:** See `cycles-server/AUDIT.md` (all passing)
 
