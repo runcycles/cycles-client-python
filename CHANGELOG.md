@@ -5,6 +5,27 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog 1.1.0](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.3] - 2026-05-22
+
+Wire-passthrough verification for `expires_from`/`expires_to` and `finalized_from`/`finalized_to` query params on `list_reservations`. Implements `cycles-protocol-v0.yaml` revision 2026-05-22 ([runcycles/cycles-protocol#98](https://github.com/runcycles/cycles-protocol/pull/98)) on the client side; runcycles/cycles-server#163 ships the server impl.
+
+### Added
+
+- Sync + async regression tests confirming `list_reservations` forwards the four new ISO-8601 window params to the URL query string byte-exactly. Unlike `from` (a Python keyword), the new param names are plain kwargs:
+  ```python
+  client.list_reservations(
+      expires_from="2026-05-22T00:00:00Z",
+      expires_to="2026-05-23T00:00:00Z",
+      finalized_from="2026-05-15T00:00:00Z",
+      finalized_to="2026-05-22T00:00:00Z",
+  )
+  ```
+
+### Notes
+
+- No protocol or wire-format change. Servers older than v0.1.25.21 will silently ignore the params per the additive-parameter guarantee in `cycles-protocol-v0.yaml`.
+- 393 tests pass at 100% coverage (gate ≥95%).
+
 ## [0.4.2] - 2026-05-21
 
 Wire-passthrough verification for the new `from` / `to` query params on `list_reservations`. Implements `cycles-protocol-v0.yaml` revision 2026-05-21 ([runcycles/cycles-protocol#97](https://github.com/runcycles/cycles-protocol/pull/97)) on the client side; runcycles/cycles-server#160 ships the server impl.
