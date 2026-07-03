@@ -26,8 +26,14 @@ HEADERS = {"X-Cycles-API-Key": KEY, "Content-Type": "application/json"}
 
 
 def test_health_check():
-    """Server responds to health endpoint."""
-    res = requests.get(f"{BASE}/actuator/health", timeout=5)
+    """Server responds to its public readiness probe.
+
+    Aggregate /actuator/health requires X-Admin-API-Key since cycles-server
+    v0.1.25.45 (500 when the server has no admin key configured); the
+    liveness/readiness probes are the public, Redis-aware health contract
+    a credential-less client can rely on.
+    """
+    res = requests.get(f"{BASE}/actuator/health/readiness", timeout=5)
     assert res.status_code == 200
 
 
