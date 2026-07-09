@@ -271,3 +271,17 @@ Cross-cutting hardening landed in response to org-wide tracking issues filed in 
 Not included in this change: bumping the reusable-workflow ref `runcycles/.github/.github/workflows/ci-python.yml@main` to `@v1` (`runcycles/.github#60`). That bump is intentionally split into a separate follow-up PR — it depends on the `v1` tag existing in `runcycles/.github`, which is being cut after the canonical-script PR (`runcycles/.github#64`) merges.
 
 Protocol conformance: No protocol or wire-format changes. No SDK source touched. Test suite unaffected.
+
+## README Transport-Error Documentation Fix (added 2026-07-09)
+
+**Files:** `README.md`
+**Version:** unreleased (docs-only, no version bump, no CHANGELOG entry per repo convention)
+
+Documentation-only correction. The README's exception-hierarchy table described `CyclesTransportError` as "Network-level failure (connection, DNS, timeout)", implying the SDK raises it — but nothing in the package ever raises it. Actual behavior:
+
+- **`@cycles` decorator / HOF paths:** a transport failure at reserve time raises `CyclesProtocolError` with `status == -1` and `error_code=None` (via `_build_protocol_exception` in `lifecycle.py`); commit-time transport failures are retried in the background by the commit retry engine, not raised.
+- **Programmatic client:** never raises for transport failures — returns `CyclesResponse` with `is_transport_error == True` and `status == -1` (`CyclesResponse.transport_error` constructor in `response.py`).
+
+The table row now states the class is exported for user code but never raised by the SDK, and a new "Transport errors" subsection documents the `status == -1` behavior for both API surfaces with a detection example. Wording matches the docs site (`cycles-docs/how-to/error-handling-patterns-in-python.md`). `CyclesTransportError` remains exported from `runcycles/__init__.py` for use in user code — no API change.
+
+Protocol conformance: No protocol or wire-format changes. No SDK source touched. Test suite unaffected.
