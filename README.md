@@ -298,7 +298,7 @@ Exception hierarchy:
 | Exception | When |
 |---|---|
 | `CyclesError` | Base for all Cycles errors |
-| `CyclesProtocolError` | Server returned a protocol-level error |
+| `CyclesProtocolError` | Server returned a protocol-level error; also raised with `status == -1` when the SDK wraps a reserve-time transport failure |
 | `BudgetExceededError` | Budget insufficient for the reservation |
 | `OverdraftLimitExceededError` | Debt exceeds the overdraft limit |
 | `DebtOutstandingError` | Outstanding debt blocks new reservations |
@@ -310,7 +310,7 @@ Exception hierarchy:
 
 When the HTTP request itself fails (DNS resolution, connection refused, timeout), the SDK never raises `CyclesTransportError` — the class is exported for use in your own code (e.g. wrapping transport-level failures in higher-level integrations). Instead:
 
-- **`@cycles` decorator:** a transport failure at reserve time raises `CyclesProtocolError` with `status == -1` and `error_code=None`. Transport failures at commit time are retried in the background by the commit retry engine, not raised.
+- **Lifecycle-managed surfaces (`@cycles` and `stream_reservation()`):** a transport failure at reserve time raises `CyclesProtocolError` with `status == -1` and `error_code=None`. Transport failures at commit time are retried in the background by the commit retry engine, not raised.
 - **Programmatic client:** calls never raise for transport failures — they return a `CyclesResponse` with `is_transport_error == True` and `status == -1` (shown above).
 
 ```python

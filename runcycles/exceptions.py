@@ -77,7 +77,13 @@ class ReservationFinalizedError(CyclesProtocolError):
 
 
 class CyclesTransportError(CyclesError):
-    """Raised when a transport-level error occurs (connection timeout, DNS failure, etc.)."""
+    """Transport-level error (connection timeout, DNS failure, etc.).
+
+    Exported for use in application code; the SDK itself surfaces transport
+    failures as ``CyclesProtocolError`` with ``status == -1`` (decorator and
+    ``stream_reservation`` paths) or ``CyclesResponse.transport_error``
+    (programmatic client) rather than raising this class.
+    """
 
     def __init__(self, message: str, *, cause: Exception | None = None) -> None:
         super().__init__(message)
