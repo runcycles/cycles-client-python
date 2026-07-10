@@ -304,7 +304,7 @@ Exception hierarchy:
 | `DebtOutstandingError` | Outstanding debt blocks new reservations |
 | `ReservationExpiredError` | Operating on an expired reservation |
 | `ReservationFinalizedError` | Operating on an already-committed/released reservation |
-| `TenantClosedError` | The owning tenant is CLOSED (HTTP 409 `TENANT_CLOSED`, runtime spec v0.1.25.13) — reserve/commit/release/extend rejected until the tenant is reopened |
+| `TenantClosedError` | The owning tenant is CLOSED (HTTP 409 `TENANT_CLOSED`, runtime spec v0.1.25.13); raised at reservation-creation time — commit/release failures are handled internally by the commit-retry/release policy |
 | `CyclesTransportError` | Exported for use in your own code; never raised by the SDK — transport failures surface as `status == -1` (see below) |
 
 ### Transport errors

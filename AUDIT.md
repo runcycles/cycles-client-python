@@ -1,6 +1,6 @@
 # Cycles Protocol v0.1.25 — Client (Python) Audit
 
-**Date:** 2026-07-10 (unreleased — `TENANT_CLOSED` error-code support per runtime spec v0.1.25.13 (`cycles-protocol-v0.yaml`, PR pending in runcycles/cycles-protocol): `ErrorCode.TENANT_CLOSED` enum member, `TenantClosedError` subclass wired into the lifecycle error-code→exception mapping, `CyclesProtocolError.is_tenant_closed()` helper. Purely additive; previously the code fell through the `ErrorCode.from_string` forward-compat path to `UNKNOWN` (retryable) — now it is typed and non-retryable. See the dated entry at the end of this file. 396 tests pass at 100% coverage.),
+**Date:** 2026-07-10 (unreleased — `TENANT_CLOSED` error-code support per runtime spec v0.1.25.13 (`cycles-protocol-v0.yaml`, runcycles/cycles-protocol#125): `ErrorCode.TENANT_CLOSED` enum member, `TenantClosedError` subclass wired into the lifecycle error-code→exception mapping, `CyclesProtocolError.is_tenant_closed()` helper. Purely additive; previously the code fell through the `ErrorCode.from_string` forward-compat path to `UNKNOWN` (retryable) — now it is typed and non-retryable. See the dated entry at the end of this file. 396 tests pass at 100% coverage.),
 2026-07-09 (README + docstring transport-error documentation fix, no version bump — see the dated entry at the end of this file. `CyclesTransportError` is exported but never raised by the SDK; README and its docstring now describe the actual `status == -1` surfacing.),
 2026-07-03 (integration-test-only, no version bump — `test_health_check` now probes the public `/actuator/health/readiness` endpoint instead of aggregate `/actuator/health`, which requires `X-Admin-API-Key` since cycles-server v0.1.25.45 and fails closed with 500 when the server has no admin key configured. The old assertion had failed the org nightly Full-Stack Integration every night since 2026-06-28. No library code change.),
 2026-05-22 (v0.4.3 — `expires_from`/`expires_to` and `finalized_from`/`finalized_to` ISO-8601 window-filter passthrough on `list_reservations` per `cycles-protocol-v0.yaml` revision 2026-05-22; closes the Python-client side of runcycles/cycles-server#162. No code change — `**query_params` already forwards arbitrary kwargs. Added sync + async regression tests; unlike `from`/`to` the new param names are plain kwargs (no Python-reserved-word workaround needed). 393 tests pass at 100% coverage.),
@@ -165,7 +165,7 @@ All spec constraints are validated both via Pydantic Field validators (on typed 
 
 - `is_success` correctly handles 2xx range (200 for most endpoints, 201 for events)
 - Error responses parsed via `ErrorResponse.model_validate()` with `ErrorCode` mapping
-- Typed exceptions: `BudgetExceededError`, `OverdraftLimitExceededError`, `DebtOutstandingError`, `ReservationExpiredError`, `ReservationFinalizedError`
+- Typed exceptions: `BudgetExceededError`, `OverdraftLimitExceededError`, `DebtOutstandingError`, `ReservationExpiredError`, `ReservationFinalizedError`, `TenantClosedError` (added 2026-07-10, raised at reservation-creation time)
 
 ---
 
@@ -293,11 +293,11 @@ Protocol conformance: No protocol or wire-format changes. No SDK source touched.
 **Files:** `runcycles/models.py`, `runcycles/exceptions.py`, `runcycles/lifecycle.py`, `runcycles/__init__.py`, `README.md`, `CHANGELOG.md`, tests
 **Version:** unreleased
 
-Additive support for the `TENANT_CLOSED` protocol error code, per runtime spec v0.1.25.13 of `cycles-protocol-v0.yaml` (PR pending in runcycles/cycles-protocol). Servers return HTTP 409 `error=TENANT_CLOSED` on reservation create/commit/release/extend when the owning tenant's status is CLOSED — the runtime-surface mirror of governance spec Rule 2 (mutating operations on objects owned by a CLOSED tenant are rejected with 409 TENANT_CLOSED).
+Additive support for the `TENANT_CLOSED` protocol error code, per runtime spec v0.1.25.13 of `cycles-protocol-v0.yaml` (runcycles/cycles-protocol#125). Servers return HTTP 409 `error=TENANT_CLOSED` on reservation create/commit/release/extend when the owning tenant's status is CLOSED — the runtime-surface mirror of governance spec Rule 2 (mutating operations on objects owned by a CLOSED tenant are rejected with 409 TENANT_CLOSED).
 
 - `ErrorCode.TENANT_CLOSED` added to the enum in `models.py` (placed with the scope-state family, after `BUDGET_CLOSED`).
 - `TenantClosedError(CyclesProtocolError)` added to `exceptions.py` following the existing per-code subclass pattern; exported from `runcycles/__init__.py`.
-- `_build_protocol_exception` in `lifecycle.py` maps `error == "TENANT_CLOSED"` to `TenantClosedError` (this mapping feeds the `@cycles` decorator, `CyclesLifecycle`, and streaming surfaces).
+- `_build_protocol_exception` in `lifecycle.py` maps `error == "TENANT_CLOSED"` to `TenantClosedError`. This mapping is invoked on the reservation-creation paths of the `@cycles` decorator, `CyclesLifecycle`, and streaming surfaces; commit/release-time error codes are handled by the existing commit-failure policy (logged + released) and are not raised as typed exceptions.
 - `CyclesProtocolError.is_tenant_closed()` helper added alongside the existing `is_*` per-code helpers.
 - README exception table gained a `TenantClosedError` row.
 
