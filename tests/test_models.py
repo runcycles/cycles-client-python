@@ -190,6 +190,11 @@ class TestErrorCode:
         assert ErrorCode.from_string("NONSENSE") == ErrorCode.UNKNOWN
         assert ErrorCode.from_string(None) is None
 
+    def test_tenant_closed(self) -> None:
+        # Runtime spec v0.1.25.13: TENANT_CLOSED added to the ErrorCode enum.
+        assert ErrorCode.from_string("TENANT_CLOSED") == ErrorCode.TENANT_CLOSED
+        assert not ErrorCode.TENANT_CLOSED.is_retryable
+
 
 class TestAmountValidation:
     def test_rejects_negative_amount(self) -> None:

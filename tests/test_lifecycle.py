@@ -15,6 +15,7 @@ from runcycles.exceptions import (
     OverdraftLimitExceededError,
     ReservationExpiredError,
     ReservationFinalizedError,
+    TenantClosedError,
 )
 from runcycles.lifecycle import (
     AsyncCyclesLifecycle,
@@ -344,6 +345,17 @@ class TestBuildProtocolExceptionEdgeCases:
         )
         exc = _build_protocol_exception("Failed", response)
         assert isinstance(exc, DebtOutstandingError)
+
+    def test_maps_tenant_closed(self) -> None:
+        response = CyclesResponse.http_error(
+            409, "Tenant closed",
+            body={"error": "TENANT_CLOSED", "message": "Tenant closed", "request_id": "r5"},
+        )
+        exc = _build_protocol_exception("Failed", response)
+        assert isinstance(exc, TenantClosedError)
+        assert exc.error_code == "TENANT_CLOSED"
+        assert exc.is_tenant_closed()
+        assert not exc.is_retryable()
 
     def test_maps_reservation_expired(self) -> None:
         response = CyclesResponse.http_error(

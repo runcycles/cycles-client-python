@@ -27,6 +27,7 @@ from runcycles.exceptions import (
     OverdraftLimitExceededError,
     ReservationExpiredError,
     ReservationFinalizedError,
+    TenantClosedError,
 )
 from runcycles.models import (
     CyclesMetrics,
@@ -216,6 +217,8 @@ def _build_protocol_exception(prefix: str, response: CyclesResponse) -> CyclesPr
         exc_class = ReservationExpiredError
     elif error_code == "RESERVATION_FINALIZED":
         exc_class = ReservationFinalizedError
+    elif error_code == "TENANT_CLOSED":
+        exc_class = TenantClosedError
 
     return exc_class(
         message,

@@ -13,6 +13,7 @@ from runcycles.exceptions import (
     OverdraftLimitExceededError,
     ReservationExpiredError,
     ReservationFinalizedError,
+    TenantClosedError,
 )
 from runcycles.models import (
     Action,
@@ -81,6 +82,7 @@ __all__ = [
     "OverdraftLimitExceededError",
     "ReservationExpiredError",
     "ReservationFinalizedError",
+    "TenantClosedError",
     # Models
     "Unit",
     "Amount",

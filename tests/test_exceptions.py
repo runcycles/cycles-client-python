@@ -9,6 +9,7 @@ from runcycles.exceptions import (
     OverdraftLimitExceededError,
     ReservationExpiredError,
     ReservationFinalizedError,
+    TenantClosedError,
 )
 
 
@@ -43,6 +44,14 @@ class TestCyclesProtocolError:
         assert isinstance(e, CyclesError)
         assert e.is_debt_outstanding()
         assert not e.is_budget_exceeded()
+
+    def test_tenant_closed(self) -> None:
+        e = TenantClosedError("tenant closed", status=409, error_code="TENANT_CLOSED")
+        assert isinstance(e, CyclesProtocolError)
+        assert isinstance(e, CyclesError)
+        assert e.is_tenant_closed()
+        assert not e.is_budget_exceeded()
+        assert not e.is_retryable()
 
     def test_reservation_expired(self) -> None:
         e = ReservationExpiredError("expired", status=410, error_code="RESERVATION_EXPIRED")

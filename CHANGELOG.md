@@ -5,7 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog 1.1.0](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.4.3] - 2026-05-22
+## [Unreleased]
+
+`TENANT_CLOSED` error-code support. Implements the runtime spec v0.1.25.13 revision of `cycles-protocol-v0.yaml`, which adds `TENANT_CLOSED` to the ErrorCode enum: servers return HTTP 409 `error=TENANT_CLOSED` on reservation create/commit/release/extend when the owning tenant is CLOSED (mirrors governance spec Rule 2).
+
+### Added
+
+- `ErrorCode.TENANT_CLOSED` enum member.
+- `TenantClosedError` (subclass of `CyclesProtocolError`), raised by the lifecycle/decorator surfaces when the server returns `TENANT_CLOSED`; exported from `runcycles`.
+- `CyclesProtocolError.is_tenant_closed()` helper.
+
+### Notes
+
+- Purely additive; no wire-format change. Before this release, servers returning `TENANT_CLOSED` were handled via the existing forward-compat path: `ErrorCode.from_string` mapped the unrecognized string to `ErrorCode.UNKNOWN`, so the lifecycle surfaces raised plain `CyclesProtocolError` with `error_code == "UNKNOWN"` — which `is_retryable()` treats as retryable. With this release the code is recognized, surfaces as `TenantClosedError` with `error_code == "TENANT_CLOSED"`, and is correctly non-retryable.
 
 Wire-passthrough verification for `expires_from`/`expires_to` and `finalized_from`/`finalized_to` query params on `list_reservations`. Implements `cycles-protocol-v0.yaml` revision 2026-05-22 ([runcycles/cycles-protocol#98](https://github.com/runcycles/cycles-protocol/pull/98)) on the client side; runcycles/cycles-server#163 ships the server impl.
 
