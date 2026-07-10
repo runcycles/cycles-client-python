@@ -73,12 +73,17 @@ class ErrorCode(str, Enum):
     OVERDRAFT_LIMIT_EXCEEDED = "OVERDRAFT_LIMIT_EXCEEDED"
     DEBT_OUTSTANDING = "DEBT_OUTSTANDING"
     MAX_EXTENSIONS_EXCEEDED = "MAX_EXTENSIONS_EXCEEDED"
+    LIMIT_EXCEEDED = "LIMIT_EXCEEDED"
+    TENANT_CLOSED = "TENANT_CLOSED"
     INTERNAL_ERROR = "INTERNAL_ERROR"
     UNKNOWN = "UNKNOWN"
 
     @property
     def is_retryable(self) -> bool:
-        return self in (ErrorCode.INTERNAL_ERROR, ErrorCode.UNKNOWN)
+        # LIMIT_EXCEEDED is HTTP 429 rate limiting (runtime spec
+        # v0.1.25.12): transient by definition — the spec instructs
+        # clients to retry after the indicated delay.
+        return self in (ErrorCode.INTERNAL_ERROR, ErrorCode.UNKNOWN, ErrorCode.LIMIT_EXCEEDED)
 
     @classmethod
     def from_string(cls, value: str | None) -> ErrorCode | None:

@@ -15,6 +15,7 @@ from runcycles.exceptions import (
     OverdraftLimitExceededError,
     ReservationExpiredError,
     ReservationFinalizedError,
+    TenantClosedError,
 )
 from runcycles.lifecycle import (
     AsyncCyclesLifecycle,
@@ -344,6 +345,45 @@ class TestBuildProtocolExceptionEdgeCases:
         )
         exc = _build_protocol_exception("Failed", response)
         assert isinstance(exc, DebtOutstandingError)
+
+    def test_retry_after_header_fallback(self) -> None:
+        # 429 LIMIT_EXCEEDED (runtime spec v0.1.25.12): the delay arrives in
+        # the HTTP Retry-After header (seconds); surface it as retry_after_ms
+        # when the body carries no retry_after_ms field.
+        response = CyclesResponse.http_error(
+            429, "Rate limited",
+            body={"error": "LIMIT_EXCEEDED", "message": "Rate limited", "request_id": "r6"},
+            headers={"retry-after": "3"},
+        )
+        exc = _build_protocol_exception("Failed", response)
+        assert exc.error_code == "LIMIT_EXCEEDED"
+        assert exc.retry_after_ms == 3000
+        assert exc.is_retryable()
+
+    def test_retry_after_body_wins_over_header(self) -> None:
+        response = CyclesResponse.http_error(
+            429, "Rate limited",
+            body={
+                "error": "LIMIT_EXCEEDED",
+                "message": "Rate limited",
+                "request_id": "r7",
+                "retry_after_ms": 1500,
+            },
+            headers={"retry-after": "3"},
+        )
+        exc = _build_protocol_exception("Failed", response)
+        assert exc.retry_after_ms == 1500
+
+    def test_maps_tenant_closed(self) -> None:
+        response = CyclesResponse.http_error(
+            409, "Tenant closed",
+            body={"error": "TENANT_CLOSED", "message": "Tenant closed", "request_id": "r5"},
+        )
+        exc = _build_protocol_exception("Failed", response)
+        assert isinstance(exc, TenantClosedError)
+        assert exc.error_code == "TENANT_CLOSED"
+        assert exc.is_tenant_closed()
+        assert not exc.is_retryable()
 
     def test_maps_reservation_expired(self) -> None:
         response = CyclesResponse.http_error(

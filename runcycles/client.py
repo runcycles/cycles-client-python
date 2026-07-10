@@ -41,7 +41,7 @@ def _extract_idempotency_key(body: dict[str, Any]) -> str | None:
     return body.get("idempotency_key")
 
 
-_RESPONSE_HEADERS = ("x-request-id", "x-ratelimit-remaining", "x-ratelimit-reset", "x-cycles-tenant")
+_RESPONSE_HEADERS = ("x-request-id", "x-ratelimit-remaining", "x-ratelimit-reset", "x-cycles-tenant", "retry-after")
 
 _BALANCE_FILTER_PARAMS = {"tenant", "workspace", "app", "workflow", "agent", "toolset"}
 

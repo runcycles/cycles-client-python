@@ -9,6 +9,7 @@ from runcycles.exceptions import (
     OverdraftLimitExceededError,
     ReservationExpiredError,
     ReservationFinalizedError,
+    TenantClosedError,
 )
 
 
@@ -44,6 +45,14 @@ class TestCyclesProtocolError:
         assert e.is_debt_outstanding()
         assert not e.is_budget_exceeded()
 
+    def test_tenant_closed(self) -> None:
+        e = TenantClosedError("tenant closed", status=409, error_code="TENANT_CLOSED")
+        assert isinstance(e, CyclesProtocolError)
+        assert isinstance(e, CyclesError)
+        assert e.is_tenant_closed()
+        assert not e.is_budget_exceeded()
+        assert not e.is_retryable()
+
     def test_reservation_expired(self) -> None:
         e = ReservationExpiredError("expired", status=410, error_code="RESERVATION_EXPIRED")
         assert isinstance(e, CyclesProtocolError)
@@ -69,6 +78,12 @@ class TestCyclesProtocolError:
     def test_retryable_unknown(self) -> None:
         e = CyclesProtocolError("unknown", status=500, error_code="UNKNOWN")
         assert e.is_retryable()
+
+    def test_retryable_limit_exceeded(self) -> None:
+        # HTTP 429 rate limiting (runtime spec v0.1.25.12) is transient.
+        e = CyclesProtocolError("rate limited", status=429, error_code="LIMIT_EXCEEDED", retry_after_ms=3000)
+        assert e.is_retryable()
+        assert e.retry_after_ms == 3000
 
     def test_retryable_5xx_without_known_code(self) -> None:
         e = CyclesProtocolError("server error", status=502)

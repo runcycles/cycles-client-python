@@ -57,6 +57,23 @@ class CyclesResponse:
         return self.headers.get("x-cycles-tenant")
 
     @property
+    def retry_after_ms_header(self) -> int | None:
+        """``Retry-After`` header (seconds, per spec) converted to milliseconds.
+
+        Servers send this on 429 ``LIMIT_EXCEEDED`` rate-limit responses
+        (runtime spec v0.1.25.12). Returns ``None`` when the header is absent
+        or not a plain integer (the HTTP-date form is not used by the spec
+        and is ignored gracefully).
+        """
+        val = self.headers.get("retry-after")
+        if val is None:
+            return None
+        try:
+            return int(val) * 1000
+        except ValueError:
+            return None
+
+    @property
     def is_success(self) -> bool:
         return 200 <= self.status < 300
 

@@ -5,6 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog 1.1.0](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+`TENANT_CLOSED` + `LIMIT_EXCEEDED` error-code support. `TENANT_CLOSED` implements the runtime spec v0.1.25.13 revision of `cycles-protocol-v0.yaml` ([runcycles/cycles-protocol#125](https://github.com/runcycles/cycles-protocol/pull/125)): servers return HTTP 409 `error=TENANT_CLOSED` on reservation create/commit/release/extend when the owning tenant is CLOSED (mirrors governance spec Rule 2). `LIMIT_EXCEEDED` closes the same class of gap for the runtime spec v0.1.25.12 revision (2026-07-04): HTTP 429 rate-limit responses carry `error=LIMIT_EXCEEDED` plus `Retry-After` / `X-RateLimit-Reset` headers.
+
+### Added
+
+- `ErrorCode.TENANT_CLOSED` enum member.
+- `TenantClosedError` (subclass of `CyclesProtocolError`), raised at reservation-creation time by the `@cycles` decorator, `CyclesLifecycle`, and streaming reserve paths (the `_build_protocol_exception` surfaces) when the server returns `TENANT_CLOSED`; exported from `runcycles`. Commit/release-time `TENANT_CLOSED` responses follow the existing commit-failure policy (handled/released internally, not raised as typed exceptions); the programmatic client surfaces the code on `CyclesResponse` as usual.
+- `CyclesProtocolError.is_tenant_closed()` helper.
+- `ErrorCode.LIMIT_EXCEEDED` enum member (spec order, after `MAX_EXTENSIONS_EXCEEDED`), classified retryable by `ErrorCode.is_retryable` and `CyclesProtocolError.is_retryable()` — a 429 rate limit is transient and the spec instructs clients to retry after the indicated delay. Enum-only by design, matching the `BUDGET_FROZEN`/`BUDGET_CLOSED` pattern: it is not a reservation-lifecycle denial, so no exception subclass or lifecycle mapping is warranted.
+- `Retry-After` header exposure: the client now captures the HTTP `Retry-After` header (how 429 rate-limit responses carry the delay per the spec) and exposes it as `CyclesResponse.retry_after_ms_header` (seconds → ms; non-integer forms ignored gracefully). `_build_protocol_exception` falls back to it for `retry_after_ms` when the body carries no `retry_after_ms` field (body wins when both are present). No auto-retry behavior change — the delay is surfaced, not consumed.
+
+### Notes
+
+- Purely additive; no wire-format change. Before this release, servers returning `TENANT_CLOSED` were handled via the existing forward-compat path: `ErrorCode.from_string` mapped the unrecognized string to `ErrorCode.UNKNOWN`, so the reservation-creation surfaces raised plain `CyclesProtocolError` with `error_code == "UNKNOWN"` — which `is_retryable()` treats as retryable. With this release the code is recognized, surfaces as `TenantClosedError` with `error_code == "TENANT_CLOSED"`, and is correctly non-retryable.
+- `LIMIT_EXCEEDED` previously also fell through to `ErrorCode.UNKNOWN`, which happened to be retryable — so its retry semantics are unchanged; it is now typed instead of accidental. `TENANT_CLOSED` moved to sit after `LIMIT_EXCEEDED` in the enum to mirror the spec's declaration order exactly.
+
 ## [0.4.3] - 2026-05-22
 
 Wire-passthrough verification for `expires_from`/`expires_to` and `finalized_from`/`finalized_to` query params on `list_reservations`. Implements `cycles-protocol-v0.yaml` revision 2026-05-22 ([runcycles/cycles-protocol#98](https://github.com/runcycles/cycles-protocol/pull/98)) on the client side; runcycles/cycles-server#163 ships the server impl.

@@ -1,6 +1,7 @@
 # Cycles Protocol v0.1.25 — Client (Python) Audit
 
-**Date:** 2026-07-09 (README + docstring transport-error documentation fix, no version bump — see the dated entry at the end of this file. `CyclesTransportError` is exported but never raised by the SDK; README and its docstring now describe the actual `status == -1` surfacing.),
+**Date:** 2026-07-10 (unreleased — `TENANT_CLOSED` + `LIMIT_EXCEEDED` error-code support. `TENANT_CLOSED` per runtime spec v0.1.25.13 (`cycles-protocol-v0.yaml`, runcycles/cycles-protocol#125): `ErrorCode.TENANT_CLOSED` enum member, `TenantClosedError` subclass wired into the lifecycle error-code→exception mapping (reservation-creation surfaces), `CyclesProtocolError.is_tenant_closed()` helper. `LIMIT_EXCEEDED` per runtime spec v0.1.25.12 (revision 2026-07-04, HTTP 429 rate limiting): enum-only member matching the `BUDGET_FROZEN`/`BUDGET_CLOSED` pattern, classified retryable at both the enum and exception layers (429 is transient; previously it fell through to `UNKNOWN`, which happened to be retryable, so semantics are unchanged — now typed). Enum reordered to mirror spec declaration order. Both purely additive; previously both codes fell through the `ErrorCode.from_string` forward-compat path to `UNKNOWN`. See the dated entries at the end of this file. 398 tests pass at 100% coverage.),
+2026-07-09 (README + docstring transport-error documentation fix, no version bump — see the dated entry at the end of this file. `CyclesTransportError` is exported but never raised by the SDK; README and its docstring now describe the actual `status == -1` surfacing.),
 2026-07-03 (integration-test-only, no version bump — `test_health_check` now probes the public `/actuator/health/readiness` endpoint instead of aggregate `/actuator/health`, which requires `X-Admin-API-Key` since cycles-server v0.1.25.45 and fails closed with 500 when the server has no admin key configured. The old assertion had failed the org nightly Full-Stack Integration every night since 2026-06-28. No library code change.),
 2026-05-22 (v0.4.3 — `expires_from`/`expires_to` and `finalized_from`/`finalized_to` ISO-8601 window-filter passthrough on `list_reservations` per `cycles-protocol-v0.yaml` revision 2026-05-22; closes the Python-client side of runcycles/cycles-server#162. No code change — `**query_params` already forwards arbitrary kwargs. Added sync + async regression tests; unlike `from`/`to` the new param names are plain kwargs (no Python-reserved-word workaround needed). 393 tests pass at 100% coverage.),
 2026-05-21 (v0.4.2 — `from` / `to` ISO-8601 window-filter passthrough on `list_reservations` per `cycles-protocol-v0.yaml` revision 2026-05-21; closes the client side of runcycles/cycles-server#159. No code change — the existing `**query_params` signature already forwards arbitrary kwargs to the URL query string. Added sync + async regression tests that lock the passthrough in (using the `**{"from": ..., "to": ...}` dict-unpack form because `from` is a Python reserved keyword). 391 tests pass at 100% coverage.),
@@ -164,7 +165,7 @@ All spec constraints are validated both via Pydantic Field validators (on typed 
 
 - `is_success` correctly handles 2xx range (200 for most endpoints, 201 for events)
 - Error responses parsed via `ErrorResponse.model_validate()` with `ErrorCode` mapping
-- Typed exceptions: `BudgetExceededError`, `OverdraftLimitExceededError`, `DebtOutstandingError`, `ReservationExpiredError`, `ReservationFinalizedError`
+- Typed exceptions: `BudgetExceededError`, `OverdraftLimitExceededError`, `DebtOutstandingError`, `ReservationExpiredError`, `ReservationFinalizedError`, `TenantClosedError` (added 2026-07-10, raised at reservation-creation time)
 
 ---
 
@@ -286,3 +287,39 @@ Documentation-only correction. The README's exception-hierarchy table described 
 The table row now states the class is exported for user code but never raised by the SDK, and a new "Transport errors" subsection documents the `status == -1` behavior for both API surfaces with a detection example. Wording matches the docs site (`cycles-docs/how-to/error-handling-patterns-in-python.md`). `CyclesTransportError` remains exported from `runcycles/__init__.py` for use in user code — no API change.
 
 Protocol conformance: No protocol or wire-format changes. No SDK source touched. Test suite unaffected.
+
+## TENANT_CLOSED Error-Code Support (added 2026-07-10)
+
+**Files:** `runcycles/models.py`, `runcycles/exceptions.py`, `runcycles/lifecycle.py`, `runcycles/__init__.py`, `README.md`, `CHANGELOG.md`, tests
+**Version:** unreleased
+
+Additive support for the `TENANT_CLOSED` protocol error code, per runtime spec v0.1.25.13 of `cycles-protocol-v0.yaml` (runcycles/cycles-protocol#125). Servers return HTTP 409 `error=TENANT_CLOSED` on reservation create/commit/release/extend when the owning tenant's status is CLOSED — the runtime-surface mirror of governance spec Rule 2 (mutating operations on objects owned by a CLOSED tenant are rejected with 409 TENANT_CLOSED).
+
+- `ErrorCode.TENANT_CLOSED` added to the enum in `models.py`, in spec declaration order: `… MAX_EXTENSIONS_EXCEEDED, LIMIT_EXCEEDED, TENANT_CLOSED, INTERNAL_ERROR` (initially placed after `BUDGET_CLOSED`; relocated when `LIMIT_EXCEEDED` landed so the enum mirrors the spec exactly).
+- `TenantClosedError(CyclesProtocolError)` added to `exceptions.py` following the existing per-code subclass pattern; exported from `runcycles/__init__.py`.
+- `_build_protocol_exception` in `lifecycle.py` maps `error == "TENANT_CLOSED"` to `TenantClosedError`. This mapping is invoked on the reservation-creation paths of the `@cycles` decorator, `CyclesLifecycle`, and streaming surfaces; commit/release-time error codes are handled by the existing commit-failure policy (logged + released) and are not raised as typed exceptions.
+- `CyclesProtocolError.is_tenant_closed()` helper added alongside the existing `is_*` per-code helpers.
+- README exception table gained a `TenantClosedError` row.
+
+Forward-compat behavior before this change (verified): an unrecognized `TENANT_CLOSED` string was mapped to `ErrorCode.UNKNOWN` by `ErrorCode.from_string`, so lifecycle surfaces raised plain `CyclesProtocolError` with `error_code == "UNKNOWN"` — which `is_retryable()` reports as retryable. Deserialization never failed. With this change the code is recognized, typed, and correctly non-retryable.
+
+The vendored spec fixture (`tests/fixtures/cycles-protocol-v0.yaml`, pinned at v0.1.24) is intentionally untouched; it will be refreshed when the v0.1.25.13 spec PR merges. The contract suite validates the fixture, not the client enum, so the client enum being a superset is by design.
+
+Tests: new coverage for the enum member (`test_models.py`), the exception subclass + helper (`test_exceptions.py`), and the lifecycle mapping (`test_lifecycle.py`). 396 tests pass at 100% coverage (gate ≥95%); ruff + mypy --strict clean.
+
+## LIMIT_EXCEEDED Error-Code Support (added 2026-07-10)
+
+**Files:** `runcycles/models.py`, `runcycles/exceptions.py`, `CHANGELOG.md`, tests
+**Version:** unreleased (same PR as the TENANT_CLOSED entry above)
+
+Additive support for the `LIMIT_EXCEEDED` protocol error code, added to the runtime ErrorCode enum in spec revision v0.1.25.12 (2026-07-04). Per the spec's ERROR SEMANTICS, HTTP 429 is reserved for server-side throttling/rate limiting (declared on the public evidence/JWKS endpoints); 429 responses carry `error=LIMIT_EXCEEDED` plus the `Retry-After` and `X-RateLimit-Reset` headers, and clients retry after the indicated delay.
+
+- `ErrorCode.LIMIT_EXCEEDED` added in spec declaration order (after `MAX_EXTENSIONS_EXCEEDED`); `TENANT_CLOSED` relocated after it so the client enum mirrors the spec order exactly.
+- Retryability decision: **retryable at both layers** — added to `ErrorCode.is_retryable` and to the code tuple in `CyclesProtocolError.is_retryable()`. Rationale: a 429 rate limit is transient by definition and the spec instructs retry; this also preserves prior behavior, where the unrecognized string fell back to `ErrorCode.UNKNOWN` (retryable). The repo's status-based rule (`status >= 500`) does not cover 429, so the code-based classification carries it.
+- Shape decision: **enum-only** — no `LimitExceededError` subclass, no lifecycle mapping. This matches the sibling pattern (`BUDGET_FROZEN`/`BUDGET_CLOSED` are enum-only): LIMIT_EXCEEDED is not a reservation-lifecycle denial, so a typed exception class is not warranted.
+
+Forward-compat behavior before this change (verified): `ErrorCode.from_string("LIMIT_EXCEEDED")` returned `ErrorCode.UNKNOWN` — retryable by accident. Now typed and retryable by design; no semantic change.
+
+Retry-After exposure (codex round-3): the client previously dropped the HTTP `Retry-After` header, so the spec's "retry after the indicated delay" was not SDK-visible for header-carried 429s. `retry-after` is now captured in `_RESPONSE_HEADERS` (`client.py`), exposed as `CyclesResponse.retry_after_ms_header` (seconds → ms, non-integer forms ignored), and `_build_protocol_exception` falls back to it for `retry_after_ms` when the body field is absent (body wins when both are present). No auto-retry behavior change — no internal path consumes code-level retryability; the delay is surfaced only.
+
+Tests: enum member + retryable (`test_models.py`), exception-layer retryable with `retry_after_ms` (`test_exceptions.py`), Retry-After header conversion + precedence (`test_response.py`, `test_lifecycle.py`), and an end-to-end 429 LIMIT_EXCEEDED with a real `Retry-After` header through the client (`test_client.py`). Full suite green at 100% coverage.

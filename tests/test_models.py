@@ -190,6 +190,17 @@ class TestErrorCode:
         assert ErrorCode.from_string("NONSENSE") == ErrorCode.UNKNOWN
         assert ErrorCode.from_string(None) is None
 
+    def test_tenant_closed(self) -> None:
+        # Runtime spec v0.1.25.13: TENANT_CLOSED added to the ErrorCode enum.
+        assert ErrorCode.from_string("TENANT_CLOSED") == ErrorCode.TENANT_CLOSED
+        assert not ErrorCode.TENANT_CLOSED.is_retryable
+
+    def test_limit_exceeded(self) -> None:
+        # Runtime spec v0.1.25.12: LIMIT_EXCEEDED added to the ErrorCode enum
+        # for HTTP 429 rate limiting; transient, so retryable.
+        assert ErrorCode.from_string("LIMIT_EXCEEDED") == ErrorCode.LIMIT_EXCEEDED
+        assert ErrorCode.LIMIT_EXCEEDED.is_retryable
+
 
 class TestAmountValidation:
     def test_rejects_negative_amount(self) -> None:

@@ -27,6 +27,7 @@ from runcycles.exceptions import (
     OverdraftLimitExceededError,
     ReservationExpiredError,
     ReservationFinalizedError,
+    TenantClosedError,
 )
 from runcycles.models import (
     CyclesMetrics,
@@ -201,9 +202,14 @@ def _build_protocol_exception(prefix: str, response: CyclesResponse) -> CyclesPr
     if reason_code is None and error_code is not None:
         reason_code = error_code
 
+    # Body field wins; otherwise fall back to the HTTP Retry-After header
+    # (seconds → ms), which is how 429 LIMIT_EXCEEDED responses carry the
+    # delay per runtime spec v0.1.25.12.
     retry_raw = response.get_body_attribute("retry_after_ms")
     if retry_raw is not None:
         retry_after_ms = int(retry_raw)
+    else:
+        retry_after_ms = response.retry_after_ms_header
 
     exc_class = CyclesProtocolError
     if error_code == "BUDGET_EXCEEDED":
@@ -216,6 +222,8 @@ def _build_protocol_exception(prefix: str, response: CyclesResponse) -> CyclesPr
         exc_class = ReservationExpiredError
     elif error_code == "RESERVATION_FINALIZED":
         exc_class = ReservationFinalizedError
+    elif error_code == "TENANT_CLOSED":
+        exc_class = TenantClosedError
 
     return exc_class(
         message,

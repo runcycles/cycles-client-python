@@ -288,6 +288,28 @@ class TestCyclesClientSync:
         assert response.request_id == "req-abc"
         assert response.rate_limit_remaining == 42
 
+    def test_retry_after_header_on_429_limit_exceeded(self, config: CyclesConfig, httpx_mock) -> None:  # type: ignore[no-untyped-def]
+        # Runtime spec v0.1.25.12: 429 rate-limit responses carry
+        # error=LIMIT_EXCEEDED plus the Retry-After header (seconds).
+        httpx_mock.add_response(
+            method="POST",
+            url="http://localhost:7878/v1/reservations",
+            json={"error": "LIMIT_EXCEEDED", "message": "Rate limited", "request_id": "req-rl"},
+            status_code=429,
+            headers={"Retry-After": "3", "X-RateLimit-Reset": "1700000000"},
+        )
+
+        with CyclesClient(config) as client:
+            response = client.create_reservation({"idempotency_key": "rl-test", "subject": {"tenant": "acme"}})
+
+        assert response.status == 429
+        assert response.retry_after_ms_header == 3000
+        assert response.rate_limit_reset == 1700000000
+        error = response.get_error_response()
+        assert error is not None
+        assert error.error_code is not None
+        assert error.error_code.value == "LIMIT_EXCEEDED"
+
     def test_dict_body(self, config: CyclesConfig, httpx_mock) -> None:  # type: ignore[no-untyped-def]
         httpx_mock.add_response(
             method="POST",

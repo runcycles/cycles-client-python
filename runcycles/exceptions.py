@@ -40,6 +40,9 @@ class CyclesProtocolError(CyclesError):
     def is_debt_outstanding(self) -> bool:
         return self.error_code == "DEBT_OUTSTANDING"
 
+    def is_tenant_closed(self) -> bool:
+        return self.error_code == "TENANT_CLOSED"
+
     def is_reservation_expired(self) -> bool:
         return self.error_code == "RESERVATION_EXPIRED"
 
@@ -53,7 +56,9 @@ class CyclesProtocolError(CyclesError):
         return self.error_code == "UNIT_MISMATCH"
 
     def is_retryable(self) -> bool:
-        return self.error_code in ("INTERNAL_ERROR", "UNKNOWN") or self.status >= 500
+        # LIMIT_EXCEEDED (HTTP 429 rate limiting, runtime spec v0.1.25.12)
+        # is transient: retry after retry_after_ms / Retry-After.
+        return self.error_code in ("INTERNAL_ERROR", "UNKNOWN", "LIMIT_EXCEEDED") or self.status >= 500
 
 
 class BudgetExceededError(CyclesProtocolError):
@@ -66,6 +71,16 @@ class OverdraftLimitExceededError(CyclesProtocolError):
 
 class DebtOutstandingError(CyclesProtocolError):
     """Raised when outstanding debt blocks new reservations."""
+
+
+class TenantClosedError(CyclesProtocolError):
+    """Raised when the owning tenant is CLOSED (HTTP 409, ``TENANT_CLOSED``).
+
+    Servers return this on reservation create/commit/release/extend when the
+    owning tenant's status is CLOSED, per runtime spec v0.1.25.13 (mirrors
+    governance spec Rule 2). Not retryable — the tenant must be reopened
+    administratively before further budget operations succeed.
+    """
 
 
 class ReservationExpiredError(CyclesProtocolError):
