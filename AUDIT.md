@@ -1,6 +1,7 @@
 # Cycles Protocol v0.1.25 — Client (Python) Audit
 
-**Date:** 2026-07-03 (integration-test-only, no version bump — `test_health_check` now probes the public `/actuator/health/readiness` endpoint instead of aggregate `/actuator/health`, which requires `X-Admin-API-Key` since cycles-server v0.1.25.45 and fails closed with 500 when the server has no admin key configured. The old assertion had failed the org nightly Full-Stack Integration every night since 2026-06-28. No library code change.),
+**Date:** 2026-07-09 (README + docstring transport-error documentation fix, no version bump — see the dated entry at the end of this file. `CyclesTransportError` is exported but never raised by the SDK; README and its docstring now describe the actual `status == -1` surfacing.),
+2026-07-03 (integration-test-only, no version bump — `test_health_check` now probes the public `/actuator/health/readiness` endpoint instead of aggregate `/actuator/health`, which requires `X-Admin-API-Key` since cycles-server v0.1.25.45 and fails closed with 500 when the server has no admin key configured. The old assertion had failed the org nightly Full-Stack Integration every night since 2026-06-28. No library code change.),
 2026-05-22 (v0.4.3 — `expires_from`/`expires_to` and `finalized_from`/`finalized_to` ISO-8601 window-filter passthrough on `list_reservations` per `cycles-protocol-v0.yaml` revision 2026-05-22; closes the Python-client side of runcycles/cycles-server#162. No code change — `**query_params` already forwards arbitrary kwargs. Added sync + async regression tests; unlike `from`/`to` the new param names are plain kwargs (no Python-reserved-word workaround needed). 393 tests pass at 100% coverage.),
 2026-05-21 (v0.4.2 — `from` / `to` ISO-8601 window-filter passthrough on `list_reservations` per `cycles-protocol-v0.yaml` revision 2026-05-21; closes the client side of runcycles/cycles-server#159. No code change — the existing `**query_params` signature already forwards arbitrary kwargs to the URL query string. Added sync + async regression tests that lock the passthrough in (using the `**{"from": ..., "to": ...}` dict-unpack form because `from` is a Python reserved keyword). 391 tests pass at 100% coverage.),
 2026-03-14
@@ -269,5 +270,19 @@ Cross-cutting hardening landed in response to org-wide tracking issues filed in 
 - **`.github/workflows/python-publish.yml`** gained a `Verify pyproject version matches tag` step that runs on tag-triggered builds (`refs/tags/v*`). The step parses `pyproject.toml` via `tomllib` and fails the workflow before the build phase if the declared version doesn't match the tag (e.g., tag `v0.5.0` against `pyproject.toml` still on `0.4.1` or a `dev0` pre-release). PyPI already rejects duplicate versions server-side, but this surfaces operator error earlier in the pipeline. Python analog of the Java SNAPSHOT-guard tracked in `runcycles/.github#61`.
 
 Not included in this change: bumping the reusable-workflow ref `runcycles/.github/.github/workflows/ci-python.yml@main` to `@v1` (`runcycles/.github#60`). That bump is intentionally split into a separate follow-up PR — it depends on the `v1` tag existing in `runcycles/.github`, which is being cut after the canonical-script PR (`runcycles/.github#64`) merges.
+
+Protocol conformance: No protocol or wire-format changes. No SDK source touched. Test suite unaffected.
+
+## README Transport-Error Documentation Fix (added 2026-07-09)
+
+**Files:** `README.md`
+**Version:** unreleased (docs-only, no version bump, no CHANGELOG entry per repo convention)
+
+Documentation-only correction. The README's exception-hierarchy table described `CyclesTransportError` as "Network-level failure (connection, DNS, timeout)", implying the SDK raises it — but nothing in the package ever raises it. Actual behavior:
+
+- **`@cycles` decorator / HOF paths:** a transport failure at reserve time raises `CyclesProtocolError` with `status == -1` and `error_code=None` (via `_build_protocol_exception` in `lifecycle.py`); commit-time transport failures are retried in the background by the commit retry engine, not raised.
+- **Programmatic client:** never raises for transport failures — returns `CyclesResponse` with `is_transport_error == True` and `status == -1` (`CyclesResponse.transport_error` constructor in `response.py`).
+
+The table row now states the class is exported for user code but never raised by the SDK, and a new "Transport errors" subsection documents the `status == -1` behavior for both API surfaces with a detection example. Wording matches the docs site (`cycles-docs/how-to/error-handling-patterns-in-python.md`). `CyclesTransportError` remains exported from `runcycles/__init__.py` for use in user code — no API change.
 
 Protocol conformance: No protocol or wire-format changes. No SDK source touched. Test suite unaffected.
