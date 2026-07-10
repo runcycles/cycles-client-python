@@ -79,6 +79,12 @@ class TestCyclesProtocolError:
         e = CyclesProtocolError("unknown", status=500, error_code="UNKNOWN")
         assert e.is_retryable()
 
+    def test_retryable_limit_exceeded(self) -> None:
+        # HTTP 429 rate limiting (runtime spec v0.1.25.12) is transient.
+        e = CyclesProtocolError("rate limited", status=429, error_code="LIMIT_EXCEEDED", retry_after_ms=3000)
+        assert e.is_retryable()
+        assert e.retry_after_ms == 3000
+
     def test_retryable_5xx_without_known_code(self) -> None:
         e = CyclesProtocolError("server error", status=502)
         assert e.is_retryable()

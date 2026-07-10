@@ -56,7 +56,9 @@ class CyclesProtocolError(CyclesError):
         return self.error_code == "UNIT_MISMATCH"
 
     def is_retryable(self) -> bool:
-        return self.error_code in ("INTERNAL_ERROR", "UNKNOWN") or self.status >= 500
+        # LIMIT_EXCEEDED (HTTP 429 rate limiting, runtime spec v0.1.25.12)
+        # is transient: retry after retry_after_ms / Retry-After.
+        return self.error_code in ("INTERNAL_ERROR", "UNKNOWN", "LIMIT_EXCEEDED") or self.status >= 500
 
 
 class BudgetExceededError(CyclesProtocolError):
