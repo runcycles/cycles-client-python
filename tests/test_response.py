@@ -69,12 +69,25 @@ class TestResponseHeaders:
         assert resp.request_id == "req-456"
         assert resp.rate_limit_reset == 1700000000
 
+    def test_retry_after_header_seconds_to_ms(self) -> None:
+        # Runtime spec v0.1.25.12: 429 LIMIT_EXCEEDED carries Retry-After
+        # in seconds; expose it as milliseconds.
+        resp = CyclesResponse.http_error(429, "Rate limited", headers={"retry-after": "3"})
+        assert resp.retry_after_ms_header == 3000
+
+    def test_retry_after_header_non_numeric_ignored(self) -> None:
+        resp = CyclesResponse.http_error(
+            429, "Rate limited", headers={"retry-after": "Wed, 21 Oct 2026 07:28:00 GMT"},
+        )
+        assert resp.retry_after_ms_header is None
+
     def test_missing_headers_return_none(self) -> None:
         resp = CyclesResponse.success(200, {})
         assert resp.request_id is None
         assert resp.rate_limit_remaining is None
         assert resp.rate_limit_reset is None
         assert resp.cycles_tenant is None
+        assert resp.retry_after_ms_header is None
 
     def test_transport_error_no_headers(self) -> None:
         resp = CyclesResponse.transport_error(ConnectionError("fail"))

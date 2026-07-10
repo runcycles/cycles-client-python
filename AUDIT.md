@@ -295,7 +295,7 @@ Protocol conformance: No protocol or wire-format changes. No SDK source touched.
 
 Additive support for the `TENANT_CLOSED` protocol error code, per runtime spec v0.1.25.13 of `cycles-protocol-v0.yaml` (runcycles/cycles-protocol#125). Servers return HTTP 409 `error=TENANT_CLOSED` on reservation create/commit/release/extend when the owning tenant's status is CLOSED — the runtime-surface mirror of governance spec Rule 2 (mutating operations on objects owned by a CLOSED tenant are rejected with 409 TENANT_CLOSED).
 
-- `ErrorCode.TENANT_CLOSED` added to the enum in `models.py` (placed with the scope-state family, after `BUDGET_CLOSED`).
+- `ErrorCode.TENANT_CLOSED` added to the enum in `models.py`, in spec declaration order: `… MAX_EXTENSIONS_EXCEEDED, LIMIT_EXCEEDED, TENANT_CLOSED, INTERNAL_ERROR` (initially placed after `BUDGET_CLOSED`; relocated when `LIMIT_EXCEEDED` landed so the enum mirrors the spec exactly).
 - `TenantClosedError(CyclesProtocolError)` added to `exceptions.py` following the existing per-code subclass pattern; exported from `runcycles/__init__.py`.
 - `_build_protocol_exception` in `lifecycle.py` maps `error == "TENANT_CLOSED"` to `TenantClosedError`. This mapping is invoked on the reservation-creation paths of the `@cycles` decorator, `CyclesLifecycle`, and streaming surfaces; commit/release-time error codes are handled by the existing commit-failure policy (logged + released) and are not raised as typed exceptions.
 - `CyclesProtocolError.is_tenant_closed()` helper added alongside the existing `is_*` per-code helpers.
@@ -320,4 +320,6 @@ Additive support for the `LIMIT_EXCEEDED` protocol error code, added to the runt
 
 Forward-compat behavior before this change (verified): `ErrorCode.from_string("LIMIT_EXCEEDED")` returned `ErrorCode.UNKNOWN` — retryable by accident. Now typed and retryable by design; no semantic change.
 
-Tests: enum member + retryable (`test_models.py`), exception-layer retryable with `retry_after_ms` (`test_exceptions.py`). Full suite green at 100% coverage.
+Retry-After exposure (codex round-3): the client previously dropped the HTTP `Retry-After` header, so the spec's "retry after the indicated delay" was not SDK-visible for header-carried 429s. `retry-after` is now captured in `_RESPONSE_HEADERS` (`client.py`), exposed as `CyclesResponse.retry_after_ms_header` (seconds → ms, non-integer forms ignored), and `_build_protocol_exception` falls back to it for `retry_after_ms` when the body field is absent (body wins when both are present). No auto-retry behavior change — no internal path consumes code-level retryability; the delay is surfaced only.
+
+Tests: enum member + retryable (`test_models.py`), exception-layer retryable with `retry_after_ms` (`test_exceptions.py`), Retry-After header conversion + precedence (`test_response.py`, `test_lifecycle.py`), and an end-to-end 429 LIMIT_EXCEEDED with a real `Retry-After` header through the client (`test_client.py`). Full suite green at 100% coverage.
