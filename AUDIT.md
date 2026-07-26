@@ -12,6 +12,15 @@
 
 ---
 
+## 2026-07-26 — Python publishing workflow maintenance
+
+Dependabot PR #83 updates the SHA-pinned `actions/setup-python` publishing
+step from 6.3.0 to 7.0.0. Version 7 moves the action runtime to ESM and removes
+the optional `pip-install` input; this workflow does not use that input. The
+change is confined to `python-publish.yml`, and the client API, package
+dependencies, generated artifacts, and protocol behavior are unchanged. The
+full PR check set passed on Python's supported matrix.
+
 ## Summary
 
 | Category | Pass | Issues |
