@@ -14,12 +14,14 @@
 
 ## 2026-07-26 — Python publishing workflow maintenance
 
-Dependabot PR #83 updates the SHA-pinned `actions/setup-python` publishing
-step from 6.3.0 to 7.0.0. Version 7 moves the action runtime to ESM and removes
-the optional `pip-install` input; this workflow does not use that input. The
-change is confined to `python-publish.yml`, and the client API, package
-dependencies, generated artifacts, and protocol behavior are unchanged. The
-full PR check set passed on Python's supported matrix.
+Dependabot PRs #82–#86 update the SHA-pinned PyPI trusted-publishing action to
+1.14.1, `actions/setup-python` to 7.0.0, the CodeQL SARIF uploader to 4.37.3,
+checkout to 7.0.1, and OSSF Scorecard to 2.4.4. Setup Python 7 moves the action
+runtime to ESM and removes the optional `pip-install` input; this workflow does
+not use that input. All changes are confined to publishing and security
+workflows, and the client API, package dependencies, generated artifacts, and
+protocol behavior are unchanged. The full PR check set passed on Python 3.10
+and 3.12 for all five heads.
 
 ## Summary
 
