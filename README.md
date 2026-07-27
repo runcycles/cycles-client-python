@@ -237,12 +237,19 @@ CyclesConfig(
 
 A commit records spend that has already happened, so the SDK never lets one
 exist only in memory. Every commit scheduled for background retry is first
-journaled to disk (`journal_dir`, default `~/.runcycles/commit-journal`) and
-removed only on a terminal outcome:
+journaled to disk and removed only on a terminal outcome. Records live under
+`journal_dir` (default `~/.runcycles/commit-journal`) in a per-identity
+subdirectory keyed by a non-secret fingerprint of `(base_url, api_key)`, so
+clients using different servers or credentials on the same machine never
+replay — or discard — each other's records:
 
 - **Process exit**: an `atexit` hook waits up to `retry_flush_timeout` seconds
-  for in-flight retries; anything unfinished stays journaled and is replayed
-  automatically the next time the process creates a client lifecycle.
+  (one process-wide budget shared across all engines) for in-flight retries;
+  anything unfinished stays journaled and is replayed automatically the next
+  time the process creates a client lifecycle.
+- **Rate limiting**: HTTP 429 / `LIMIT_EXCEEDED` responses are transient —
+  the journal entry is kept and the next attempt waits at least the server's
+  `Retry-After`.
 - **Reservation expired before the commit landed**: the server has already
   returned the reserved budget to the pool, so the SDK re-records the spend
   via `POST /v1/events` (the protocol's post-hoc direct-debit endpoint),

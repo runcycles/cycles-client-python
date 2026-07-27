@@ -15,6 +15,7 @@ from runcycles.journal import (
     CommitJournal,
     PendingCommitRecord,
     _safe_filename,
+    auth_fingerprint,
     default_journal_dir,
 )
 from runcycles.lifecycle import (
@@ -102,9 +103,14 @@ def _record(reservation_id: str = "rsv_1", **overrides: Any) -> PendingCommitRec
     return PendingCommitRecord(**defaults)
 
 
+def _identity_dir(tmp_path: Path, api_key: str = "test-key", base_url: str = BASE_URL) -> Path:
+    """The per-identity subdirectory an engine with these credentials uses."""
+    return tmp_path / "journal" / auth_fingerprint(base_url, api_key)
+
+
 def _journal_files(tmp_path: Path) -> list[Path]:
     d = tmp_path / "journal"
-    return sorted(d.glob("*.json")) if d.is_dir() else []
+    return sorted(d.rglob("*.json")) if d.is_dir() else []
 
 
 # ---------------------------------------------------------------------------
@@ -210,6 +216,14 @@ class TestCommitJournal:
         # Note: conftest patches the module attribute; this exercises the real function.
         path = default_journal_dir()
         assert path == Path.home() / ".runcycles" / "commit-journal"
+
+    def test_auth_fingerprint_is_stable_and_identity_scoped(self) -> None:
+        fp = auth_fingerprint(BASE_URL, "test-key")
+        assert fp == auth_fingerprint(BASE_URL, "test-key")
+        assert len(fp) == 16
+        assert all(c in "0123456789abcdef" for c in fp)
+        assert fp != auth_fingerprint(BASE_URL, "other-key")
+        assert fp != auth_fingerprint("http://other:9999", "test-key")
 
 
 # ---------------------------------------------------------------------------
@@ -415,6 +429,113 @@ class TestSyncEngineDurability:
         assert mock_client.commit_reservation.call_count == 1
         assert _journal_files(tmp_path) == []
 
+    def test_flush_all_engines_with_no_engines(self) -> None:
+        import weakref
+
+        import runcycles.retry as retry_mod
+
+        original = retry_mod._live_engines
+        retry_mod._live_engines = weakref.WeakSet()
+        try:
+            retry_mod._flush_all_engines()  # must not raise
+        finally:
+            retry_mod._live_engines = original
+
+    def test_flush_all_engines_shares_one_deadline(self, tmp_path: Path) -> None:
+        # Finding 4: exit flush is bounded by retry_flush_timeout for the
+        # whole process, not per engine.
+        import weakref
+
+        import runcycles.retry as retry_mod
+
+        config = _config(tmp_path, retry_flush_timeout=0.5)
+
+        def _slow_commit(*args: Any, **kwargs: Any) -> CyclesResponse:
+            time.sleep(2.0)
+            return _commit_success()
+
+        engines = []
+        for i in range(2):
+            engine = CommitRetryEngine(config)
+            mock_client = MagicMock()
+            mock_client.commit_reservation.side_effect = _slow_commit
+            engine.set_client(mock_client)
+            engine.schedule(f"rsv_{i}", _commit_body())
+            engines.append(engine)
+
+        isolated: weakref.WeakSet[CommitRetryEngine] = weakref.WeakSet(engines)
+        original = retry_mod._live_engines
+        retry_mod._live_engines = isolated
+        try:
+            start = time.monotonic()
+            retry_mod._flush_all_engines()
+            elapsed = time.monotonic() - start
+        finally:
+            retry_mod._live_engines = original
+
+        # One shared 0.5s budget — sequential per-engine flushes would take ~1.0s+.
+        assert elapsed < 0.9
+
+
+class TestRateLimitedRetry:
+    def test_429_commit_is_transient_and_honors_retry_after(self, tmp_path: Path) -> None:
+        # Finding 2: a rate-limited commit must keep its journal entry and
+        # keep retrying, waiting at least the server's Retry-After.
+        engine = CommitRetryEngine(_config(tmp_path))
+        response = CyclesResponse.http_error(
+            429, "Rate limited",
+            body={"error": "LIMIT_EXCEEDED", "message": "slow down", "request_id": "r9"},
+            headers={"retry-after": "2"},
+        )
+        pending = _PendingCommit("rsv_1", _commit_body(), _event_body())
+        engine._journal_record(pending)
+
+        assert engine._classify_commit_response(pending, response) is False
+        assert pending.retry_after_s == 2.0
+        assert len(_journal_files(tmp_path)) == 1  # retained, not discarded
+
+        delay = engine._delay_for(pending)
+        assert delay >= 2.0  # server's Retry-After wins over backoff
+        assert pending.retry_after_s is None  # consumed — applies once
+
+    def test_429_without_body_detected_by_status(self, tmp_path: Path) -> None:
+        engine = CommitRetryEngine(_config(tmp_path))
+        pending = _PendingCommit("rsv_1", _commit_body())
+        assert engine._classify_commit_response(pending, CyclesResponse.http_error(429, "busy")) is False
+        assert pending.retry_after_s is None  # no header → plain backoff
+
+    def test_429_then_success_discards_journal(self, tmp_path: Path) -> None:
+        engine = CommitRetryEngine(_config(tmp_path))
+        mock_client = MagicMock()
+        mock_client.commit_reservation.side_effect = [
+            CyclesResponse.http_error(429, "busy", headers={"retry-after": "0"}),
+            _commit_success(),
+        ]
+        engine.set_client(mock_client)
+
+        pending = _PendingCommit("rsv_1", _commit_body())
+        engine._journal_record(pending)
+        engine._retry_loop(pending)
+
+        assert mock_client.commit_reservation.call_count == 2
+        assert _journal_files(tmp_path) == []
+
+    def test_429_event_fallback_is_transient(self, tmp_path: Path) -> None:
+        engine = CommitRetryEngine(_config(tmp_path))
+        mock_client = MagicMock()
+        mock_client.create_event.return_value = CyclesResponse.http_error(
+            429, "busy", body={"error": "LIMIT_EXCEEDED", "message": "m", "request_id": "r"},
+        )
+        engine.set_client(mock_client)
+
+        pending = _PendingCommit("rsv_1", None, _event_body(), mode="event")
+        engine._journal_record(pending)
+        engine._retry_loop(pending)
+
+        # Exhausts attempts without ever discarding the durable record.
+        assert mock_client.create_event.call_count == 3
+        assert len(_journal_files(tmp_path)) == 1
+
 
 # ---------------------------------------------------------------------------
 # Journal replay
@@ -423,7 +544,7 @@ class TestSyncEngineDurability:
 
 class TestSyncReplay:
     def test_replays_pending_commit_on_set_client(self, tmp_path: Path) -> None:
-        CommitJournal(tmp_path / "journal").record(_record("rsv_old"))
+        CommitJournal(_identity_dir(tmp_path)).record(_record("rsv_old"))
 
         engine = CommitRetryEngine(_config(tmp_path))
         mock_client = MagicMock()
@@ -435,7 +556,7 @@ class TestSyncReplay:
         assert _journal_files(tmp_path) == []
 
     def test_replays_event_mode_entry(self, tmp_path: Path) -> None:
-        CommitJournal(tmp_path / "journal").record(
+        CommitJournal(_identity_dir(tmp_path)).record(
             _record("rsv_old", mode="event", commit_body=None)
         )
 
@@ -449,7 +570,7 @@ class TestSyncReplay:
         assert _journal_files(tmp_path) == []
 
     def test_replay_happens_once_per_directory(self, tmp_path: Path) -> None:
-        CommitJournal(tmp_path / "journal").record(_record("rsv_old"))
+        CommitJournal(_identity_dir(tmp_path)).record(_record("rsv_old"))
         config = _config(tmp_path)
 
         first = CommitRetryEngine(config)
@@ -467,7 +588,10 @@ class TestSyncReplay:
         client2.commit_reservation.assert_not_called()
 
     def test_replay_skips_other_server_entries(self, tmp_path: Path) -> None:
-        journal = CommitJournal(tmp_path / "journal")
+        # Defense-in-depth: a mismatched-base_url record inside the identity
+        # dir (should not happen — the fingerprint includes base_url) is
+        # still filtered out rather than replayed against the wrong server.
+        journal = CommitJournal(_identity_dir(tmp_path))
         journal.record(_record("rsv_other", base_url="http://other:9999"))
 
         engine = CommitRetryEngine(_config(tmp_path))
@@ -476,10 +600,57 @@ class TestSyncReplay:
         engine.flush(timeout=5.0)
 
         mock_client.commit_reservation.assert_not_called()
-        assert len(_journal_files(tmp_path)) == 1  # left for the other server's process
+        assert len(_journal_files(tmp_path)) == 1  # left in place, never discarded
+
+    def test_replay_isolated_by_api_key(self, tmp_path: Path) -> None:
+        # Finding 1: same server, different credentials → separate identity
+        # dirs. Client A must never replay (and 401-discard) client B's spend.
+        CommitJournal(_identity_dir(tmp_path, api_key="test-key")).record(_record("rsv_a"))
+        CommitJournal(_identity_dir(tmp_path, api_key="other-key")).record(_record("rsv_b"))
+
+        engine_a = CommitRetryEngine(_config(tmp_path))
+        client_a = MagicMock()
+        client_a.commit_reservation.return_value = _commit_success()
+        engine_a.set_client(client_a)
+        engine_a.flush(timeout=5.0)
+
+        client_a.commit_reservation.assert_called_once_with("rsv_a", _commit_body())
+        assert _journal_files(tmp_path) == [_identity_dir(tmp_path, api_key="other-key") / "rsv_b.json"]
+
+        engine_b = CommitRetryEngine(_config(tmp_path, api_key="other-key"))
+        client_b = MagicMock()
+        client_b.commit_reservation.return_value = _commit_success()
+        engine_b.set_client(client_b)
+        engine_b.flush(timeout=5.0)
+
+        client_b.commit_reservation.assert_called_once_with("rsv_b", _commit_body())
+        assert _journal_files(tmp_path) == []
+
+    def test_one_server_claim_does_not_block_another(self, tmp_path: Path) -> None:
+        # Finding 3: the replay claim is scoped to the identity subdirectory,
+        # so server A's engine starting first cannot starve server B's entries.
+        other_url = "http://other:9999"
+        CommitJournal(_identity_dir(tmp_path, base_url=other_url)).record(
+            _record("rsv_b", base_url=other_url)
+        )
+
+        engine_a = CommitRetryEngine(_config(tmp_path))
+        client_a = MagicMock()
+        engine_a.set_client(client_a)  # claims A's (empty) identity dir first
+        engine_a.flush(timeout=5.0)
+        client_a.commit_reservation.assert_not_called()
+
+        engine_b = CommitRetryEngine(_config(tmp_path, base_url=other_url))
+        client_b = MagicMock()
+        client_b.commit_reservation.return_value = _commit_success()
+        engine_b.set_client(client_b)
+        engine_b.flush(timeout=5.0)
+
+        client_b.commit_reservation.assert_called_once_with("rsv_b", _commit_body())
+        assert _journal_files(tmp_path) == []
 
     def test_no_replay_when_retry_disabled(self, tmp_path: Path) -> None:
-        CommitJournal(tmp_path / "journal").record(_record("rsv_old"))
+        CommitJournal(_identity_dir(tmp_path)).record(_record("rsv_old"))
 
         engine = CommitRetryEngine(_config(tmp_path, retry_enabled=False))
         mock_client = MagicMock()
@@ -578,7 +749,7 @@ class TestAsyncEngineDurability:
         assert len(_journal_files(tmp_path)) == 1
 
     async def test_replay_on_set_client_with_running_loop(self, tmp_path: Path) -> None:
-        CommitJournal(tmp_path / "journal").record(_record("rsv_old"))
+        CommitJournal(_identity_dir(tmp_path)).record(_record("rsv_old"))
 
         engine = AsyncCommitRetryEngine(_config(tmp_path))
         mock_client = AsyncMock()
@@ -611,7 +782,7 @@ class TestAsyncEngineNoLoop:
         assert _journal_files(tmp_path) == []
 
     def test_deferred_replay_runs_at_first_schedule(self, tmp_path: Path) -> None:
-        CommitJournal(tmp_path / "journal").record(_record("rsv_old"))
+        CommitJournal(_identity_dir(tmp_path)).record(_record("rsv_old"))
 
         engine = AsyncCommitRetryEngine(_config(tmp_path))
         mock_client = AsyncMock()

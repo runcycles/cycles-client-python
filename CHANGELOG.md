@@ -11,9 +11,10 @@ Durable commit retries. Previously a commit that failed transiently lived only i
 
 ### Added
 
-- `runcycles.journal`: file-per-commit `CommitJournal` (atomic write, idempotent replay). Config: `journal_enabled` (default `True`), `journal_dir` (default `~/.runcycles/commit-journal`), `retry_flush_timeout` (default 10 s); env `CYCLES_JOURNAL_ENABLED`, `CYCLES_JOURNAL_DIR`, `CYCLES_RETRY_FLUSH_TIMEOUT`. The first engine created per journal directory replays surviving entries for its `base_url`; corrupt files are renamed `*.corrupt` for operator triage.
+- `runcycles.journal`: file-per-commit `CommitJournal` (atomic write, idempotent replay). Config: `journal_enabled` (default `True`), `journal_dir` (default `~/.runcycles/commit-journal`), `retry_flush_timeout` (default 10 s); env `CYCLES_JOURNAL_ENABLED`, `CYCLES_JOURNAL_DIR`, `CYCLES_RETRY_FLUSH_TIMEOUT`. Records are partitioned into per-identity subdirectories keyed by a non-secret SHA-256 fingerprint of `(base_url, api_key)`, so clients with different servers or credentials sharing a journal directory never replay — or 401-discard — each other's records, and one identity's replay claim cannot starve another's. The first engine created per identity replays surviving entries; corrupt files are renamed `*.corrupt` for operator triage.
 - Event fallback: when a commit (first attempt or retry) returns `RESERVATION_EXPIRED`, the SDK posts the spend to `/v1/events` reusing the commit's idempotency key, with `metadata.recovered_reservation_id` / `metadata.recovery_reason` markers and no `overage_policy` (spec default `ALLOW_IF_AVAILABLE` never rejects). Applies to the `@cycles` lifecycles and both streaming context managers. `RESERVATION_FINALIZED` is still treated as settled.
-- `flush()` on both retry engines; a process-wide `atexit` hook flushes sync engines for up to `retry_flush_timeout` seconds so daemon retry threads aren't killed mid-backoff on clean exit.
+- `flush()` on both retry engines; a process-wide `atexit` hook flushes sync engines under one shared `retry_flush_timeout` deadline (not per engine) so daemon retry threads aren't killed mid-backoff on clean exit and shutdown time stays bounded regardless of engine count.
+- Rate-limit awareness in the retry engines: HTTP 429 / `LIMIT_EXCEEDED` on a commit or event attempt is transient — the journal entry is retained and the next attempt waits at least the server's `Retry-After` (consistent with `ErrorCode.is_retryable`).
 
 ### Fixed
 

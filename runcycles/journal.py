@@ -15,6 +15,7 @@ the commit path itself.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import time
@@ -31,6 +32,19 @@ _SUFFIX = ".json"
 def default_journal_dir() -> Path:
     """Default location for the pending-commit journal."""
     return Path.home() / ".runcycles" / "commit-journal"
+
+
+def auth_fingerprint(base_url: str, api_key: str) -> str:
+    """Non-secret identity for one (server, credential) pair.
+
+    Journal records are stored under a per-identity subdirectory so that
+    clients sharing a journal directory but using different servers or API
+    keys never replay (and on 401/403, discard) each other's records. A
+    truncated SHA-256 is not reversible and API keys are high-entropy, so
+    the fingerprint is safe to use as a directory name.
+    """
+    digest = hashlib.sha256(f"{base_url}\n{api_key}".encode()).hexdigest()
+    return digest[:16]
 
 
 def _safe_filename(reservation_id: str) -> str:

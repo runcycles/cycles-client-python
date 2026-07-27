@@ -37,6 +37,9 @@ class _PendingCommit:
     event_fallback_body: dict[str, Any] | None = None
     mode: str = "commit"  # "commit" | "event"
     attempt: int = 0
+    # Server-requested minimum delay (seconds) before the next attempt,
+    # set from a 429's Retry-After and consumed by the retry loop.
+    retry_after_s: float | None = None
 
 
 def _extract_error_code(response: CyclesResponse) -> str | None:
@@ -47,9 +50,12 @@ def _extract_error_code(response: CyclesResponse) -> str | None:
     return raw if isinstance(raw, str) else None
 
 
-# Journal replay must happen at most once per journal directory per process:
-# the first engine created for a directory claims it and replays surviving
-# entries; later engines (and the claimer's own in-flight work) are excluded.
+# Journal replay must happen at most once per identity directory per process:
+# the first engine created for a (server, credential) identity claims its
+# subdirectory and replays surviving entries; later engines (and the
+# claimer's own in-flight work) are excluded. Because the claim is scoped to
+# the identity subdirectory — not the shared parent — an engine for one
+# server/key can never block another identity's entries from replaying.
 _replay_lock = threading.Lock()
 _replayed_dirs: set[Path] = set()
 
@@ -72,8 +78,18 @@ _atexit_registered = False
 
 
 def _flush_all_engines() -> None:
-    for engine in list(_live_engines):
-        engine.flush()
+    # One process-wide deadline: retry_flush_timeout bounds the whole exit
+    # wait, not each engine. With several engines (decorators, streams) the
+    # remaining budget shrinks as each is flushed.
+    engines = list(_live_engines)
+    if not engines:
+        return
+    deadline = time.monotonic() + max(engine._flush_timeout for engine in engines)
+    for engine in engines:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return
+        engine.flush(remaining)
 
 
 def _register_engine_for_flush(engine: CommitRetryEngine) -> None:
@@ -99,8 +115,12 @@ class _RetryEngineBase:
         self._client: Any = None  # set by lifecycle to avoid circular import
         self._journal: CommitJournal | None = None
         if config.journal_enabled:
-            directory = Path(config.journal_dir) if config.journal_dir else _journal.default_journal_dir()
-            self._journal = CommitJournal(directory)
+            base = Path(config.journal_dir) if config.journal_dir else _journal.default_journal_dir()
+            # Per-identity subdirectory: clients sharing a journal directory
+            # but using different servers or API keys must never replay each
+            # other's records (a foreign record would 401/403 and be
+            # discarded as terminal — permanent spend loss).
+            self._journal = CommitJournal(base / _journal.auth_fingerprint(config.base_url, config.api_key))
 
     def _journal_record(self, pending: _PendingCommit) -> None:
         if self._journal is not None:
@@ -151,8 +171,27 @@ class _RetryEngineBase:
                 pending.mode, pending.reservation_id,
             )
 
-    def _delay_for(self, attempt: int) -> float:
-        return min(self._initial_delay * (self._multiplier**attempt), self._max_delay)
+    def _delay_for(self, pending: _PendingCommit) -> float:
+        delay = min(self._initial_delay * (self._multiplier ** pending.attempt), self._max_delay)
+        if pending.retry_after_s is not None:
+            # A 429 asked us to wait: honor the server's Retry-After when it
+            # exceeds our own backoff, then clear it — it applies once.
+            delay = max(delay, pending.retry_after_s)
+            pending.retry_after_s = None
+        return delay
+
+    def _is_rate_limited(self, pending: _PendingCommit, response: CyclesResponse) -> bool:
+        """Detect 429 / LIMIT_EXCEEDED and stash its Retry-After. Transient, never terminal."""
+        if response.status != 429 and _extract_error_code(response) != "LIMIT_EXCEEDED":
+            return False
+        retry_after_ms = response.retry_after_ms_header
+        if retry_after_ms is not None:
+            pending.retry_after_s = retry_after_ms / 1000.0
+        logger.warning(
+            "%s retry rate-limited: reservation_id=%s, attempt=%d, retry_after_ms=%s",
+            pending.mode, pending.reservation_id, pending.attempt, retry_after_ms,
+        )
+        return True
 
     def _classify_commit_response(self, pending: _PendingCommit, response: CyclesResponse) -> bool:
         """Handle a commit attempt's response. Returns True when terminal.
@@ -167,6 +206,8 @@ class _RetryEngineBase:
             )
             self._journal_discard(pending.reservation_id)
             return True
+        if self._is_rate_limited(pending, response):
+            return False
         if response.is_client_error:
             code = _extract_error_code(response)
             if code == "RESERVATION_EXPIRED":
@@ -207,6 +248,8 @@ class _RetryEngineBase:
             )
             self._journal_discard(pending.reservation_id)
             return True
+        if self._is_rate_limited(pending, response):
+            return False
         if response.is_client_error:
             logger.error(
                 "Event fallback rejected (%s); spend recovery failed: reservation_id=%s, status=%d",
@@ -306,7 +349,7 @@ class CommitRetryEngine(_RetryEngineBase):
 
     def _retry_loop(self, pending: _PendingCommit) -> None:
         while pending.attempt < self._max_attempts:
-            delay = self._delay_for(pending.attempt)
+            delay = self._delay_for(pending)
             pending.attempt += 1
             logger.info(
                 "Scheduling %s retry: reservation_id=%s, attempt=%d/%d, delay=%.1fs",
@@ -422,7 +465,7 @@ class AsyncCommitRetryEngine(_RetryEngineBase):
 
     async def _retry_loop(self, pending: _PendingCommit) -> None:
         while pending.attempt < self._max_attempts:
-            delay = self._delay_for(pending.attempt)
+            delay = self._delay_for(pending)
             pending.attempt += 1
             logger.info(
                 "Scheduling async %s retry: reservation_id=%s, attempt=%d/%d, delay=%.1fs",
