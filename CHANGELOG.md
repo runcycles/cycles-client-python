@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog 1.1.0](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.1] - 2026-07-27
+
+### Fixed
+
+- **Heartbeat extend drift**: `extend_by_ms` is relative to the reservation's *current* `expires_at_ms` (spec), but the heartbeat extended by the full `ttl_ms` on every `ttl/2` beat — drifting expiry outward by `ttl/2` per beat. A killed process left its reserved budget locked until the drifted expiry (a zombie-reservation window scaling with runtime, bounded only by `max_extensions`), and long runs burned the `max_extensions` budget twice as fast as needed, losing heartbeat protection mid-flight. All four heartbeats (both lifecycles, both streaming context managers) now use alternate-beat extension: extend on the first beat and every second beat after a success, retrying immediately after a failure. Expiry lead stays within `[ttl/2, 1.5×ttl]`; extension consumption is halved. Fleet-wide fix (TS/Java/Rust ship the same change); spec guidance added in cycles-protocol#148.
+
+### Added
+
+- `metadata.actual_source: "estimate"` is stamped on commits whose actual was structurally defaulted from the estimate (`@cycles` without an `actual` expression; streams with no recorded cost or a raised `cost_fn`), so audit evidence distinguishes measured spend from assumed spend. Defaults are unchanged; the marker flows into `/v1/events` recovery bodies via the shared metadata.
+
 ## [0.5.0] - 2026-07-27
 
 Durable commit retries. Previously a commit that failed transiently lived only in an in-memory daemon thread (or an unreferenced asyncio task): a process exit — even a clean one — dropped it, and once the reservation's grace period elapsed the server's expiry sweep returned the reserved budget to the pool, permanently under-counting spend that had already happened. Pending commits are now journaled to disk before retry, replayed on the next run, flushed (bounded) at interpreter exit, and — when the reservation has already expired — recovered via `POST /v1/events`, the spec's post-hoc direct-debit endpoint.

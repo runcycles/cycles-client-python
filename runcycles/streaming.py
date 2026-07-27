@@ -92,17 +92,22 @@ def _resolve_actual_cost(
     usage: StreamUsage,
     cost_fn: Callable[[StreamUsage], int] | None,
     estimate_amount: int,
-) -> int:
-    """Resolve the actual cost: explicit > cost_fn > estimate fallback."""
+) -> tuple[int, bool]:
+    """Resolve the actual cost: explicit > cost_fn > estimate fallback.
+
+    Returns ``(amount, from_estimate)`` — the flag is True when the estimate
+    was substituted for an unmeasured actual, so the commit can carry an
+    ``actual_source`` marker for audit honesty.
+    """
     if usage.actual_cost is not None:
-        return usage.actual_cost
+        return usage.actual_cost, False
     if cost_fn is not None:
         try:
-            return cost_fn(usage)
+            return cost_fn(usage), False
         except Exception:
             logger.warning("cost_fn raised, falling back to estimate", exc_info=True)
-            return estimate_amount
-    return estimate_amount
+            return estimate_amount, True
+    return estimate_amount, True
 
 
 def _build_stream_metrics(
@@ -273,11 +278,17 @@ class StreamReservation:
 
     def _handle_commit(self) -> None:
         elapsed_ms = int((time.monotonic() - self._start_time) * 1000)
-        actual = _resolve_actual_cost(self._usage, self._cost_fn, self._estimate.amount)
+        actual, actual_from_estimate = _resolve_actual_cost(
+            self._usage, self._cost_fn, self._estimate.amount
+        )
         ctx_metrics = self._ctx.metrics if self._ctx else None
         metrics = _build_stream_metrics(self._usage, elapsed_ms, ctx_metrics)
         unit = self._estimate.unit if isinstance(self._estimate.unit, str) else self._estimate.unit.value
-        commit_body = _build_commit_body(actual, unit, metrics, self._metadata)
+        commit_metadata = self._metadata
+        if actual_from_estimate:
+            # Estimate recorded as actual — mark the evidence (audit honesty).
+            commit_metadata = {**(commit_metadata or {}), "actual_source": "estimate"}
+        commit_body = _build_commit_body(actual, unit, metrics, commit_metadata)
 
         assert self._reservation_id is not None
         event_fallback = _build_event_fallback_body(
@@ -364,11 +375,17 @@ class StreamReservation:
         ctx = self._ctx
 
         def heartbeat_loop() -> None:
+            # Alternate-beat extension — see CyclesLifecycle heartbeat for rationale.
+            beats_since_extend = 1
             while not self._heartbeat_stop.wait(timeout=interval_s):
+                beats_since_extend += 1
+                if beats_since_extend < 2:
+                    continue
                 try:
                     body = _build_extend_body(self._ttl_ms)
                     response = self._client.extend_reservation(reservation_id, body)
                     if response.is_success:
+                        beats_since_extend = 0
                         new_expires = response.get_body_attribute("expires_at_ms")
                         if new_expires is not None and ctx is not None:
                             ctx.update_expires_at_ms(int(new_expires))
@@ -534,11 +551,17 @@ class AsyncStreamReservation:
 
     async def _handle_commit(self) -> None:
         elapsed_ms = int((time.monotonic() - self._start_time) * 1000)
-        actual = _resolve_actual_cost(self._usage, self._cost_fn, self._estimate.amount)
+        actual, actual_from_estimate = _resolve_actual_cost(
+            self._usage, self._cost_fn, self._estimate.amount
+        )
         ctx_metrics = self._ctx.metrics if self._ctx else None
         metrics = _build_stream_metrics(self._usage, elapsed_ms, ctx_metrics)
         unit = self._estimate.unit if isinstance(self._estimate.unit, str) else self._estimate.unit.value
-        commit_body = _build_commit_body(actual, unit, metrics, self._metadata)
+        commit_metadata = self._metadata
+        if actual_from_estimate:
+            # Estimate recorded as actual — mark the evidence (audit honesty).
+            commit_metadata = {**(commit_metadata or {}), "actual_source": "estimate"}
+        commit_body = _build_commit_body(actual, unit, metrics, commit_metadata)
 
         assert self._reservation_id is not None
         event_fallback = _build_event_fallback_body(
@@ -629,13 +652,19 @@ class AsyncStreamReservation:
         ttl_ms = self._ttl_ms
 
         async def heartbeat_loop() -> None:
+            # Alternate-beat extension — see CyclesLifecycle heartbeat for rationale.
+            beats_since_extend = 1
             try:
                 while True:
                     await asyncio.sleep(interval_s)
+                    beats_since_extend += 1
+                    if beats_since_extend < 2:
+                        continue
                     try:
                         body = _build_extend_body(ttl_ms)
                         response = await client.extend_reservation(reservation_id, body)
                         if response.is_success:
+                            beats_since_extend = 0
                             new_expires = response.get_body_attribute("expires_at_ms")
                             if new_expires is not None and ctx is not None:
                                 ctx.update_expires_at_ms(int(new_expires))

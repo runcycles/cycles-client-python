@@ -229,7 +229,7 @@ class TestBuildStreamingReservationBody:
 class TestResolveActualCost:
     def test_explicit_actual_cost(self) -> None:
         u = StreamUsage(actual_cost=777)
-        assert _resolve_actual_cost(u, lambda _: 999, 1000) == 777
+        assert _resolve_actual_cost(u, lambda _: 999, 1000) == (777, False)
 
     def test_cost_fn(self) -> None:
         u = StreamUsage(tokens_input=100, tokens_output=50)
@@ -237,7 +237,7 @@ class TestResolveActualCost:
         def cost_fn(usage: StreamUsage) -> int:
             return usage.tokens_input * 2 + usage.tokens_output * 3
 
-        assert _resolve_actual_cost(u, cost_fn, 1000) == 350
+        assert _resolve_actual_cost(u, cost_fn, 1000) == (350, False)
 
     def test_cost_fn_error_falls_back_to_estimate(self) -> None:
         u = StreamUsage()
@@ -245,11 +245,11 @@ class TestResolveActualCost:
         def bad_fn(_: StreamUsage) -> int:
             raise ValueError("oops")
 
-        assert _resolve_actual_cost(u, bad_fn, 1000) == 1000
+        assert _resolve_actual_cost(u, bad_fn, 1000) == (1000, True)
 
     def test_fallback_to_estimate(self) -> None:
         u = StreamUsage()
-        assert _resolve_actual_cost(u, None, 500) == 500
+        assert _resolve_actual_cost(u, None, 500) == (500, True)
 
 
 # ---------------------------------------------------------------------------
@@ -620,7 +620,8 @@ class TestStreamReservation:
             pass
 
         commit_body = mock.commit_reservation.call_args[0][1]
-        assert commit_body["metadata"] == {"source": "test"}
+        # actual_source marker added because no actual cost was recorded
+        assert commit_body["metadata"] == {"source": "test", "actual_source": "estimate"}
 
     def test_metrics_include_tokens(self) -> None:
         mock = _make_mock_client()
@@ -1310,7 +1311,8 @@ class TestAsyncStreamReservationEdgeCases:
             pass
 
         commit_body = mock.commit_reservation.call_args[0][1]
-        assert commit_body["metadata"] == {"key": "val"}
+        # actual_source marker added because no actual cost was recorded
+        assert commit_body["metadata"] == {"key": "val", "actual_source": "estimate"}
 
     @pytest.mark.asyncio
     async def test_caps_propagated(self) -> None:

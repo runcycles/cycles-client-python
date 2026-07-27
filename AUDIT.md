@@ -13,6 +13,16 @@
 
 ---
 
+## 2026-07-27 — Heartbeat drift fix + actual_source marker (v0.5.1)
+
+The heartbeat extended by full ttl_ms every ttl/2 beat while extend_by_ms
+is relative to current expiry — drifting expiry outward +ttl/2 per beat
+(zombie budget lockup on kill; max_extensions burned 2× too fast). All
+four heartbeats now alternate-beat extend (lead stays [ttl/2, 1.5×ttl]).
+Commits whose actual was defaulted from the estimate now carry
+metadata.actual_source="estimate" for audit honesty. Spec guidance:
+cycles-protocol#148. 517 tests pass at 100% coverage.
+
 ## 2026-07-27 — Durable commit retries (journal + /v1/events fallback)
 
 Pending commits no longer exist only in memory: the retry engines journal

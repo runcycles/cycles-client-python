@@ -371,7 +371,14 @@ class CyclesLifecycle:
             if metrics.latency_ms is None:
                 metrics.latency_ms = method_elapsed
 
-            commit_body = _build_commit_body(actual_amount, cfg.unit, metrics, ctx.commit_metadata)
+            commit_metadata = ctx.commit_metadata
+            if cfg.actual is None:
+                # The estimate is being recorded as the actual (documented
+                # fallback). Mark the evidence so auditors can distinguish
+                # measured spend from assumed spend.
+                logger.debug("No actual expression; committing estimate as actual: id=%s", reservation_id)
+                commit_metadata = {**(commit_metadata or {}), "actual_source": "estimate"}
+            commit_body = _build_commit_body(actual_amount, cfg.unit, metrics, commit_metadata)
             event_fallback = _build_event_fallback_body(
                 reservation_id, create_body["subject"], create_body["action"], commit_body,
             )
@@ -470,11 +477,23 @@ class CyclesLifecycle:
         interval_s = max(ttl_ms / 2, 1000) / 1000.0
 
         def heartbeat_loop() -> None:
+            # Alternate-beat extension: extend_by_ms is relative to the
+            # CURRENT expiry (spec), so extending by ttl on every ttl/2 beat
+            # drifts expiry outward +ttl/2 per beat — a zombie-reservation
+            # window — and burns max_extensions twice as fast as needed.
+            # Extend on the first beat (only ttl/2 of lifetime remains) and
+            # every second beat after a success; retry right away after a
+            # failure. Expiry lead stays within [ttl/2, 1.5*ttl].
+            beats_since_extend = 1
             while not stop_event.wait(timeout=interval_s):
+                beats_since_extend += 1
+                if beats_since_extend < 2:
+                    continue
                 try:
                     body = _build_extend_body(ttl_ms)
                     response = self._client.extend_reservation(reservation_id, body)
                     if response.is_success:
+                        beats_since_extend = 0
                         new_expires = response.get_body_attribute("expires_at_ms")
                         if new_expires is not None:
                             ctx.update_expires_at_ms(int(new_expires))
@@ -572,7 +591,13 @@ class AsyncCyclesLifecycle:
             if metrics.latency_ms is None:
                 metrics.latency_ms = method_elapsed
 
-            commit_body = _build_commit_body(actual_amount, cfg.unit, metrics, ctx.commit_metadata)
+            commit_metadata = ctx.commit_metadata
+            if cfg.actual is None:
+                # See the sync lifecycle: estimate recorded as actual is
+                # marked so the evidence stays honest.
+                logger.debug("No actual expression; committing estimate as actual: id=%s", reservation_id)
+                commit_metadata = {**(commit_metadata or {}), "actual_source": "estimate"}
+            commit_body = _build_commit_body(actual_amount, cfg.unit, metrics, commit_metadata)
             event_fallback = _build_event_fallback_body(
                 reservation_id, create_body["subject"], create_body["action"], commit_body,
             )
@@ -669,13 +694,19 @@ class AsyncCyclesLifecycle:
         interval_s = max(ttl_ms / 2, 1000) / 1000.0
 
         async def heartbeat_loop() -> None:
+            # Alternate-beat extension — see the sync heartbeat for rationale.
+            beats_since_extend = 1
             try:
                 while True:
                     await asyncio.sleep(interval_s)
+                    beats_since_extend += 1
+                    if beats_since_extend < 2:
+                        continue
                     try:
                         body = _build_extend_body(ttl_ms)
                         response = await self._client.extend_reservation(reservation_id, body)
                         if response.is_success:
+                            beats_since_extend = 0
                             new_expires = response.get_body_attribute("expires_at_ms")
                             if new_expires is not None:
                                 ctx.update_expires_at_ms(int(new_expires))
