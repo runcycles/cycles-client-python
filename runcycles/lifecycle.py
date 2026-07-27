@@ -163,6 +163,33 @@ def _build_commit_body(
     return body
 
 
+def _build_event_fallback_body(
+    reservation_id: str, subject: dict[str, Any], action: dict[str, Any], commit_body: dict[str, Any],
+) -> dict[str, Any]:
+    """Build a POST /v1/events body that records the spend of a commit whose
+    reservation expired before the commit landed (the server has already
+    returned the reserved budget to the pool at that point).
+
+    Reuses the commit's idempotency key — the event idempotency namespace is
+    separate, so replays across process restarts stay exactly-once. Omits
+    overage_policy: the spec default ALLOW_IF_AVAILABLE never rejects, which
+    is the right bias when the spend has already happened.
+    """
+    metadata = dict(commit_body.get("metadata") or {})
+    metadata["recovered_reservation_id"] = reservation_id
+    metadata["recovery_reason"] = "commit_after_reservation_expired"
+    body: dict[str, Any] = {
+        "idempotency_key": commit_body["idempotency_key"],
+        "subject": subject,
+        "action": action,
+        "actual": commit_body["actual"],
+        "metadata": metadata,
+    }
+    if "metrics" in commit_body:
+        body["metrics"] = commit_body["metrics"]
+    return body
+
+
 def _build_release_body(reason: str) -> dict[str, Any]:
     return {"idempotency_key": str(uuid.uuid4()), "reason": reason}
 
@@ -341,7 +368,10 @@ class CyclesLifecycle:
                 metrics.latency_ms = method_elapsed
 
             commit_body = _build_commit_body(actual_amount, cfg.unit, metrics, ctx.commit_metadata)
-            self._handle_commit(reservation_id, commit_body)
+            event_fallback = _build_event_fallback_body(
+                reservation_id, create_body["subject"], create_body["action"], commit_body,
+            )
+            self._handle_commit(reservation_id, commit_body, event_fallback)
 
             return result
 
@@ -355,7 +385,9 @@ class CyclesLifecycle:
                 heartbeat_thread.join(timeout=1.0)
             _clear_context()
 
-    def _handle_commit(self, reservation_id: str, commit_body: dict[str, Any]) -> None:
+    def _handle_commit(
+        self, reservation_id: str, commit_body: dict[str, Any], event_fallback_body: dict[str, Any],
+    ) -> None:
         try:
             logger.debug("Committing: id=%s", reservation_id)
             response = self._client.commit_reservation(reservation_id, commit_body)
@@ -363,14 +395,20 @@ class CyclesLifecycle:
                 logger.info("Commit successful: id=%s", reservation_id)
             elif response.is_transport_error or response.is_server_error:
                 logger.warning("Commit failed (retryable): id=%s, status=%d", reservation_id, response.status)
-                self._retry_engine.schedule(reservation_id, commit_body)
+                self._retry_engine.schedule(reservation_id, commit_body, event_fallback_body)
             else:
                 error_code = None
                 error_resp = response.get_error_response()
                 if error_resp and error_resp.error_code:
                     error_code = error_resp.error_code.value
-                if error_code in ("RESERVATION_FINALIZED", "RESERVATION_EXPIRED"):
-                    logger.warning("Reservation already finalized/expired: id=%s", reservation_id)
+                if error_code == "RESERVATION_EXPIRED":
+                    logger.warning(
+                        "Reservation expired before commit; recovering spend via POST /v1/events: id=%s",
+                        reservation_id,
+                    )
+                    self._retry_engine.schedule_event(reservation_id, event_fallback_body)
+                elif error_code == "RESERVATION_FINALIZED":
+                    logger.warning("Reservation already finalized: id=%s", reservation_id)
                 elif error_code == "IDEMPOTENCY_MISMATCH":
                     logger.warning("Commit idempotency mismatch (not releasing): id=%s", reservation_id)
                 elif response.is_client_error:
@@ -379,7 +417,7 @@ class CyclesLifecycle:
                     logger.warning("Unrecognized commit response: id=%s, response=%s", reservation_id, response)
         except Exception:
             logger.exception("Failed to commit: id=%s", reservation_id)
-            self._retry_engine.schedule(reservation_id, commit_body)
+            self._retry_engine.schedule(reservation_id, commit_body, event_fallback_body)
 
     def _handle_release(self, reservation_id: str, reason: str) -> None:
         try:
@@ -504,7 +542,10 @@ class AsyncCyclesLifecycle:
                 metrics.latency_ms = method_elapsed
 
             commit_body = _build_commit_body(actual_amount, cfg.unit, metrics, ctx.commit_metadata)
-            await self._handle_commit(reservation_id, commit_body)
+            event_fallback = _build_event_fallback_body(
+                reservation_id, create_body["subject"], create_body["action"], commit_body,
+            )
+            await self._handle_commit(reservation_id, commit_body, event_fallback)
 
             return result
 
@@ -521,20 +562,28 @@ class AsyncCyclesLifecycle:
                     pass
             _clear_context()
 
-    async def _handle_commit(self, reservation_id: str, commit_body: dict[str, Any]) -> None:
+    async def _handle_commit(
+        self, reservation_id: str, commit_body: dict[str, Any], event_fallback_body: dict[str, Any],
+    ) -> None:
         try:
             response = await self._client.commit_reservation(reservation_id, commit_body)
             if response.is_success:
                 logger.info("Commit successful: id=%s", reservation_id)
             elif response.is_transport_error or response.is_server_error:
-                self._retry_engine.schedule(reservation_id, commit_body)
+                self._retry_engine.schedule(reservation_id, commit_body, event_fallback_body)
             else:
                 error_code = None
                 error_resp = response.get_error_response()
                 if error_resp and error_resp.error_code:
                     error_code = error_resp.error_code.value
-                if error_code in ("RESERVATION_FINALIZED", "RESERVATION_EXPIRED"):
-                    logger.warning("Reservation already finalized/expired: id=%s", reservation_id)
+                if error_code == "RESERVATION_EXPIRED":
+                    logger.warning(
+                        "Reservation expired before commit; recovering spend via POST /v1/events: id=%s",
+                        reservation_id,
+                    )
+                    self._retry_engine.schedule_event(reservation_id, event_fallback_body)
+                elif error_code == "RESERVATION_FINALIZED":
+                    logger.warning("Reservation already finalized: id=%s", reservation_id)
                 elif error_code == "IDEMPOTENCY_MISMATCH":
                     logger.warning("Commit idempotency mismatch (not releasing): id=%s", reservation_id)
                 elif response.is_client_error:
@@ -543,7 +592,7 @@ class AsyncCyclesLifecycle:
                     logger.warning("Unrecognized commit response: id=%s, response=%s", reservation_id, response)
         except Exception:
             logger.exception("Failed to commit: id=%s", reservation_id)
-            self._retry_engine.schedule(reservation_id, commit_body)
+            self._retry_engine.schedule(reservation_id, commit_body, event_fallback_body)
 
     async def _handle_release(self, reservation_id: str, reason: str) -> None:
         try:

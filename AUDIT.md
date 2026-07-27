@@ -12,6 +12,18 @@
 
 ---
 
+## 2026-07-27 — Durable commit retries (journal + /v1/events fallback)
+
+Pending commits no longer exist only in memory: the retry engines journal
+each one to disk (`~/.runcycles/commit-journal`, config/env overridable)
+before retrying, replay survivors on the next run, and flush bounded at
+interpreter exit. A commit answered `RESERVATION_EXPIRED` — where the server
+has already returned the reserved budget to the pool — is recovered via
+`POST /v1/events` (spec-conformant `EventCreateRequest`, commit idempotency
+key reused, recovery markers in `metadata`). Also fixes the async engine's
+unreferenced-task GC hazard and the silent drop under `retry_enabled=False`.
+460 tests pass at 100% coverage.
+
 ## 2026-07-26 — Python publishing workflow maintenance
 
 Dependabot PRs #82–#86 update the SHA-pinned PyPI trusted-publishing action to

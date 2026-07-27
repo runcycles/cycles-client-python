@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+Durable commit retries. Previously a commit that failed transiently lived only in an in-memory daemon thread (or an unreferenced asyncio task): a process exit — even a clean one — dropped it, and once the reservation's grace period elapsed the server's expiry sweep returned the reserved budget to the pool, permanently under-counting spend that had already happened. Pending commits are now journaled to disk before retry, replayed on the next run, flushed (bounded) at interpreter exit, and — when the reservation has already expired — recovered via `POST /v1/events`, the spec's post-hoc direct-debit endpoint.
+
+### Added
+
+- `runcycles.journal`: file-per-commit `CommitJournal` (atomic write, idempotent replay). Config: `journal_enabled` (default `True`), `journal_dir` (default `~/.runcycles/commit-journal`), `retry_flush_timeout` (default 10 s); env `CYCLES_JOURNAL_ENABLED`, `CYCLES_JOURNAL_DIR`, `CYCLES_RETRY_FLUSH_TIMEOUT`. The first engine created per journal directory replays surviving entries for its `base_url`; corrupt files are renamed `*.corrupt` for operator triage.
+- Event fallback: when a commit (first attempt or retry) returns `RESERVATION_EXPIRED`, the SDK posts the spend to `/v1/events` reusing the commit's idempotency key, with `metadata.recovered_reservation_id` / `metadata.recovery_reason` markers and no `overage_policy` (spec default `ALLOW_IF_AVAILABLE` never rejects). Applies to the `@cycles` lifecycles and both streaming context managers. `RESERVATION_FINALIZED` is still treated as settled.
+- `flush()` on both retry engines; a process-wide `atexit` hook flushes sync engines for up to `retry_flush_timeout` seconds so daemon retry threads aren't killed mid-backoff on clean exit.
+
+### Fixed
+
+- With `retry_enabled=False`, failed commits were dropped with only a warning; they are now journaled for replay (the old drop behavior remains only when the journal is also disabled).
+- `AsyncCommitRetryEngine` created retry tasks without holding a reference, so a pending retry could be garbage-collected mid-flight; task references are now held until completion.
+- Commit retries exhausting, or landing after expiry, no longer lose the spend record silently: the journal entry is retained (transient exhaustion) or the event fallback records it (expiry).
+
+---
+
 `TENANT_CLOSED` + `LIMIT_EXCEEDED` error-code support. `TENANT_CLOSED` implements the runtime spec v0.1.25.13 revision of `cycles-protocol-v0.yaml` ([runcycles/cycles-protocol#125](https://github.com/runcycles/cycles-protocol/pull/125)): servers return HTTP 409 `error=TENANT_CLOSED` on reservation create/commit/release/extend when the owning tenant is CLOSED (mirrors governance spec Rule 2). `LIMIT_EXCEEDED` closes the same class of gap for the runtime spec v0.1.25.12 revision (2026-07-04): HTTP 429 rate-limit responses carry `error=LIMIT_EXCEEDED` plus `Retry-After` / `X-RateLimit-Reset` headers.
 
 ### Added

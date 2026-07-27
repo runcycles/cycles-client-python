@@ -227,8 +227,31 @@ CyclesConfig(
     retry_initial_delay=0.5,
     retry_multiplier=2.0,
     retry_max_delay=30.0,
+    retry_flush_timeout=10.0,
+    journal_enabled=True,
+    journal_dir=None,  # None → ~/.runcycles/commit-journal
 )
 ```
+
+### Commit durability
+
+A commit records spend that has already happened, so the SDK never lets one
+exist only in memory. Every commit scheduled for background retry is first
+journaled to disk (`journal_dir`, default `~/.runcycles/commit-journal`) and
+removed only on a terminal outcome:
+
+- **Process exit**: an `atexit` hook waits up to `retry_flush_timeout` seconds
+  for in-flight retries; anything unfinished stays journaled and is replayed
+  automatically the next time the process creates a client lifecycle.
+- **Reservation expired before the commit landed**: the server has already
+  returned the reserved budget to the pool, so the SDK re-records the spend
+  via `POST /v1/events` (the protocol's post-hoc direct-debit endpoint),
+  tagging the event metadata with `recovered_reservation_id` for
+  reconciliation. Commit and event requests both carry idempotency keys, so
+  replays across restarts (or from multiple processes sharing a journal
+  directory) are exactly-once.
+- Set `journal_enabled=False` (or `CYCLES_JOURNAL_ENABLED=false`) to opt out
+  and restore fire-and-forget behavior.
 
 ### Default client / config
 

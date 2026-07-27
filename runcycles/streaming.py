@@ -17,6 +17,7 @@ from runcycles.context import CyclesContext, _clear_context, _set_context
 from runcycles.exceptions import CyclesProtocolError
 from runcycles.lifecycle import (
     _build_commit_body,
+    _build_event_fallback_body,
     _build_extend_body,
     _build_protocol_exception,
     _build_release_body,
@@ -275,20 +276,32 @@ class StreamReservation:
         commit_body = _build_commit_body(actual, unit, metrics, self._metadata)
 
         assert self._reservation_id is not None
+        event_fallback = _build_event_fallback_body(
+            self._reservation_id,
+            self._subject.model_dump(exclude_none=True),
+            self._action.model_dump(exclude_none=True),
+            commit_body,
+        )
         try:
             response = self._client.commit_reservation(self._reservation_id, commit_body)
             if response.is_success:
                 logger.info("Stream commit successful: id=%s", self._reservation_id)
             elif response.is_transport_error or response.is_server_error:
                 logger.warning("Stream commit failed (retryable): id=%s", self._reservation_id)
-                self._retry_engine.schedule(self._reservation_id, commit_body)
+                self._retry_engine.schedule(self._reservation_id, commit_body, event_fallback)
             else:
                 error_code = None
                 error_resp = response.get_error_response()
                 if error_resp and error_resp.error_code:
                     error_code = error_resp.error_code.value
-                if error_code in ("RESERVATION_FINALIZED", "RESERVATION_EXPIRED"):
-                    logger.warning("Reservation already finalized/expired: id=%s", self._reservation_id)
+                if error_code == "RESERVATION_EXPIRED":
+                    logger.warning(
+                        "Reservation expired before commit; recovering spend via POST /v1/events: id=%s",
+                        self._reservation_id,
+                    )
+                    self._retry_engine.schedule_event(self._reservation_id, event_fallback)
+                elif error_code == "RESERVATION_FINALIZED":
+                    logger.warning("Reservation already finalized: id=%s", self._reservation_id)
                 elif error_code == "IDEMPOTENCY_MISMATCH":
                     logger.warning("Commit idempotency mismatch (not releasing): id=%s", self._reservation_id)
                 elif response.is_client_error:
@@ -297,7 +310,7 @@ class StreamReservation:
                     logger.warning("Unrecognized commit response: id=%s", self._reservation_id)
         except Exception:
             logger.exception("Failed to commit stream: id=%s", self._reservation_id)
-            self._retry_engine.schedule(self._reservation_id, commit_body)
+            self._retry_engine.schedule(self._reservation_id, commit_body, event_fallback)
 
     def _handle_release(self, reason: str) -> None:
         assert self._reservation_id is not None
@@ -497,20 +510,32 @@ class AsyncStreamReservation:
         commit_body = _build_commit_body(actual, unit, metrics, self._metadata)
 
         assert self._reservation_id is not None
+        event_fallback = _build_event_fallback_body(
+            self._reservation_id,
+            self._subject.model_dump(exclude_none=True),
+            self._action.model_dump(exclude_none=True),
+            commit_body,
+        )
         try:
             response = await self._client.commit_reservation(self._reservation_id, commit_body)
             if response.is_success:
                 logger.info("Async stream commit successful: id=%s", self._reservation_id)
             elif response.is_transport_error or response.is_server_error:
                 logger.warning("Async stream commit failed (retryable): id=%s", self._reservation_id)
-                self._retry_engine.schedule(self._reservation_id, commit_body)
+                self._retry_engine.schedule(self._reservation_id, commit_body, event_fallback)
             else:
                 error_code = None
                 error_resp = response.get_error_response()
                 if error_resp and error_resp.error_code:
                     error_code = error_resp.error_code.value
-                if error_code in ("RESERVATION_FINALIZED", "RESERVATION_EXPIRED"):
-                    logger.warning("Reservation already finalized/expired: id=%s", self._reservation_id)
+                if error_code == "RESERVATION_EXPIRED":
+                    logger.warning(
+                        "Reservation expired before commit; recovering spend via POST /v1/events: id=%s",
+                        self._reservation_id,
+                    )
+                    self._retry_engine.schedule_event(self._reservation_id, event_fallback)
+                elif error_code == "RESERVATION_FINALIZED":
+                    logger.warning("Reservation already finalized: id=%s", self._reservation_id)
                 elif error_code == "IDEMPOTENCY_MISMATCH":
                     logger.warning("Commit idempotency mismatch (not releasing): id=%s", self._reservation_id)
                 elif response.is_client_error:
@@ -519,7 +544,7 @@ class AsyncStreamReservation:
                     logger.warning("Unrecognized commit response: id=%s", self._reservation_id)
         except Exception:
             logger.exception("Failed to commit async stream: id=%s", self._reservation_id)
-            self._retry_engine.schedule(self._reservation_id, commit_body)
+            self._retry_engine.schedule(self._reservation_id, commit_body, event_fallback)
 
     async def _handle_release(self, reason: str) -> None:
         assert self._reservation_id is not None
