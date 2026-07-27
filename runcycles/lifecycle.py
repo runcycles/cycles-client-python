@@ -410,6 +410,15 @@ class CyclesLifecycle:
                         reservation_id, commit_body, event_fallback_body,
                         retry_after_ms=response.retry_after_ms_header,
                     )
+                elif response.status in (401, 403):
+                    # Credentials failed after the spend happened: journal the
+                    # commit for replay once they're fixed. Never release —
+                    # that would return budget for real spend.
+                    logger.error(
+                        "Commit got authentication failure (status=%d); journaling for replay: id=%s",
+                        response.status, reservation_id,
+                    )
+                    self._retry_engine.schedule(reservation_id, commit_body, event_fallback_body)
                 elif error_code == "RESERVATION_EXPIRED":
                     logger.warning(
                         "Reservation expired before commit; recovering spend via POST /v1/events: id=%s",
@@ -594,6 +603,15 @@ class AsyncCyclesLifecycle:
                         reservation_id, commit_body, event_fallback_body,
                         retry_after_ms=response.retry_after_ms_header,
                     )
+                elif response.status in (401, 403):
+                    # Credentials failed after the spend happened: journal the
+                    # commit for replay once they're fixed. Never release —
+                    # that would return budget for real spend.
+                    logger.error(
+                        "Commit got authentication failure (status=%d); journaling for replay: id=%s",
+                        response.status, reservation_id,
+                    )
+                    self._retry_engine.schedule(reservation_id, commit_body, event_fallback_body)
                 elif error_code == "RESERVATION_EXPIRED":
                     logger.warning(
                         "Reservation expired before commit; recovering spend via POST /v1/events: id=%s",

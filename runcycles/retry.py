@@ -126,6 +126,9 @@ class _RetryEngineBase:
 
     def _journal_record(self, pending: _PendingCommit) -> None:
         if self._journal is not None:
+            not_before_ms = None
+            if pending.retry_after_s is not None:
+                not_before_ms = int(time.time() * 1000 + pending.retry_after_s * 1000)
             self._journal.record(
                 PendingCommitRecord(
                     reservation_id=pending.reservation_id,
@@ -133,6 +136,7 @@ class _RetryEngineBase:
                     mode=pending.mode,
                     commit_body=pending.commit_body,
                     event_fallback_body=pending.event_fallback_body,
+                    not_before_ms=not_before_ms,
                 )
             )
 
@@ -151,15 +155,24 @@ class _RetryEngineBase:
             logger.info(
                 "Replaying %d journaled pending commit(s) from %s", len(entries), self._journal.directory
             )
-        return [
-            _PendingCommit(
-                reservation_id=e.reservation_id,
-                commit_body=e.commit_body,
-                event_fallback_body=e.event_fallback_body,
-                mode=e.mode,
+        now_ms = time.time() * 1000
+        pendings = []
+        for e in entries:
+            # Restore a persisted Retry-After floor as a relative delay; a
+            # floor already in the past falls back to normal backoff.
+            retry_after_s: float | None = None
+            if e.not_before_ms is not None and e.not_before_ms > now_ms:
+                retry_after_s = (e.not_before_ms - now_ms) / 1000.0
+            pendings.append(
+                _PendingCommit(
+                    reservation_id=e.reservation_id,
+                    commit_body=e.commit_body,
+                    event_fallback_body=e.event_fallback_body,
+                    mode=e.mode,
+                    retry_after_s=retry_after_s,
+                )
             )
-            for e in entries
-        ]
+        return pendings
 
     def _log_disabled_drop(self, pending: _PendingCommit) -> None:
         if self._journal is not None:
@@ -189,6 +202,9 @@ class _RetryEngineBase:
         retry_after_ms = response.retry_after_ms_header
         if retry_after_ms is not None:
             pending.retry_after_s = retry_after_ms / 1000.0
+            # Persist the floor: a restart during a long Retry-After wait
+            # must not replay into the window the server told us to avoid.
+            self._journal_record(pending)
         logger.warning(
             "%s retry rate-limited: reservation_id=%s, attempt=%d, retry_after_ms=%s",
             pending.mode, pending.reservation_id, pending.attempt, retry_after_ms,

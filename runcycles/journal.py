@@ -18,7 +18,9 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import time
+import uuid
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
@@ -35,18 +37,22 @@ def default_journal_dir() -> Path:
     return Path.home() / ".runcycles" / "commit-journal"
 
 
-@lru_cache(maxsize=64)
+@lru_cache(maxsize=256)
 def _principal_digest(base_url: str, principal: str) -> str:
     # PBKDF2 rather than a bare hash: the principal may embed a credential,
-    # and an expensive KDF makes offline recovery from a leaked directory
-    # name infeasible even for a weak user-chosen key. Parameters are fixed
-    # constants — the digest must be deterministic across processes and
-    # releases. Cached so the cost is paid once per identity per process.
+    # and a KDF makes offline recovery from a leaked directory name harder
+    # for a weak user-chosen key. The round count is deliberately modest
+    # (~tens of ms cold, cached per identity per process): the principal is
+    # normally a high-entropy machine credential, so rounds only defend the
+    # weak-key fallback, and this runs synchronously at engine setup —
+    # password-storage round counts would stall async callers. Parameters
+    # are fixed constants — the digest must be deterministic across
+    # processes and releases.
     digest = hashlib.pbkdf2_hmac(
         "sha256",
         principal.encode(),
         f"runcycles-commit-journal\n{base_url}".encode(),
-        600_000,
+        30_000,
     )
     return digest.hex()[:16]
 
@@ -96,6 +102,9 @@ class PendingCommitRecord:
     commit_body: dict[str, Any] | None = None
     event_fallback_body: dict[str, Any] | None = None
     recorded_at_ms: int = field(default_factory=lambda: int(time.time() * 1000))
+    # Absolute wall-clock floor (ms) for the next attempt, set from a 429's
+    # Retry-After. Absolute so it survives a process restart mid-wait.
+    not_before_ms: int | None = None
 
     def to_json(self) -> str:
         return json.dumps(
@@ -107,6 +116,7 @@ class PendingCommitRecord:
                 "commit_body": self.commit_body,
                 "event_fallback_body": self.event_fallback_body,
                 "recorded_at_ms": self.recorded_at_ms,
+                "not_before_ms": self.not_before_ms,
             }
         )
 
@@ -123,6 +133,7 @@ class PendingCommitRecord:
             raise ValueError("commit-mode journal record missing commit_body")
         if mode == "event" and not isinstance(data.get("event_fallback_body"), dict):
             raise ValueError("event-mode journal record missing event_fallback_body")
+        not_before_raw = data.get("not_before_ms")
         return cls(
             reservation_id=reservation_id,
             base_url=data.get("base_url", ""),
@@ -130,6 +141,7 @@ class PendingCommitRecord:
             commit_body=data.get("commit_body"),
             event_fallback_body=data.get("event_fallback_body"),
             recorded_at_ms=int(data.get("recorded_at_ms", 0)),
+            not_before_ms=int(not_before_raw) if not_before_raw is not None else None,
         )
 
 
@@ -156,10 +168,21 @@ class CommitJournal:
             self._dir.mkdir(parents=True, exist_ok=True)
             _restrict_permissions(self._dir, 0o700)
             target = self._dir / _safe_filename(entry.reservation_id)
-            tmp = target.with_suffix(".tmp")
-            tmp.write_text(entry.to_json(), encoding="utf-8")
-            _restrict_permissions(tmp, 0o600)
-            tmp.replace(target)
+            # Unique temp name per writer: concurrent processes may settle
+            # the same reservation (replay is idempotent), and a shared
+            # temp filename would let one truncate the other mid-write and
+            # atomically publish partial JSON.
+            tmp = self._dir / f"{target.name}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp"
+            try:
+                tmp.write_text(entry.to_json(), encoding="utf-8")
+                _restrict_permissions(tmp, 0o600)
+                tmp.replace(target)
+            except OSError:
+                try:
+                    tmp.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                raise
             logger.debug("Journaled pending commit: id=%s, path=%s", entry.reservation_id, target)
         except OSError:
             logger.warning(

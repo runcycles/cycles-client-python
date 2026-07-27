@@ -257,11 +257,12 @@ idempotent:
   everywhere — a rate-limited *first* commit attempt is scheduled for retry
   (never released, which would return budget for spend that already
   happened), the journal entry is kept, and the next attempt waits at least
-  the server's `Retry-After`.
-- **Authentication failures**: 401/403 on a retried commit or event stops
-  the current run's attempts but retains the journal entry, so spend
-  recorded during a key misconfiguration or rotation window replays once
-  credentials are fixed.
+  the server's `Retry-After`. The floor is persisted as an absolute
+  timestamp, so a restart mid-wait still honors it.
+- **Authentication failures**: 401/403 on any commit attempt — first or
+  retried — journals the spend (never releases it) and stops the current
+  run's attempts, so spend recorded during a key misconfiguration or
+  rotation window replays once credentials are fixed.
 - **Reservation expired before the commit landed**: the server has already
   returned the reserved budget to the pool, so the SDK re-records the spend
   via `POST /v1/events` (the protocol's post-hoc direct-debit endpoint),
