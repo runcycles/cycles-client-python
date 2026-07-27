@@ -42,8 +42,13 @@ floor is persisted as an absolute `not_before_ms` and restored on replay;
 PBKDF2 rounds reduced 600k → 30k (~20 ms cold, cache 256 — input is a
 high-entropy machine credential, rounds only defend the weak-key
 fallback); journal temp files get unique per-writer names so concurrent
-processes cannot publish each other's partial writes. 491 tests pass at
-100% coverage.
+processes cannot publish each other's partial writes. Fleet self-review
+round: ASCII-explicit sanitizer + pinned cross-SDK fingerprint vectors
+(interop with TS/Java identity dirs), blank-tenant normalization, 1-hour
+clamp on honored Retry-After and restored floors, status-410 expired
+trigger, unclassifiable-4xx retention (never release/discard on codeless
+or unknown-code responses), base-dir permissions, stale-temp reaping.
+506 tests pass at 100% coverage.
 
 ## 2026-07-26 — Python publishing workflow maintenance
 

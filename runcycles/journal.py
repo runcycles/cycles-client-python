@@ -19,6 +19,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -71,7 +72,7 @@ def auth_fingerprint(base_url: str, api_key: str, tenant: str | None = None) -> 
     idempotent). The truncated PBKDF2-HMAC-SHA256 digest is not reversible,
     so the fingerprint is safe to use as a directory name.
     """
-    principal = f"tenant\n{tenant}" if tenant else f"key\n{api_key}"
+    principal = f"tenant\n{tenant}" if tenant and tenant.strip() else f"key\n{api_key}"
     return _principal_digest(base_url, principal)
 
 
@@ -88,7 +89,10 @@ def _restrict_permissions(path: Path, mode: int) -> None:
 
 
 def _safe_filename(reservation_id: str) -> str:
-    sanitized = "".join(c if c.isalnum() or c in "-_" else "_" for c in reservation_id)
+    # ASCII-only, matching the TS/Java SDKs exactly: same-tenant clients in
+    # other languages settle records from this directory, and their discard()
+    # must compute the identical filename or the record replays forever.
+    sanitized = re.sub(r"[^A-Za-z0-9_-]", "_", reservation_id)
     return f"{sanitized}{_SUFFIX}"
 
 
@@ -166,6 +170,7 @@ class CommitJournal:
         """Persist a pending commit. Never raises."""
         try:
             self._dir.mkdir(parents=True, exist_ok=True)
+            _restrict_permissions(self._dir.parent, 0o700)
             _restrict_permissions(self._dir, 0o700)
             target = self._dir / _safe_filename(entry.reservation_id)
             # Unique temp name per writer: concurrent processes may settle
@@ -211,6 +216,15 @@ class CommitJournal:
         try:
             if not self._dir.is_dir():
                 return entries
+            cutoff = time.time() - 3600
+            for tmp in self._dir.glob("*.tmp"):
+                # Crashed writers leave unique temp files behind; reap the
+                # stale ones so they don't accumulate forever.
+                try:
+                    if tmp.stat().st_mtime < cutoff:
+                        tmp.unlink(missing_ok=True)
+                except OSError:
+                    pass
             for path in sorted(self._dir.glob(f"*{_SUFFIX}")):
                 try:
                     entry = PendingCommitRecord.from_json(path.read_text(encoding="utf-8"))

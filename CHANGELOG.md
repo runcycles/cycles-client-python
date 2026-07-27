@@ -19,6 +19,7 @@ Durable commit retries. Previously a commit that failed transiently lived only i
 
 ### Fixed
 
+- Self-review hardening (fleet-wide adversarial review): filename sanitization is ASCII-explicit, matching the TS/Java SDKs, so sibling SDKs sharing a tenant identity directory can always discard records this SDK wrote (and vice versa); the two cross-SDK PBKDF2 fingerprint vectors are now pinned in this suite; a whitespace-only `tenant` falls back to the key principal (matching Java); honored `Retry-After` values and restored journal floors are clamped to 1 hour; HTTP 410 triggers the expired/event-fallback path even when the response body was mangled in transit; a 4xx with no recognizable protocol error code (proxy error pages, forward-compat future codes) is no longer treated as a genuine rejection — the journal entry is retained and the reservation is never released; the base journal directory is also permission-tightened and stale temp files from crashed writers are reaped after 1 hour.
 - With `retry_enabled=False`, failed commits were dropped with only a warning; they are now journaled for replay (the old drop behavior remains only when the journal is also disabled).
 - `AsyncCommitRetryEngine` created retry tasks without holding a reference, so a pending retry could be garbage-collected mid-flight; task references are now held until completion.
 - Commit retries exhausting, or landing after expiry, no longer lose the spend record silently: the journal entry is retained (transient exhaustion) or the event fallback records it (expiry).

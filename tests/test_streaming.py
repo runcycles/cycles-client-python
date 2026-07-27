@@ -568,7 +568,7 @@ class TestStreamReservation:
         mock.commit_reservation.return_value = CyclesResponse.http_error(
             400,
             "Bad request",
-            body={"error": "VALIDATION_ERROR", "message": "Bad", "request_id": "r1"},
+            body={"error": "INVALID_REQUEST", "message": "Bad", "request_id": "r1"},
         )
         mock.release_reservation.return_value = _release_success()
 
@@ -876,7 +876,7 @@ class TestAsyncStreamReservation:
         mock.commit_reservation.return_value = CyclesResponse.http_error(
             400,
             "Bad request",
-            body={"error": "VALIDATION_ERROR", "message": "Bad", "request_id": "r1"},
+            body={"error": "INVALID_REQUEST", "message": "Bad", "request_id": "r1"},
         )
         mock.release_reservation.return_value = _release_success()
 

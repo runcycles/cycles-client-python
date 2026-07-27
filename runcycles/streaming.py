@@ -31,7 +31,11 @@ from runcycles.models import (
     ReservationCreateResponse,
     Subject,
 )
-from runcycles.retry import AsyncCommitRetryEngine, CommitRetryEngine
+from runcycles.retry import (
+    AsyncCommitRetryEngine,
+    CommitRetryEngine,
+    _is_recognized_rejection,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -312,7 +316,7 @@ class StreamReservation:
                         response.status, self._reservation_id,
                     )
                     self._retry_engine.schedule(self._reservation_id, commit_body, event_fallback)
-                elif error_code == "RESERVATION_EXPIRED":
+                elif response.status == 410 or error_code == "RESERVATION_EXPIRED":
                     logger.warning(
                         "Reservation expired before commit; recovering spend via POST /v1/events: id=%s",
                         self._reservation_id,
@@ -322,8 +326,17 @@ class StreamReservation:
                     logger.warning("Reservation already finalized: id=%s", self._reservation_id)
                 elif error_code == "IDEMPOTENCY_MISMATCH":
                     logger.warning("Commit idempotency mismatch (not releasing): id=%s", self._reservation_id)
-                elif response.is_client_error:
+                elif response.is_client_error and _is_recognized_rejection(error_code):
                     self._handle_release(f"commit_rejected_{error_code}")
+                elif response.is_client_error:
+                    # Codeless or forward-compat-unknown 4xx: neither release
+                    # nor drop — retain the spend record.
+                    logger.error(
+                        "Stream commit got unclassifiable client error (status=%d, error=%s); "
+                        "journaling for replay: id=%s",
+                        response.status, error_code, self._reservation_id,
+                    )
+                    self._retry_engine.schedule(self._reservation_id, commit_body, event_fallback)
                 else:
                     logger.warning("Unrecognized commit response: id=%s", self._reservation_id)
         except Exception:
@@ -566,7 +579,7 @@ class AsyncStreamReservation:
                         response.status, self._reservation_id,
                     )
                     self._retry_engine.schedule(self._reservation_id, commit_body, event_fallback)
-                elif error_code == "RESERVATION_EXPIRED":
+                elif response.status == 410 or error_code == "RESERVATION_EXPIRED":
                     logger.warning(
                         "Reservation expired before commit; recovering spend via POST /v1/events: id=%s",
                         self._reservation_id,
@@ -576,8 +589,17 @@ class AsyncStreamReservation:
                     logger.warning("Reservation already finalized: id=%s", self._reservation_id)
                 elif error_code == "IDEMPOTENCY_MISMATCH":
                     logger.warning("Commit idempotency mismatch (not releasing): id=%s", self._reservation_id)
-                elif response.is_client_error:
+                elif response.is_client_error and _is_recognized_rejection(error_code):
                     await self._handle_release(f"commit_rejected_{error_code}")
+                elif response.is_client_error:
+                    # Codeless or forward-compat-unknown 4xx: neither release
+                    # nor drop — retain the spend record.
+                    logger.error(
+                        "Async stream commit got unclassifiable client error (status=%d, error=%s); "
+                        "journaling for replay: id=%s",
+                        response.status, error_code, self._reservation_id,
+                    )
+                    self._retry_engine.schedule(self._reservation_id, commit_body, event_fallback)
                 else:
                     logger.warning("Unrecognized commit response: id=%s", self._reservation_id)
         except Exception:

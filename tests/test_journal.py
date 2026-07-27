@@ -214,6 +214,58 @@ class TestCommitJournal:
         assert _safe_filename("rsv_abc-123") == "rsv_abc-123.json"
         assert _safe_filename("rsv/../etc") == "rsv____etc.json"
 
+    def test_safe_filename_is_ascii_only(self) -> None:
+        # Cross-SDK invariant: TS/Java sanitize with [^A-Za-z0-9_-]; a
+        # Unicode-alphanumeric-preserving Python name would never be
+        # discardable by a sibling SDK sharing the identity directory.
+        assert _safe_filename("rsvé٣x") == "rsv__x.json"
+
+    def test_stale_temp_files_are_reaped_on_load(self, tmp_path: Path) -> None:
+        import os
+
+        directory = tmp_path / "j"
+        journal = CommitJournal(directory)
+        journal.record(_record("rsv_a"))
+
+        stale = directory / "rsv_x.json.999.deadbeef.tmp"
+        stale.write_text("{partial", encoding="utf-8")
+        two_hours_ago = time.time() - 7200
+        os.utime(stale, (two_hours_ago, two_hours_ago))
+        fresh = directory / "rsv_y.json.999.cafecafe.tmp"
+        fresh.write_text("{partial", encoding="utf-8")
+
+        journal.load_pending(BASE_URL)
+
+        assert not stale.exists()  # reaped
+        assert fresh.exists()  # a live writer's temp is left alone
+
+    def test_temp_reap_failure_is_swallowed(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        import os
+
+        directory = tmp_path / "j"
+        journal = CommitJournal(directory)
+        journal.record(_record("rsv_a"))
+        stale = directory / "rsv_x.json.999.deadbeef.tmp"
+        stale.write_text("{partial", encoding="utf-8")
+        two_hours_ago = time.time() - 7200
+        os.utime(stale, (two_hours_ago, two_hours_ago))
+        monkeypatch.setattr(Path, "unlink", MagicMock(side_effect=OSError("locked")))
+
+        assert [e.reservation_id for e in journal.load_pending(BASE_URL)] == ["rsv_a"]
+
+    def test_blank_tenant_treated_as_absent(self) -> None:
+        # Matches Java's isBlank presence check — whitespace-only tenant
+        # falls back to the key principal so all SDKs share one identity.
+        assert auth_fingerprint(BASE_URL, "test-key", "   ") == auth_fingerprint(BASE_URL, "test-key")
+
+    def test_fingerprint_pins_cross_sdk_vectors(self) -> None:
+        # These exact values are asserted in the TS and Java SDK suites; a
+        # drift here breaks journal interop for every sibling SDK.
+        assert auth_fingerprint("http://localhost", "test-key") == "68c905017df7dbfc"
+        assert auth_fingerprint("http://localhost", "any-key", "acme") == "8baba538fb970da4"
+
     def test_default_journal_dir_under_home(self) -> None:
         # Note: conftest patches the module attribute; this exercises the real function.
         path = default_journal_dir()
@@ -677,6 +729,94 @@ class TestAuthFailureRetention:
         assert mock_client.create_event.call_count == 1
         assert len(_journal_files(tmp_path)) == 1
 
+    def test_unclassifiable_commit_4xx_retains_journal(self, tmp_path: Path) -> None:
+        # A codeless 4xx (proxy junk) or a forward-compat unknown code must
+        # neither release nor destroy the durable record.
+        engine = CommitRetryEngine(_config(tmp_path))
+        mock_client = MagicMock()
+        mock_client.commit_reservation.side_effect = [
+            CyclesResponse.http_error(400, "proxy junk"),
+        ]
+        engine.set_client(mock_client)
+
+        pending = _PendingCommit("rsv_1", _commit_body(), _event_body())
+        engine._journal_record(pending)
+        engine._retry_loop(pending)
+
+        assert mock_client.commit_reservation.call_count == 1
+        assert len(_journal_files(tmp_path)) == 1
+
+        mock_client2 = MagicMock()
+        mock_client2.commit_reservation.return_value = CyclesResponse.http_error(
+            422, "future", body={"error": "FUTURE_REJECTION_CODE", "message": "m", "request_id": "r"},
+        )
+        engine2 = CommitRetryEngine(_config(tmp_path))
+        engine2.set_client(mock_client2)
+        pending2 = _PendingCommit("rsv_2", _commit_body(), _event_body())
+        engine2._journal_record(pending2)
+        engine2._retry_loop(pending2)
+        assert len(_journal_files(tmp_path)) == 2  # both retained
+
+    def test_unclassifiable_event_4xx_retains_journal(self, tmp_path: Path) -> None:
+        engine = CommitRetryEngine(_config(tmp_path))
+        mock_client = MagicMock()
+        mock_client.create_event.return_value = CyclesResponse.http_error(400, "proxy junk")
+        engine.set_client(mock_client)
+
+        pending = _PendingCommit("rsv_1", None, _event_body(), mode="event")
+        engine._journal_record(pending)
+        engine._retry_loop(pending)
+
+        assert mock_client.create_event.call_count == 1
+        assert len(_journal_files(tmp_path)) == 1
+
+    def test_bodyless_410_triggers_event_fallback(self, tmp_path: Path) -> None:
+        # The 429 path is status-hardened; a mangled 410 body must still
+        # reach the event fallback rather than the terminal branches.
+        engine = CommitRetryEngine(_config(tmp_path))
+        mock_client = MagicMock()
+        mock_client.commit_reservation.return_value = CyclesResponse.http_error(410, "gone")
+        mock_client.create_event.return_value = _event_success()
+        engine.set_client(mock_client)
+
+        pending = _PendingCommit("rsv_1", _commit_body(), _event_body())
+        engine._journal_record(pending)
+        engine._retry_loop(pending)
+
+        mock_client.create_event.assert_called_once_with(_event_body())
+        assert _journal_files(tmp_path) == []
+
+    def test_honored_retry_after_is_clamped(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        engine = CommitRetryEngine(_config(tmp_path))
+        response = CyclesResponse.http_error(
+            429, "busy",
+            body={"error": "LIMIT_EXCEEDED", "message": "m", "request_id": "r"},
+            headers={"retry-after": "7200"},
+        )
+        pending = _PendingCommit("rsv_1", _commit_body())
+        assert engine._classify_commit_response(pending, response) is False
+        assert pending.retry_after_s == 3600.0  # 2h clamped to the 1h ceiling
+
+        captured: list[_PendingCommit] = []
+        monkeypatch.setattr(engine, "_spawn", captured.append)
+        engine.set_client(MagicMock())
+        engine.schedule("rsv_2", _commit_body(), retry_after_ms=7_200_000)
+        # captured[-1]: set_client's replay may capture the journaled rsv_1 first
+        assert captured[-1].retry_after_s == 3600.0
+
+    def test_restored_replay_floor_is_clamped(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        far_future = int(time.time() * 1000 + 7_200_000)
+        CommitJournal(_identity_dir(tmp_path)).record(_record("rsv_old", not_before_ms=far_future))
+
+        engine = CommitRetryEngine(_config(tmp_path))
+        captured: list[_PendingCommit] = []
+        monkeypatch.setattr(engine, "_spawn", captured.append)
+        engine.set_client(MagicMock())
+
+        assert captured[0].retry_after_s == 3600.0
+
     def test_replay_survives_api_key_rotation_with_tenant(self, tmp_path: Path) -> None:
         # Records written under the old key are found by the rotated key
         # because the identity is the tenant, not the credential.
@@ -1067,6 +1207,26 @@ class TestLifecycleEventFallbackWiring:
         engine.schedule_event.assert_not_called()
         engine.schedule.assert_not_called()
 
+    def test_unclassifiable_4xx_schedules_not_release(self, tmp_path: Path) -> None:
+        lifecycle, mock_client, engine = self._make(tmp_path)
+        mock_client.create_reservation.return_value = _allow_response()
+        mock_client.commit_reservation.return_value = CyclesResponse.http_error(400, "proxy junk")
+
+        lifecycle.execute(lambda: "result", (), {}, _make_cfg())
+
+        engine.schedule.assert_called_once()
+        mock_client.release_reservation.assert_not_called()
+
+    def test_bodyless_410_schedules_event(self, tmp_path: Path) -> None:
+        lifecycle, mock_client, engine = self._make(tmp_path)
+        mock_client.create_reservation.return_value = _allow_response()
+        mock_client.commit_reservation.return_value = CyclesResponse.http_error(410, "gone")
+
+        lifecycle.execute(lambda: "result", (), {}, _make_cfg())
+
+        engine.schedule_event.assert_called_once()
+        mock_client.release_reservation.assert_not_called()
+
     def test_rate_limited_first_commit_schedules_retry_not_release(self, tmp_path: Path) -> None:
         # A 429 on the initial commit must never release the reservation —
         # that would return budget for spend that already happened.
@@ -1168,6 +1328,19 @@ class TestAsyncLifecycleEventFallbackWiring:
         assert engine.schedule.call_args.args[0] == "rsv_test"
         mock_client.release_reservation.assert_not_called()
 
+    async def test_unclassifiable_4xx_schedules_not_release(self, tmp_path: Path) -> None:
+        lifecycle, mock_client, engine = self._make(tmp_path)
+        mock_client.create_reservation.return_value = _allow_response()
+        mock_client.commit_reservation.return_value = CyclesResponse.http_error(400, "proxy junk")
+
+        async def fn() -> str:
+            return "result"
+
+        await lifecycle.execute(fn, (), {}, _make_cfg())
+
+        engine.schedule.assert_called_once()
+        mock_client.release_reservation.assert_not_called()
+
 
 # ---------------------------------------------------------------------------
 # Streaming wiring: expired commit → schedule_event
@@ -1247,6 +1420,17 @@ class TestStreamingEventFallbackWiring:
         assert engine.schedule.call_args.args[0] == "rsv_test"
         mock_client.release_reservation.assert_not_called()
 
+    def test_unclassifiable_4xx_schedules_not_release(self, tmp_path: Path) -> None:
+        stream, mock_client, engine = self._make_stream(tmp_path)
+        mock_client.create_reservation.return_value = _allow_response()
+        mock_client.commit_reservation.return_value = CyclesResponse.http_error(400, "proxy junk")
+
+        with stream:
+            pass
+
+        engine.schedule.assert_called_once()
+        mock_client.release_reservation.assert_not_called()
+
 
 @pytest.mark.asyncio
 class TestAsyncStreamingEventFallbackWiring:
@@ -1319,4 +1503,15 @@ class TestAsyncStreamingEventFallbackWiring:
 
         engine.schedule.assert_called_once()
         assert engine.schedule.call_args.args[0] == "rsv_test"
+        mock_client.release_reservation.assert_not_called()
+
+    async def test_unclassifiable_4xx_schedules_not_release(self, tmp_path: Path) -> None:
+        stream, mock_client, engine = await self._make_stream(tmp_path)
+        mock_client.create_reservation.return_value = _allow_response()
+        mock_client.commit_reservation.return_value = CyclesResponse.http_error(400, "proxy junk")
+
+        async with stream:
+            pass
+
+        engine.schedule.assert_called_once()
         mock_client.release_reservation.assert_not_called()

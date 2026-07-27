@@ -25,9 +25,25 @@ from typing import Any
 from runcycles import journal as _journal
 from runcycles.config import CyclesConfig
 from runcycles.journal import CommitJournal, PendingCommitRecord
+from runcycles.models import ErrorCode
 from runcycles.response import CyclesResponse
 
 logger = logging.getLogger(__name__)
+
+# Upper bound on any honored server-requested or restored delay (1 hour).
+# A mangled Retry-After or a corrupted journal floor must not park a spend
+# record for days.
+_MAX_HONORED_DELAY_S = 3600.0
+
+
+def _is_recognized_rejection(code: str | None) -> bool:
+    """True when the error code is a known protocol code (not forward-compat).
+
+    Only a recognized rejection justifies destroying a durable spend record
+    or releasing a reservation; a codeless or unknown-future-code 4xx (a
+    proxy error page, a newer server) is retained instead.
+    """
+    return code is not None and ErrorCode.from_string(code) is not ErrorCode.UNKNOWN
 
 
 @dataclass
@@ -162,7 +178,7 @@ class _RetryEngineBase:
             # floor already in the past falls back to normal backoff.
             retry_after_s: float | None = None
             if e.not_before_ms is not None and e.not_before_ms > now_ms:
-                retry_after_s = (e.not_before_ms - now_ms) / 1000.0
+                retry_after_s = min((e.not_before_ms - now_ms) / 1000.0, _MAX_HONORED_DELAY_S)
             pendings.append(
                 _PendingCommit(
                     reservation_id=e.reservation_id,
@@ -201,7 +217,7 @@ class _RetryEngineBase:
             return False
         retry_after_ms = response.retry_after_ms_header
         if retry_after_ms is not None:
-            pending.retry_after_s = retry_after_ms / 1000.0
+            pending.retry_after_s = min(retry_after_ms / 1000.0, _MAX_HONORED_DELAY_S)
             # Persist the floor: a restart during a long Retry-After wait
             # must not replay into the window the server told us to avoid.
             self._journal_record(pending)
@@ -235,7 +251,9 @@ class _RetryEngineBase:
             return True
         if response.is_client_error:
             code = _extract_error_code(response)
-            if code == "RESERVATION_EXPIRED":
+            # Status 410 catches expired responses whose body was mangled in
+            # transit — the 429 path is status-hardened, this one must be too.
+            if response.status == 410 or code == "RESERVATION_EXPIRED":
                 if pending.event_fallback_body:
                     logger.warning(
                         "Reservation expired before commit landed; falling back to POST /v1/events: "
@@ -250,6 +268,13 @@ class _RetryEngineBase:
                     "Reservation expired with no event fallback; spend is unrecorded "
                     "(journal entry retained): reservation_id=%s",
                     pending.reservation_id,
+                )
+                return True
+            if not _is_recognized_rejection(code):
+                logger.error(
+                    "Commit retry got unclassifiable client error (status=%d, error=%s); "
+                    "journal entry retained: reservation_id=%s",
+                    response.status, code, pending.reservation_id,
                 )
                 return True
             logger.warning(
@@ -283,9 +308,17 @@ class _RetryEngineBase:
             )
             return True
         if response.is_client_error:
+            code = _extract_error_code(response)
+            if not _is_recognized_rejection(code):
+                logger.error(
+                    "Event fallback got unclassifiable client error (status=%d, error=%s); "
+                    "journal entry retained: reservation_id=%s",
+                    response.status, code, pending.reservation_id,
+                )
+                return True
             logger.error(
                 "Event fallback rejected (%s); spend recovery failed: reservation_id=%s, status=%d",
-                _extract_error_code(response), pending.reservation_id, response.status,
+                code, pending.reservation_id, response.status,
             )
             self._journal_discard(pending.reservation_id)
             return True
@@ -332,7 +365,7 @@ class CommitRetryEngine(_RetryEngineBase):
         if retry_after_ms is not None:
             # A rate-limited first attempt passes its Retry-After along so
             # the first background retry honors the server's delay.
-            pending.retry_after_s = retry_after_ms / 1000.0
+            pending.retry_after_s = min(retry_after_ms / 1000.0, _MAX_HONORED_DELAY_S)
         self._submit(pending)
 
     def schedule_event(self, reservation_id: str, event_body: dict[str, Any]) -> None:
@@ -448,7 +481,7 @@ class AsyncCommitRetryEngine(_RetryEngineBase):
         if retry_after_ms is not None:
             # A rate-limited first attempt passes its Retry-After along so
             # the first background retry honors the server's delay.
-            pending.retry_after_s = retry_after_ms / 1000.0
+            pending.retry_after_s = min(retry_after_ms / 1000.0, _MAX_HONORED_DELAY_S)
         self._submit(pending)
 
     def schedule_event(self, reservation_id: str, event_body: dict[str, Any]) -> None:
