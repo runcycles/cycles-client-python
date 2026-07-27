@@ -31,6 +31,13 @@ class CyclesConfig:
     retry_initial_delay: float = 0.5
     retry_multiplier: float = 2.0
     retry_max_delay: float = 30.0
+    # Bounded wait (seconds) at interpreter exit for in-flight commit retries.
+    # 0 disables the wait; journaled entries replay on the next run either way.
+    retry_flush_timeout: float = 10.0
+
+    # Durable journal for pending commits (survives process restarts)
+    journal_enabled: bool = True
+    journal_dir: str | None = None  # None → ~/.runcycles/commit-journal
 
     @classmethod
     def from_env(cls, prefix: str = "CYCLES_") -> CyclesConfig:
@@ -40,7 +47,8 @@ class CyclesConfig:
         CYCLES_APP, CYCLES_WORKFLOW, CYCLES_AGENT, CYCLES_TOOLSET,
         CYCLES_CONNECT_TIMEOUT, CYCLES_READ_TIMEOUT, CYCLES_RETRY_ENABLED,
         CYCLES_RETRY_MAX_ATTEMPTS, CYCLES_RETRY_INITIAL_DELAY,
-        CYCLES_RETRY_MULTIPLIER, CYCLES_RETRY_MAX_DELAY.
+        CYCLES_RETRY_MULTIPLIER, CYCLES_RETRY_MAX_DELAY,
+        CYCLES_RETRY_FLUSH_TIMEOUT, CYCLES_JOURNAL_ENABLED, CYCLES_JOURNAL_DIR.
         """
         base_url = os.environ.get(f"{prefix}BASE_URL", "")
         api_key = os.environ.get(f"{prefix}API_KEY", "")
@@ -66,4 +74,7 @@ class CyclesConfig:
             retry_initial_delay=float(os.environ.get(f"{prefix}RETRY_INITIAL_DELAY", "0.5")),
             retry_multiplier=float(os.environ.get(f"{prefix}RETRY_MULTIPLIER", "2.0")),
             retry_max_delay=float(os.environ.get(f"{prefix}RETRY_MAX_DELAY", "30.0")),
+            retry_flush_timeout=float(os.environ.get(f"{prefix}RETRY_FLUSH_TIMEOUT", "10.0")),
+            journal_enabled=os.environ.get(f"{prefix}JOURNAL_ENABLED", "true").lower() == "true",
+            journal_dir=os.environ.get(f"{prefix}JOURNAL_DIR"),
         )

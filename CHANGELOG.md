@@ -5,7 +5,26 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog 1.1.0](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.5.0] - 2026-07-27
+
+Durable commit retries. Previously a commit that failed transiently lived only in an in-memory daemon thread (or an unreferenced asyncio task): a process exit — even a clean one — dropped it, and once the reservation's grace period elapsed the server's expiry sweep returned the reserved budget to the pool, permanently under-counting spend that had already happened. Pending commits are now journaled to disk before retry, replayed on the next run, flushed (bounded) at interpreter exit, and — when the reservation has already expired — recovered via `POST /v1/events`, the spec's post-hoc direct-debit endpoint.
+
+### Added
+
+- `runcycles.journal`: file-per-commit `CommitJournal` (atomic write, idempotent replay). Config: `journal_enabled` (default `True`), `journal_dir` (default `~/.runcycles/commit-journal`), `retry_flush_timeout` (default 10 s); env `CYCLES_JOURNAL_ENABLED`, `CYCLES_JOURNAL_DIR`, `CYCLES_RETRY_FLUSH_TIMEOUT`. Records are partitioned into per-identity subdirectories (directories `0700`, files `0600` where supported) keyed by a non-secret PBKDF2-HMAC-SHA256 fingerprint of the server plus principal — the configured `tenant` when set (rotation-safe: any same-tenant credential can settle the records), else the API key — so clients with different servers or principals sharing a journal directory never replay each other's records, and one identity's replay claim cannot starve another's. The first engine created per identity replays surviving entries; corrupt files are renamed `*.corrupt` for operator triage.
+- Event fallback: when a commit (first attempt or retry) returns `RESERVATION_EXPIRED`, the SDK posts the spend to `/v1/events` reusing the commit's idempotency key, with `metadata.recovered_reservation_id` / `metadata.recovery_reason` markers and no `overage_policy` (spec default `ALLOW_IF_AVAILABLE` never rejects). Applies to the `@cycles` lifecycles and both streaming context managers. `RESERVATION_FINALIZED` is still treated as settled.
+- `flush()` on both retry engines; a process-wide `atexit` hook flushes sync engines under one shared `retry_flush_timeout` deadline (not per engine) so daemon retry threads aren't killed mid-backoff on clean exit and shutdown time stays bounded regardless of engine count.
+- Rate-limit awareness end to end: HTTP 429 / `LIMIT_EXCEEDED` on the *first* commit attempt schedules a retry instead of releasing the reservation (a release would return budget for spend that already happened) in all four lifecycle variants, passing the server's `Retry-After` into the engine; on retried commit/event attempts the journal entry is retained and the next attempt waits at least `Retry-After` (consistent with `ErrorCode.is_retryable`). The `Retry-After` floor is persisted in the journal record as an absolute `not_before_ms`, so a restart during a long server-mandated wait does not replay into the window early.
+- Authentication failures (401/403) on any commit attempt — first or retried — and on event fallbacks journal the spend instead of releasing or discarding it, so spend recorded during a key misconfiguration or rotation window replays once credentials are fixed.
+
+### Fixed
+
+- Self-review hardening (fleet-wide adversarial review): filename sanitization is ASCII-explicit, matching the TS/Java SDKs, so sibling SDKs sharing a tenant identity directory can always discard records this SDK wrote (and vice versa); the two cross-SDK PBKDF2 fingerprint vectors are now pinned in this suite; a whitespace-only `tenant` falls back to the key principal (matching Java); honored `Retry-After` values and restored journal floors are clamped to 1 hour; HTTP 410 triggers the expired/event-fallback path even when the response body was mangled in transit; a 4xx with no recognizable protocol error code (proxy error pages, forward-compat future codes) is no longer treated as a genuine rejection — the journal entry is retained and the reservation is never released; the base journal directory is also permission-tightened and stale temp files from crashed writers are reaped after 1 hour.
+- With `retry_enabled=False`, failed commits were dropped with only a warning; they are now journaled for replay (the old drop behavior remains only when the journal is also disabled).
+- `AsyncCommitRetryEngine` created retry tasks without holding a reference, so a pending retry could be garbage-collected mid-flight; task references are now held until completion.
+- Commit retries exhausting, or landing after expiry, no longer lose the spend record silently: the journal entry is retained (transient exhaustion) or the event fallback records it (expiry).
+
+---
 
 `TENANT_CLOSED` + `LIMIT_EXCEEDED` error-code support. `TENANT_CLOSED` implements the runtime spec v0.1.25.13 revision of `cycles-protocol-v0.yaml` ([runcycles/cycles-protocol#125](https://github.com/runcycles/cycles-protocol/pull/125)): servers return HTTP 409 `error=TENANT_CLOSED` on reservation create/commit/release/extend when the owning tenant is CLOSED (mirrors governance spec Rule 2). `LIMIT_EXCEEDED` closes the same class of gap for the runtime spec v0.1.25.12 revision (2026-07-04): HTTP 429 rate-limit responses carry `error=LIMIT_EXCEEDED` plus `Retry-After` / `X-RateLimit-Reset` headers.
 

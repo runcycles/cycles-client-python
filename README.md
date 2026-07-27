@@ -227,8 +227,51 @@ CyclesConfig(
     retry_initial_delay=0.5,
     retry_multiplier=2.0,
     retry_max_delay=30.0,
+    retry_flush_timeout=10.0,
+    journal_enabled=True,
+    journal_dir=None,  # None → ~/.runcycles/commit-journal
 )
 ```
+
+### Commit durability
+
+A commit records spend that has already happened, so the SDK never lets one
+exist only in memory. Every commit scheduled for background retry is first
+journaled to disk and removed only on a terminal outcome. Records live under
+`journal_dir` (default `~/.runcycles/commit-journal`) in a per-identity
+subdirectory (directories `0700`, files `0600` where supported) keyed by a
+non-secret fingerprint of the server plus principal — the configured
+`tenant` when set (stable across API-key rotation; any same-tenant
+credential can settle the records), otherwise the API key. Clients using
+different servers or principals on the same machine never replay each
+other's records. Without a tenant configured, rotating the API key orphans
+pending records under the old fingerprint directory; records are plain
+JSON, so moving them into the new identity directory is safe — replay is
+idempotent:
+
+- **Process exit**: an `atexit` hook waits up to `retry_flush_timeout` seconds
+  (one process-wide budget shared across all engines) for in-flight retries;
+  anything unfinished stays journaled and is replayed automatically the next
+  time the process creates a client lifecycle.
+- **Rate limiting**: HTTP 429 / `LIMIT_EXCEEDED` responses are transient
+  everywhere — a rate-limited *first* commit attempt is scheduled for retry
+  (never released, which would return budget for spend that already
+  happened), the journal entry is kept, and the next attempt waits at least
+  the server's `Retry-After`. The floor is persisted as an absolute
+  timestamp, so a restart mid-wait still honors it.
+- **Authentication failures**: 401/403 on any commit attempt — first or
+  retried — journals the spend (never releases it) and stops the current
+  run's attempts, so spend recorded during a key misconfiguration or
+  rotation window replays once credentials are fixed.
+- **Reservation expired before the commit landed**: the server has already
+  returned the reserved budget to the pool, so the SDK re-records the spend
+  via `POST /v1/events` (the protocol's post-hoc direct-debit endpoint),
+  tagging the event metadata with `recovered_reservation_id` for
+  reconciliation. Commit and event requests both carry idempotency keys, so
+  replays across restarts (or from multiple processes sharing a journal
+  directory) are exactly-once.
+- Set `journal_enabled=False` (or `CYCLES_JOURNAL_ENABLED=false`) to opt out
+  and restore fire-and-forget behavior.
 
 ### Default client / config
 
