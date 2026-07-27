@@ -120,7 +120,9 @@ class _RetryEngineBase:
             # but using different servers or API keys must never replay each
             # other's records (a foreign record would 401/403 and be
             # discarded as terminal — permanent spend loss).
-            self._journal = CommitJournal(base / _journal.auth_fingerprint(config.base_url, config.api_key))
+            self._journal = CommitJournal(
+                base / _journal.auth_fingerprint(config.base_url, config.api_key, config.tenant)
+            )
 
     def _journal_record(self, pending: _PendingCommit) -> None:
         if self._journal is not None:
@@ -208,6 +210,13 @@ class _RetryEngineBase:
             return True
         if self._is_rate_limited(pending, response):
             return False
+        if response.status in (401, 403):
+            logger.error(
+                "Commit retry got authentication failure (status=%d); journal entry retained — "
+                "fix credentials and restart to replay: reservation_id=%s",
+                response.status, pending.reservation_id,
+            )
+            return True
         if response.is_client_error:
             code = _extract_error_code(response)
             if code == "RESERVATION_EXPIRED":
@@ -250,6 +259,13 @@ class _RetryEngineBase:
             return True
         if self._is_rate_limited(pending, response):
             return False
+        if response.status in (401, 403):
+            logger.error(
+                "Event fallback got authentication failure (status=%d); journal entry retained — "
+                "fix credentials and restart to replay: reservation_id=%s",
+                response.status, pending.reservation_id,
+            )
+            return True
         if response.is_client_error:
             logger.error(
                 "Event fallback rejected (%s); spend recovery failed: reservation_id=%s, status=%d",
@@ -294,8 +310,14 @@ class CommitRetryEngine(_RetryEngineBase):
         reservation_id: str,
         commit_body: dict[str, Any],
         event_fallback_body: dict[str, Any] | None = None,
+        retry_after_ms: int | None = None,
     ) -> None:
-        self._submit(_PendingCommit(reservation_id, commit_body, event_fallback_body, mode="commit"))
+        pending = _PendingCommit(reservation_id, commit_body, event_fallback_body, mode="commit")
+        if retry_after_ms is not None:
+            # A rate-limited first attempt passes its Retry-After along so
+            # the first background retry honors the server's delay.
+            pending.retry_after_s = retry_after_ms / 1000.0
+        self._submit(pending)
 
     def schedule_event(self, reservation_id: str, event_body: dict[str, Any]) -> None:
         """Deliver spend via POST /v1/events for a reservation that already expired."""
@@ -404,8 +426,14 @@ class AsyncCommitRetryEngine(_RetryEngineBase):
         reservation_id: str,
         commit_body: dict[str, Any],
         event_fallback_body: dict[str, Any] | None = None,
+        retry_after_ms: int | None = None,
     ) -> None:
-        self._submit(_PendingCommit(reservation_id, commit_body, event_fallback_body, mode="commit"))
+        pending = _PendingCommit(reservation_id, commit_body, event_fallback_body, mode="commit")
+        if retry_after_ms is not None:
+            # A rate-limited first attempt passes its Retry-After along so
+            # the first background retry honors the server's delay.
+            pending.retry_after_s = retry_after_ms / 1000.0
+        self._submit(pending)
 
     def schedule_event(self, reservation_id: str, event_body: dict[str, Any]) -> None:
         """Deliver spend via POST /v1/events for a reservation that already expired."""

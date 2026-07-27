@@ -401,7 +401,16 @@ class CyclesLifecycle:
                 error_resp = response.get_error_response()
                 if error_resp and error_resp.error_code:
                     error_code = error_resp.error_code.value
-                if error_code == "RESERVATION_EXPIRED":
+                if response.status == 429 or error_code == "LIMIT_EXCEEDED":
+                    # Rate-limited, not rejected: releasing here would return
+                    # budget for spend that already happened. Retry instead,
+                    # honoring the server's Retry-After.
+                    logger.warning("Commit rate-limited; scheduling retry: id=%s", reservation_id)
+                    self._retry_engine.schedule(
+                        reservation_id, commit_body, event_fallback_body,
+                        retry_after_ms=response.retry_after_ms_header,
+                    )
+                elif error_code == "RESERVATION_EXPIRED":
                     logger.warning(
                         "Reservation expired before commit; recovering spend via POST /v1/events: id=%s",
                         reservation_id,
@@ -576,7 +585,16 @@ class AsyncCyclesLifecycle:
                 error_resp = response.get_error_response()
                 if error_resp and error_resp.error_code:
                     error_code = error_resp.error_code.value
-                if error_code == "RESERVATION_EXPIRED":
+                if response.status == 429 or error_code == "LIMIT_EXCEEDED":
+                    # Rate-limited, not rejected: releasing here would return
+                    # budget for spend that already happened. Retry instead,
+                    # honoring the server's Retry-After.
+                    logger.warning("Commit rate-limited; scheduling retry: id=%s", reservation_id)
+                    self._retry_engine.schedule(
+                        reservation_id, commit_body, event_fallback_body,
+                        retry_after_ms=response.retry_after_ms_header,
+                    )
+                elif error_code == "RESERVATION_EXPIRED":
                     logger.warning(
                         "Reservation expired before commit; recovering spend via POST /v1/events: id=%s",
                         reservation_id,

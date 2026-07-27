@@ -34,17 +34,35 @@ def default_journal_dir() -> Path:
     return Path.home() / ".runcycles" / "commit-journal"
 
 
-def auth_fingerprint(base_url: str, api_key: str) -> str:
-    """Non-secret identity for one (server, credential) pair.
+def auth_fingerprint(base_url: str, api_key: str, tenant: str | None = None) -> str:
+    """Non-secret identity for one (server, principal) pair.
 
     Journal records are stored under a per-identity subdirectory so that
-    clients sharing a journal directory but using different servers or API
-    keys never replay (and on 401/403, discard) each other's records. A
-    truncated SHA-256 is not reversible and API keys are high-entropy, so
-    the fingerprint is safe to use as a directory name.
+    clients sharing a journal directory but using different servers or
+    principals never replay each other's records. When a tenant is
+    configured it is the principal — stable across API-key rotation, and
+    any same-tenant credential may settle the records. Without a tenant
+    the API key itself is the principal; rotating it then orphans pending
+    records under the old fingerprint (records are plain JSON, so an
+    operator can move them into the new identity directory — replay is
+    idempotent). A truncated SHA-256 is not reversible and API keys are
+    high-entropy, so the fingerprint is safe to use as a directory name.
     """
-    digest = hashlib.sha256(f"{base_url}\n{api_key}".encode()).hexdigest()
+    principal = f"tenant\n{tenant}" if tenant else f"key\n{api_key}"
+    digest = hashlib.sha256(f"{base_url}\n{principal}".encode()).hexdigest()
     return digest[:16]
+
+
+def _restrict_permissions(path: Path, mode: int) -> None:
+    """Best-effort permission tightening — records carry spend metadata.
+
+    No-op semantics on platforms without POSIX modes; failure never blocks
+    the write itself.
+    """
+    try:
+        path.chmod(mode)
+    except OSError:
+        pass
 
 
 def _safe_filename(reservation_id: str) -> str:
@@ -120,9 +138,11 @@ class CommitJournal:
         """Persist a pending commit. Never raises."""
         try:
             self._dir.mkdir(parents=True, exist_ok=True)
+            _restrict_permissions(self._dir, 0o700)
             target = self._dir / _safe_filename(entry.reservation_id)
             tmp = target.with_suffix(".tmp")
             tmp.write_text(entry.to_json(), encoding="utf-8")
+            _restrict_permissions(tmp, 0o600)
             tmp.replace(target)
             logger.debug("Journaled pending commit: id=%s, path=%s", entry.reservation_id, target)
         except OSError:

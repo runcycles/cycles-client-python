@@ -1,6 +1,6 @@
 # Cycles Protocol v0.1.25 — Client (Python) Audit
 
-**Date:** 2026-07-27 (v0.5.0 — durable commit retries: on-disk pending-commit journal with next-run replay, bounded atexit flush, and `POST /v1/events` recovery for commits that land after reservation expiry; async retry-task GC fix; `retry_enabled=False` now journals instead of silently dropping. Review hardening: per-identity journal partitioning, 429 transient with `Retry-After`, process-wide flush deadline. See the dated entry below. 469 tests pass at 100% coverage.),
+**Date:** 2026-07-27 (v0.5.0 — durable commit retries: on-disk pending-commit journal with next-run replay, bounded atexit flush, and `POST /v1/events` recovery for commits that land after reservation expiry; async retry-task GC fix; `retry_enabled=False` now journals instead of silently dropping. Review hardening: per-identity journal partitioning (tenant-keyed when configured — rotation-safe), 429 transient with `Retry-After` incl. first-attempt commits (no more release-on-429), 401/403 retained, `0700`/`0600` journal permissions, process-wide flush deadline. See the dated entry below. 481 tests pass at 100% coverage.),
 2026-07-10 (v0.5.0 — `TENANT_CLOSED` + `LIMIT_EXCEEDED` error-code support. `TENANT_CLOSED` per runtime spec v0.1.25.13 (`cycles-protocol-v0.yaml`, runcycles/cycles-protocol#125): `ErrorCode.TENANT_CLOSED` enum member, `TenantClosedError` subclass wired into the lifecycle error-code→exception mapping (reservation-creation surfaces), `CyclesProtocolError.is_tenant_closed()` helper. `LIMIT_EXCEEDED` per runtime spec v0.1.25.12 (revision 2026-07-04, HTTP 429 rate limiting): enum-only member matching the `BUDGET_FROZEN`/`BUDGET_CLOSED` pattern, classified retryable at both the enum and exception layers (429 is transient; previously it fell through to `UNKNOWN`, which happened to be retryable, so semantics are unchanged — now typed). Enum reordered to mirror spec declaration order. Both purely additive; previously both codes fell through the `ErrorCode.from_string` forward-compat path to `UNKNOWN`. See the dated entries at the end of this file. 398 tests pass at 100% coverage.),
 2026-07-09 (README + docstring transport-error documentation fix, no version bump — see the dated entry at the end of this file. `CyclesTransportError` is exported but never raised by the SDK; README and its docstring now describe the actual `status == -1` surfacing.),
 2026-07-03 (integration-test-only, no version bump — `test_health_check` now probes the public `/actuator/health/readiness` endpoint instead of aggregate `/actuator/health`, which requires `X-Admin-API-Key` since cycles-server v0.1.25.45 and fails closed with 500 when the server has no admin key configured. The old assertion had failed the org nightly Full-Stack Integration every night since 2026-06-28. No library code change.),
@@ -23,14 +23,20 @@ has already returned the reserved budget to the pool — is recovered via
 `POST /v1/events` (spec-conformant `EventCreateRequest`, commit idempotency
 key reused, recovery markers in `metadata`). Also fixes the async engine's
 unreferenced-task GC hazard and the silent drop under `retry_enabled=False`.
-Post-review (PR #89) hardening: journal records are partitioned into
-per-identity subdirectories (SHA-256 fingerprint of base_url + api_key) so
-co-located clients with different credentials never replay or 401-discard
-each other's records and replay claims cannot cross identities; HTTP 429 /
-`LIMIT_EXCEEDED` is transient (record retained, `Retry-After` honored)
-instead of a terminal discard; the atexit flush enforces one process-wide
-`retry_flush_timeout` deadline instead of per-engine. 469 tests pass at
-100% coverage.
+Post-review (PR #89) hardening, round 1: journal records are partitioned
+into per-identity subdirectories so co-located clients with different
+credentials never replay or 401-discard each other's records and replay
+claims cannot cross identities; HTTP 429 / `LIMIT_EXCEEDED` on retried
+attempts is transient (record retained, `Retry-After` honored) instead of
+a terminal discard; the atexit flush enforces one process-wide
+`retry_flush_timeout` deadline instead of per-engine. Round 2: a
+rate-limited *first* commit attempt now schedules a retry in all four
+lifecycle variants instead of releasing the reservation (a release
+returned budget for spend that already happened); the identity fingerprint
+uses the configured tenant when set, so API-key rotation no longer orphans
+pending records, and 401/403 retains the journal entry instead of
+discarding it; journal directories/files are created `0700`/`0600` where
+supported. 481 tests pass at 100% coverage.
 
 ## 2026-07-26 — Python publishing workflow maintenance
 
