@@ -13,25 +13,28 @@
 
 ---
 
-## 2026-07-27 — Heartbeat lead-estimate redesign + actual_source marker (v0.5.1)
+## 2026-07-27 — Heartbeat conservative-lead redesign + actual_source marker (v0.5.1)
 
 The heartbeat extended by full ttl_ms every ttl/2 beat while extend_by_ms
 is relative to current expiry — drifting expiry outward +ttl/2 per beat
-(zombie budget lockup on kill; max_extensions burned 2× too fast). All
-four heartbeats now alternate-beat extend (lead stays [ttl/2, 1.5×ttl]).
-Self-review found the first fix (alternate-beat) introduced inward-drift
-hazards (single-failure lead-0, sub-2s-ttl floor decay, RTT slippage); the
-heartbeat now maintains a conservative lead LOWER BOUND (sum of grants
-measured from successive returned expires_at_ms minus monotonic elapsed
-— same server frame only), primes early, derives cadence from the
-measured grant (tenant max_reservation_ttl_ms clamps self-correct), uses
-the Date header only as a first-beat hint (RFC 9110 caveats; Redis TIME
-vs container clock), reuses the extend idempotency key on retries, and
-stops permanently on expired/finalized/max-extensions/tenant-closed/
-not-found.
-Commits whose actual was defaulted from the estimate now carry
+(zombie budget lockup on kill; max_extensions burned 2× too fast). Four
+adversarial review rounds refined the replacement; final (v2.3) design:
+conservative lead LOWER BOUND lead_min = Σ measured grants − monotonic
+elapsed (grants from successive returned expires_at_ms — same server
+frame only, no cross-clock arithmetic); FIRST extension fires immediately
+(any bounded first delay can outlive a tenant-policy-capped lease);
+cadence splits by regime — a grant tracking the lease drives
+clamp(grant/2, 500ms, ttl/2), while a grant merely mirroring elapsed time
+(maximum-lead clamping) carries no wire cadence signal, so the loop holds
+min(ttl/2, 30s) and warns once instead of burning max_extensions at the
+floor; a transient failure on the primed beat backs off to the held
+cadence (no hot loop); skip at lead_min ≥ 1.5×last_grant; extend
+idempotency key reused on retries; permanent stop on expired/finalized/
+max-extensions/tenant-closed/not-found (and raw 404/410). The HTTP Date
+header plays no heartbeat role (RFC 9110 §6.6.1; Redis TIME vs container
+clock). Commits whose actual was defaulted from the estimate now carry
 metadata.actual_source="estimate" for audit honesty. Spec guidance:
-cycles-protocol#148. 533 tests pass at 100% coverage.
+cycles-protocol#148. 532 tests pass at 100% coverage.
 
 ## 2026-07-27 — Durable commit retries (journal + /v1/events fallback)
 

@@ -214,33 +214,9 @@ _PERMANENT_EXTEND_CODES = frozenset(
         "NOT_FOUND",  # a purged reservation never comes back
     }
 )
-
-
-def _effective_ttl_ms(
-    requested_ttl_ms: int,
-    expires_at_ms: int | None,
-    server_date_ms: int | None,
-) -> int | None:
-    """Rough estimate of the granted TTL — a cadence HINT only, never
-    load-bearing for correctness.
-
-    Tenant policy ``max_reservation_ttl_ms`` (default 1h) silently caps the
-    granted TTL and the create response has no effective-TTL field. The HTTP
-    ``Date`` header gives a rough estimate, but per RFC 9110 it is a
-    whole-second, best-effort origination timestamp that intermediaries may
-    replace — and it need not come from the clock that stamped
-    ``expires_at_ms`` (in the reference server that clock is Redis TIME).
-    So the estimate only informs the FIRST heartbeat delay; the heartbeat's
-    correctness rests on the ``lead_min`` accounting instead. Returns
-    ``None`` when underivable; never clamps upward.
-    """
-    if expires_at_ms is None or server_date_ms is None:
-        return None
-    derived = expires_at_ms - server_date_ms
-    return max(0, min(derived, requested_ttl_ms))
-# Lead threshold: extend when the estimated remaining lifetime drops below
-# this multiple of ttl. Attempts then happen with ~ttl of margin, tolerating
-# failed beats; the success-path lead stays within ~[ttl, 2*ttl].
+# Skip an extension while lead_min is at least this multiple of the last
+# measured grant; below it, extend. Attempts then carry enough margin to
+# tolerate failed beats on the success path.
 _LEAD_TARGET_FACTOR = 1.5
 
 
@@ -400,8 +376,7 @@ class CyclesLifecycle:
 
         # Start heartbeat
         heartbeat_stop = threading.Event()
-        est_ttl = _effective_ttl_ms(cfg.ttl_ms, res_result.expires_at_ms, res_response.server_date_ms)
-        heartbeat_thread = self._start_heartbeat(reservation_id, cfg.ttl_ms, ctx, heartbeat_stop, est_ttl)
+        heartbeat_thread = self._start_heartbeat(reservation_id, cfg.ttl_ms, ctx, heartbeat_stop)
 
         try:
             result = fn(*args, **kwargs)
@@ -517,28 +492,25 @@ class CyclesLifecycle:
             logger.exception("Failed to release: id=%s", reservation_id)
 
     def _start_heartbeat(
-        self,
-        reservation_id: str,
-        ttl_ms: int,
-        ctx: CyclesContext,
-        stop_event: threading.Event,
-        est_ttl_ms: int | None = None,
+        self, reservation_id: str, ttl_ms: int, ctx: CyclesContext, stop_event: threading.Event,
     ) -> threading.Thread | None:
         if ttl_ms <= 0:
             return None
 
         def heartbeat_loop() -> None:
-            # Conservative-lead heartbeat (v2.2): the only rigorous,
+            # Conservative-lead heartbeat (v2.3): the only rigorous,
             # cross-clock-free quantity a client can maintain is a LOWER
             # BOUND on its remaining lead:
             #   lead_min = sum(measured grants) - monotonic elapsed
             # where each grant is the difference of successive returned
             # expires_at_ms values (same server frame). lead_min starts at
-            # 0, so the first extension fires early — bounded by
-            # min(ttl/2, est/2 if a Date-derived hint exists, 30s) — which
-            # both establishes real measured margin and reveals the actual
-            # per-extend grant (tenant policy may clamp). Cadence then
-            # derives from the measured grant; skip when lead_min >=
+            # 0, so the FIRST extension fires immediately — establishing
+            # real measured margin and revealing the actual per-extend
+            # grant. Cadence then splits by regime: a grant that tracks the
+            # lease (grant ≫ elapsed) drives cadence at grant/2; a grant
+            # that merely mirrors elapsed time (maximum-lead clamping)
+            # carries no cadence signal, so the loop holds a bounded
+            # cadence instead of tightening. Skip when lead_min >=
             # 1.5*last_grant. Failed extends retry with the SAME body (same
             # idempotency key); permanent rejections stop the heartbeat.
             prev_expiry = ctx.expires_at_ms
@@ -546,11 +518,18 @@ class CyclesLifecycle:
             grants_sum = 0.0
             last_grant: float | None = None
             pending_body: dict[str, Any] | None = None
-            delay_ms = min(
-                [ttl_ms / 2, 30_000.0]
-                + ([est_ttl_ms / 2] if est_ttl_ms is not None and est_ttl_ms > 0 else [])
-            )
+            # Immediate first extension: with lead_min starting at 0 and no
+            # trustworthy effective-TTL signal on the wire, any bounded first
+            # delay can outlive a policy-capped lease. Priming costs one
+            # extension; total protected runtime is unchanged.
+            delay_ms = 0.0
+            last_success_ms = anchor_ms
+            held_delay_ms = min(ttl_ms / 2, 30_000.0)
+            clamp_warned = False
             while not stop_event.wait(timeout=delay_ms / 1000.0):
+                # After the primed (delay-0) first beat, the baseline cadence
+                # is the held delay — a transient failure must not hot-loop.
+                delay_ms = delay_ms or held_delay_ms
                 lead_min = grants_sum - (_now_mono_ms() - anchor_ms)
                 if last_grant is not None and lead_min >= _LEAD_TARGET_FACTOR * last_grant:
                     continue
@@ -575,9 +554,28 @@ class CyclesLifecycle:
                             if prev_expiry is not None:
                                 prev_expiry += ttl_ms
                         grant = max(grant, 0.0)
+                        now_ms = _now_mono_ms()
+                        elapsed_since_success = now_ms - last_success_ms
+                        last_success_ms = now_ms
                         grants_sum += grant
                         last_grant = grant
-                        delay_ms = min(max(grant / 2, 500.0), ttl_ms / 2)
+                        if grant <= 0 or (
+                            grant < 0.9 * ttl_ms and grant <= 1.25 * elapsed_since_success
+                        ):
+                            # Lead-clamping server: the grant mirrors elapsed
+                            # time, not lease size — no cadence signal exists
+                            # on the wire. Hold a bounded cadence; never
+                            # tighten toward the floor (that would burn the
+                            # max_extensions budget in seconds).
+                            delay_ms = held_delay_ms
+                            if not clamp_warned:
+                                clamp_warned = True
+                                logger.warning(
+                                    "Server appears to clamp lease lead; extension budget will deplete: id=%s",
+                                    reservation_id,
+                                )
+                        else:
+                            delay_ms = min(max(grant / 2, 500.0), ttl_ms / 2)
                         logger.debug("Heartbeat extend ok: id=%s", reservation_id)
                     else:
                         code = _extract_error_code(response)
@@ -665,8 +663,7 @@ class AsyncCyclesLifecycle:
         )
         _set_context(ctx)
 
-        est_ttl = _effective_ttl_ms(cfg.ttl_ms, res_result.expires_at_ms, res_response.server_date_ms)
-        heartbeat_task = self._start_heartbeat(reservation_id, cfg.ttl_ms, ctx, est_ttl)
+        heartbeat_task = self._start_heartbeat(reservation_id, cfg.ttl_ms, ctx)
 
         try:
             result = await fn(*args, **kwargs)
@@ -778,29 +775,33 @@ class AsyncCyclesLifecycle:
             logger.exception("Failed to release: id=%s", reservation_id)
 
     def _start_heartbeat(
-        self,
-        reservation_id: str,
-        ttl_ms: int,
-        ctx: CyclesContext,
-        est_ttl_ms: int | None = None,
+        self, reservation_id: str, ttl_ms: int, ctx: CyclesContext,
     ) -> asyncio.Task[None] | None:
         if ttl_ms <= 0:
             return None
 
         async def heartbeat_loop() -> None:
-            # Conservative-lead heartbeat (v2.2) — see the sync heartbeat.
+            # Conservative-lead heartbeat (v2.3) — see the sync heartbeat.
             prev_expiry = ctx.expires_at_ms
             anchor_ms = _now_mono_ms()
             grants_sum = 0.0
             last_grant: float | None = None
             pending_body: dict[str, Any] | None = None
-            delay_ms = min(
-                [ttl_ms / 2, 30_000.0]
-                + ([est_ttl_ms / 2] if est_ttl_ms is not None and est_ttl_ms > 0 else [])
-            )
+            # Immediate first extension: with lead_min starting at 0 and no
+            # trustworthy effective-TTL signal on the wire, any bounded first
+            # delay can outlive a policy-capped lease. Priming costs one
+            # extension; total protected runtime is unchanged.
+            delay_ms = 0.0
+            last_success_ms = anchor_ms
+            held_delay_ms = min(ttl_ms / 2, 30_000.0)
+            clamp_warned = False
             try:
                 while True:
                     await asyncio.sleep(delay_ms / 1000.0)
+                    # After the primed (delay-0) first beat, the baseline
+                    # cadence is the held delay — a transient failure must
+                    # not hot-loop.
+                    delay_ms = delay_ms or held_delay_ms
                     lead_min = grants_sum - (_now_mono_ms() - anchor_ms)
                     if last_grant is not None and lead_min >= _LEAD_TARGET_FACTOR * last_grant:
                         continue
@@ -825,9 +826,28 @@ class AsyncCyclesLifecycle:
                                 if prev_expiry is not None:
                                     prev_expiry += ttl_ms
                             grant = max(grant, 0.0)
+                            now_ms = _now_mono_ms()
+                            elapsed_since_success = now_ms - last_success_ms
+                            last_success_ms = now_ms
                             grants_sum += grant
                             last_grant = grant
-                            delay_ms = min(max(grant / 2, 500.0), ttl_ms / 2)
+                            if grant <= 0 or (
+                                grant < 0.9 * ttl_ms and grant <= 1.25 * elapsed_since_success
+                            ):
+                                # Lead-clamping server: the grant mirrors elapsed
+                                # time, not lease size — no cadence signal exists
+                                # on the wire. Hold a bounded cadence; never
+                                # tighten toward the floor (that would burn the
+                                # max_extensions budget in seconds).
+                                delay_ms = held_delay_ms
+                                if not clamp_warned:
+                                    clamp_warned = True
+                                    logger.warning(
+                                        "Server appears to clamp lease lead; extension budget will deplete: id=%s",
+                                        reservation_id,
+                                    )
+                            else:
+                                delay_ms = min(max(grant / 2, 500.0), ttl_ms / 2)
                         else:
                             code = _extract_error_code(response)
                             if response.status in (404, 410) or code in _PERMANENT_EXTEND_CODES:

@@ -184,7 +184,6 @@ class StreamReservation:
 
         self._heartbeat_stop = threading.Event()
         self._heartbeat_thread: threading.Thread | None = None
-        self._est_ttl: int | None = None
 
         self._retry_engine = CommitRetryEngine(client._config)
         self._retry_engine.set_client(client)
@@ -250,9 +249,6 @@ class StreamReservation:
         )
         _set_context(self._ctx)
 
-        self._est_ttl = _lifecycle._effective_ttl_ms(
-            self._ttl_ms, result.expires_at_ms, response.server_date_ms
-        )
         self._start_time = time.monotonic()
         self._heartbeat_thread = self._start_heartbeat()
 
@@ -382,18 +378,25 @@ class StreamReservation:
         ctx = self._ctx
 
         def heartbeat_loop() -> None:
-            # Conservative-lead heartbeat (v2.2) — see CyclesLifecycle heartbeat.
+            # Conservative-lead heartbeat (v2.3) — see CyclesLifecycle heartbeat.
             ttl_ms = self._ttl_ms
-            est = self._est_ttl
             prev_expiry = ctx.expires_at_ms if ctx is not None else None
             anchor_ms = _lifecycle._now_mono_ms()
             grants_sum = 0.0
             last_grant: float | None = None
             pending_body: dict[str, Any] | None = None
-            delay_ms = min(
-                [ttl_ms / 2, 30_000.0] + ([est / 2] if est is not None and est > 0 else [])
-            )
+            # Immediate first extension: with lead_min starting at 0 and no
+            # trustworthy effective-TTL signal on the wire, any bounded first
+            # delay can outlive a policy-capped lease. Priming costs one
+            # extension; total protected runtime is unchanged.
+            delay_ms = 0.0
+            last_success_ms = anchor_ms
+            held_delay_ms = min(ttl_ms / 2, 30_000.0)
+            clamp_warned = False
             while not self._heartbeat_stop.wait(timeout=delay_ms / 1000.0):
+                # After the primed (delay-0) first beat, the baseline cadence
+                # is the held delay — a transient failure must not hot-loop.
+                delay_ms = delay_ms or held_delay_ms
                 lead_min = grants_sum - (_lifecycle._now_mono_ms() - anchor_ms)
                 if last_grant is not None and lead_min >= _LEAD_TARGET_FACTOR * last_grant:
                     continue
@@ -419,9 +422,28 @@ class StreamReservation:
                             if prev_expiry is not None:
                                 prev_expiry += ttl_ms
                         grant = max(grant, 0.0)
+                        now_ms = _lifecycle._now_mono_ms()
+                        elapsed_since_success = now_ms - last_success_ms
+                        last_success_ms = now_ms
                         grants_sum += grant
                         last_grant = grant
-                        delay_ms = min(max(grant / 2, 500.0), ttl_ms / 2)
+                        if grant <= 0 or (
+                            grant < 0.9 * ttl_ms and grant <= 1.25 * elapsed_since_success
+                        ):
+                            # Lead-clamping server: the grant mirrors elapsed
+                            # time, not lease size — no cadence signal exists
+                            # on the wire. Hold a bounded cadence; never
+                            # tighten toward the floor (that would burn the
+                            # max_extensions budget in seconds).
+                            delay_ms = held_delay_ms
+                            if not clamp_warned:
+                                clamp_warned = True
+                                logger.warning(
+                                    "Server appears to clamp lease lead; extension budget will deplete: id=%s",
+                                    reservation_id,
+                                )
+                        else:
+                            delay_ms = min(max(grant / 2, 500.0), ttl_ms / 2)
                     else:
                         code = _extract_error_code(response)
                         if response.status in (404, 410) or code in _PERMANENT_EXTEND_CODES:
@@ -490,7 +512,6 @@ class AsyncStreamReservation:
         self._start_time: float = 0.0
 
         self._heartbeat_task: asyncio.Task[None] | None = None
-        self._est_ttl: int | None = None
 
         self._retry_engine = AsyncCommitRetryEngine(client._config)
         self._retry_engine.set_client(client)
@@ -556,9 +577,6 @@ class AsyncStreamReservation:
         )
         _set_context(self._ctx)
 
-        self._est_ttl = _lifecycle._effective_ttl_ms(
-            self._ttl_ms, result.expires_at_ms, response.server_date_ms
-        )
         self._start_time = time.monotonic()
         self._heartbeat_task = self._start_heartbeat()
 
@@ -693,21 +711,29 @@ class AsyncStreamReservation:
         ctx = self._ctx
         client = self._client
         ttl_ms = self._ttl_ms
-        est = self._est_ttl
 
         async def heartbeat_loop() -> None:
-            # Conservative-lead heartbeat (v2.2) — see CyclesLifecycle heartbeat.
+            # Conservative-lead heartbeat (v2.3) — see CyclesLifecycle heartbeat.
             prev_expiry = ctx.expires_at_ms if ctx is not None else None
             anchor_ms = _lifecycle._now_mono_ms()
             grants_sum = 0.0
             last_grant: float | None = None
             pending_body: dict[str, Any] | None = None
-            delay_ms = min(
-                [ttl_ms / 2, 30_000.0] + ([est / 2] if est is not None and est > 0 else [])
-            )
+            # Immediate first extension: with lead_min starting at 0 and no
+            # trustworthy effective-TTL signal on the wire, any bounded first
+            # delay can outlive a policy-capped lease. Priming costs one
+            # extension; total protected runtime is unchanged.
+            delay_ms = 0.0
+            last_success_ms = anchor_ms
+            held_delay_ms = min(ttl_ms / 2, 30_000.0)
+            clamp_warned = False
             try:
                 while True:
                     await asyncio.sleep(delay_ms / 1000.0)
+                    # After the primed (delay-0) first beat, the baseline
+                    # cadence is the held delay — a transient failure must
+                    # not hot-loop.
+                    delay_ms = delay_ms or held_delay_ms
                     lead_min = grants_sum - (_lifecycle._now_mono_ms() - anchor_ms)
                     if last_grant is not None and lead_min >= _LEAD_TARGET_FACTOR * last_grant:
                         continue
@@ -733,9 +759,28 @@ class AsyncStreamReservation:
                                 if prev_expiry is not None:
                                     prev_expiry += ttl_ms
                             grant = max(grant, 0.0)
+                            now_ms = _lifecycle._now_mono_ms()
+                            elapsed_since_success = now_ms - last_success_ms
+                            last_success_ms = now_ms
                             grants_sum += grant
                             last_grant = grant
-                            delay_ms = min(max(grant / 2, 500.0), ttl_ms / 2)
+                            if grant <= 0 or (
+                                grant < 0.9 * ttl_ms and grant <= 1.25 * elapsed_since_success
+                            ):
+                                # Lead-clamping server: the grant mirrors elapsed
+                                # time, not lease size — no cadence signal exists
+                                # on the wire. Hold a bounded cadence; never
+                                # tighten toward the floor (that would burn the
+                                # max_extensions budget in seconds).
+                                delay_ms = held_delay_ms
+                                if not clamp_warned:
+                                    clamp_warned = True
+                                    logger.warning(
+                                        "Server appears to clamp lease lead; extension budget will deplete: id=%s",
+                                        reservation_id,
+                                    )
+                            else:
+                                delay_ms = min(max(grant / 2, 500.0), ttl_ms / 2)
                         else:
                             code = _extract_error_code(response)
                             if response.status in (404, 410) or code in _PERMANENT_EXTEND_CODES:

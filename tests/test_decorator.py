@@ -1,5 +1,7 @@
 """Tests for the @cycles decorator."""
 
+import re
+
 import pytest
 
 from runcycles.client import AsyncCyclesClient, CyclesClient
@@ -12,6 +14,20 @@ from runcycles.exceptions import CyclesProtocolError
 @pytest.fixture
 def config() -> CyclesConfig:
     return CyclesConfig(base_url="http://localhost:7878", api_key="test-key", tenant="acme")
+
+
+@pytest.fixture(autouse=True)
+def _allow_heartbeat_extends(httpx_mock) -> None:  # type: ignore[no-untyped-def]
+    # The v2.3 heartbeat primes an IMMEDIATE extend on entry; these tests
+    # run the real decorator flow, so accept (and ignore) heartbeat extends.
+    httpx_mock.add_response(
+        method="POST",
+        url=re.compile(r"http://localhost:7878/v1/reservations/[^/]+/extend$"),
+        json={"status": "ACTIVE"},
+        status_code=200,
+        is_optional=True,
+        is_reusable=True,
+    )
 
 
 class TestCyclesDecoratorSync:
