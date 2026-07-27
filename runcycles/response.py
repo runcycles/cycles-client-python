@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from email.utils import parsedate_to_datetime
 from typing import Any
 
 from runcycles.models import ErrorResponse
@@ -71,6 +72,23 @@ class CyclesResponse:
         try:
             return int(val) * 1000
         except ValueError:
+            return None
+
+    @property
+    def server_date_ms(self) -> int | None:
+        """HTTP ``Date`` header as epoch milliseconds (server wall clock).
+
+        Server-frame, so differencing it against other server-frame values
+        (like ``expires_at_ms``) is clock-skew-free to within the header's
+        one-second resolution plus transit latency. Returns ``None`` when
+        absent or unparseable.
+        """
+        val = self.headers.get("date")
+        if val is None:
+            return None
+        try:
+            return int(parsedate_to_datetime(val).timestamp() * 1000)
+        except (ValueError, TypeError):
             return None
 
     @property

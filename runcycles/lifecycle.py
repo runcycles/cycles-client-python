@@ -40,6 +40,7 @@ from runcycles.response import CyclesResponse
 from runcycles.retry import (
     AsyncCommitRetryEngine,
     CommitRetryEngine,
+    _extract_error_code,
     _is_recognized_rejection,
 )
 
@@ -198,6 +199,49 @@ def _build_release_body(reason: str) -> dict[str, Any]:
     return {"idempotency_key": str(uuid.uuid4()), "reason": reason}
 
 
+def _now_mono_ms() -> float:
+    """Monotonic milliseconds — the heartbeat's only clock (test seam)."""
+    return time.monotonic() * 1000.0
+
+
+# Extend failures that can never succeed again — the heartbeat stops on them.
+_PERMANENT_EXTEND_CODES = frozenset(
+    {
+        "RESERVATION_EXPIRED",
+        "RESERVATION_FINALIZED",
+        "MAX_EXTENSIONS_EXCEEDED",
+        "TENANT_CLOSED",  # closure is irreversible per cascade semantics
+        "NOT_FOUND",  # a purged reservation never comes back
+    }
+)
+
+
+def _effective_ttl_ms(
+    requested_ttl_ms: int,
+    expires_at_ms: int | None,
+    server_date_ms: int | None,
+) -> int:
+    """The TTL the server actually granted, best-effort.
+
+    Tenant policy ``max_reservation_ttl_ms`` (default 1h) silently caps the
+    granted TTL, and the create response has no effective-TTL field —
+    scheduling the heartbeat from the REQUESTED ttl can put the first beat
+    long after expiry. Derive the grant from two server-frame values —
+    ``expires_at_ms`` minus the HTTP ``Date`` header — which stays
+    clock-skew-free (the header's ~1s resolution is negligible against
+    multi-second TTLs). Falls back to the requested ttl when either value
+    is unavailable.
+    """
+    if expires_at_ms is None or server_date_ms is None:
+        return requested_ttl_ms
+    derived = expires_at_ms - server_date_ms
+    return max(1000, min(derived, requested_ttl_ms))
+# Lead threshold: extend when the estimated remaining lifetime drops below
+# this multiple of ttl. Attempts then happen with ~ttl of margin, tolerating
+# failed beats; the success-path lead stays within ~[ttl, 2*ttl].
+_LEAD_TARGET_FACTOR = 1.5
+
+
 def _build_extend_body(ttl_ms: int) -> dict[str, Any]:
     validate_extend_by_ms(ttl_ms)
     return {"idempotency_key": str(uuid.uuid4()), "extend_by_ms": ttl_ms}
@@ -354,7 +398,8 @@ class CyclesLifecycle:
 
         # Start heartbeat
         heartbeat_stop = threading.Event()
-        heartbeat_thread = self._start_heartbeat(reservation_id, cfg.ttl_ms, ctx, heartbeat_stop)
+        hb_ttl = _effective_ttl_ms(cfg.ttl_ms, res_result.expires_at_ms, res_response.server_date_ms)
+        heartbeat_thread = self._start_heartbeat(reservation_id, hb_ttl, ctx, heartbeat_stop)
 
         try:
             result = fn(*args, **kwargs)
@@ -474,31 +519,61 @@ class CyclesLifecycle:
     ) -> threading.Thread | None:
         if ttl_ms <= 0:
             return None
-        interval_s = max(ttl_ms / 2, 1000) / 1000.0
+        # No 1s floor: for spec-legal ttl < 2000 a floored interval cannot
+        # keep the reservation alive (each extend adds only ttl of lifetime).
+        interval_s = (ttl_ms / 2) / 1000.0
 
         def heartbeat_loop() -> None:
-            # Alternate-beat extension: extend_by_ms is relative to the
-            # CURRENT expiry (spec), so extending by ttl on every ttl/2 beat
-            # drifts expiry outward +ttl/2 per beat — a zombie-reservation
-            # window — and burns max_extensions twice as fast as needed.
-            # Extend on the first beat (only ttl/2 of lifetime remains) and
-            # every second beat after a success; retry right away after a
-            # failure. Expiry lead stays within [ttl/2, 1.5*ttl].
-            beats_since_extend = 1
+            # Lead-estimate heartbeat: extend_by_ms is relative to the
+            # CURRENT expiry (spec), so blind cadence-based extension either
+            # drifts expiry outward or leaves zero margin after a failed
+            # beat. Instead, estimate the remaining lead from the
+            # AUTHORITATIVE expires_at_ms the server returns, compared
+            # skew-free: server-frame differences plus client-monotonic
+            # elapsed only (never client wall clock vs server wall clock).
+            # Extend when lead < 1.5*ttl; skip otherwise. Failed extends are
+            # retried with the SAME body (same idempotency key) so a lost
+            # response cannot double-extend; permanent rejections stop the
+            # heartbeat for good.
+            initial_expiry = ctx.expires_at_ms
+            known_expiry = initial_expiry
+            anchor_ms = _now_mono_ms()
+            pending_body: dict[str, Any] | None = None
             while not stop_event.wait(timeout=interval_s):
-                beats_since_extend += 1
-                if beats_since_extend < 2:
+                elapsed = _now_mono_ms() - anchor_ms
+                if initial_expiry is not None and known_expiry is not None:
+                    lead = (known_expiry - initial_expiry) + ttl_ms - elapsed
+                else:
+                    lead = ttl_ms - elapsed
+                if lead >= _LEAD_TARGET_FACTOR * ttl_ms:
                     continue
                 try:
-                    body = _build_extend_body(ttl_ms)
+                    body = pending_body if pending_body is not None else _build_extend_body(ttl_ms)
+                    pending_body = body
                     response = self._client.extend_reservation(reservation_id, body)
                     if response.is_success:
-                        beats_since_extend = 0
+                        pending_body = None
                         new_expires = response.get_body_attribute("expires_at_ms")
                         if new_expires is not None:
                             ctx.update_expires_at_ms(int(new_expires))
+                            if initial_expiry is None:
+                                # Late anchor: treat this response as the frame origin.
+                                initial_expiry = int(new_expires)
+                                known_expiry = initial_expiry
+                                anchor_ms = _now_mono_ms()
+                            else:
+                                known_expiry = int(new_expires)
+                        elif known_expiry is not None:
+                            known_expiry += ttl_ms
                         logger.debug("Heartbeat extend ok: id=%s", reservation_id)
                     else:
+                        code = _extract_error_code(response)
+                        if response.status == 410 or code in _PERMANENT_EXTEND_CODES:
+                            logger.warning(
+                                "Heartbeat stopping permanently (%s, status=%d): id=%s",
+                                code, response.status, reservation_id,
+                            )
+                            return
                         logger.warning("Heartbeat extend failed: id=%s, status=%d", reservation_id, response.status)
                 except Exception:
                     logger.warning("Heartbeat extend error: id=%s", reservation_id, exc_info=True)
@@ -577,7 +652,8 @@ class AsyncCyclesLifecycle:
         )
         _set_context(ctx)
 
-        heartbeat_task = self._start_heartbeat(reservation_id, cfg.ttl_ms, ctx)
+        hb_ttl = _effective_ttl_ms(cfg.ttl_ms, res_result.expires_at_ms, res_response.server_date_ms)
+        heartbeat_task = self._start_heartbeat(reservation_id, hb_ttl, ctx)
 
         try:
             result = await fn(*args, **kwargs)
@@ -691,26 +767,50 @@ class AsyncCyclesLifecycle:
     def _start_heartbeat(self, reservation_id: str, ttl_ms: int, ctx: CyclesContext) -> asyncio.Task[None] | None:
         if ttl_ms <= 0:
             return None
-        interval_s = max(ttl_ms / 2, 1000) / 1000.0
+        # No 1s floor — see the sync heartbeat for rationale.
+        interval_s = (ttl_ms / 2) / 1000.0
 
         async def heartbeat_loop() -> None:
-            # Alternate-beat extension — see the sync heartbeat for rationale.
-            beats_since_extend = 1
+            # Lead-estimate heartbeat — see the sync heartbeat for rationale.
+            initial_expiry = ctx.expires_at_ms
+            known_expiry = initial_expiry
+            anchor_ms = _now_mono_ms()
+            pending_body: dict[str, Any] | None = None
             try:
                 while True:
                     await asyncio.sleep(interval_s)
-                    beats_since_extend += 1
-                    if beats_since_extend < 2:
+                    elapsed = _now_mono_ms() - anchor_ms
+                    if initial_expiry is not None and known_expiry is not None:
+                        lead = (known_expiry - initial_expiry) + ttl_ms - elapsed
+                    else:
+                        lead = ttl_ms - elapsed
+                    if lead >= _LEAD_TARGET_FACTOR * ttl_ms:
                         continue
                     try:
-                        body = _build_extend_body(ttl_ms)
+                        body = pending_body if pending_body is not None else _build_extend_body(ttl_ms)
+                        pending_body = body
                         response = await self._client.extend_reservation(reservation_id, body)
                         if response.is_success:
-                            beats_since_extend = 0
+                            pending_body = None
                             new_expires = response.get_body_attribute("expires_at_ms")
                             if new_expires is not None:
                                 ctx.update_expires_at_ms(int(new_expires))
+                                if initial_expiry is None:
+                                    initial_expiry = int(new_expires)
+                                    known_expiry = initial_expiry
+                                    anchor_ms = _now_mono_ms()
+                                else:
+                                    known_expiry = int(new_expires)
+                            elif known_expiry is not None:
+                                known_expiry += ttl_ms
                         else:
+                            code = _extract_error_code(response)
+                            if response.status == 410 or code in _PERMANENT_EXTEND_CODES:
+                                logger.warning(
+                                    "Heartbeat stopping permanently (%s, status=%d): id=%s",
+                                    code, response.status, reservation_id,
+                                )
+                                return
                             logger.warning("Heartbeat extend failed: id=%s", reservation_id)
                     except Exception:
                         logger.warning("Heartbeat extend error: id=%s", reservation_id, exc_info=True)

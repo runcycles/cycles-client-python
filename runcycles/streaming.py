@@ -11,11 +11,14 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
+from runcycles import lifecycle as _lifecycle
 from runcycles._validation import validate_grace_period_ms, validate_subject, validate_ttl_ms
 from runcycles.client import AsyncCyclesClient, CyclesClient
 from runcycles.context import CyclesContext, _clear_context, _set_context
 from runcycles.exceptions import CyclesProtocolError
 from runcycles.lifecycle import (
+    _LEAD_TARGET_FACTOR,
+    _PERMANENT_EXTEND_CODES,
     _build_commit_body,
     _build_event_fallback_body,
     _build_extend_body,
@@ -34,6 +37,7 @@ from runcycles.models import (
 from runcycles.retry import (
     AsyncCommitRetryEngine,
     CommitRetryEngine,
+    _extract_error_code,
     _is_recognized_rejection,
 )
 
@@ -180,6 +184,7 @@ class StreamReservation:
 
         self._heartbeat_stop = threading.Event()
         self._heartbeat_thread: threading.Thread | None = None
+        self._hb_ttl = ttl_ms
 
         self._retry_engine = CommitRetryEngine(client._config)
         self._retry_engine.set_client(client)
@@ -245,6 +250,9 @@ class StreamReservation:
         )
         _set_context(self._ctx)
 
+        self._hb_ttl = _lifecycle._effective_ttl_ms(
+            self._ttl_ms, result.expires_at_ms, response.server_date_ms
+        )
         self._start_time = time.monotonic()
         self._heartbeat_thread = self._start_heartbeat()
 
@@ -369,27 +377,52 @@ class StreamReservation:
     def _start_heartbeat(self) -> threading.Thread | None:
         if self._ttl_ms <= 0:
             return None
-        interval_s = max(self._ttl_ms / 2, 1000) / 1000.0
+        interval_s = (self._hb_ttl / 2) / 1000.0  # no 1s floor — see lifecycle heartbeat
         assert self._reservation_id is not None
         reservation_id: str = self._reservation_id
         ctx = self._ctx
 
         def heartbeat_loop() -> None:
-            # Alternate-beat extension — see CyclesLifecycle heartbeat for rationale.
-            beats_since_extend = 1
+            # Lead-estimate heartbeat — see CyclesLifecycle heartbeat for rationale.
+            ttl_ms = self._hb_ttl
+            initial_expiry = ctx.expires_at_ms if ctx is not None else None
+            known_expiry = initial_expiry
+            anchor_ms = _lifecycle._now_mono_ms()
+            pending_body: dict[str, Any] | None = None
             while not self._heartbeat_stop.wait(timeout=interval_s):
-                beats_since_extend += 1
-                if beats_since_extend < 2:
+                elapsed = _lifecycle._now_mono_ms() - anchor_ms
+                if initial_expiry is not None and known_expiry is not None:
+                    lead = (known_expiry - initial_expiry) + ttl_ms - elapsed
+                else:
+                    lead = ttl_ms - elapsed
+                if lead >= _LEAD_TARGET_FACTOR * ttl_ms:
                     continue
                 try:
-                    body = _build_extend_body(self._ttl_ms)
+                    body = pending_body if pending_body is not None else _build_extend_body(ttl_ms)
+                    pending_body = body
                     response = self._client.extend_reservation(reservation_id, body)
                     if response.is_success:
-                        beats_since_extend = 0
+                        pending_body = None
                         new_expires = response.get_body_attribute("expires_at_ms")
-                        if new_expires is not None and ctx is not None:
-                            ctx.update_expires_at_ms(int(new_expires))
+                        if new_expires is not None:
+                            if ctx is not None:
+                                ctx.update_expires_at_ms(int(new_expires))
+                            if initial_expiry is None:
+                                initial_expiry = int(new_expires)
+                                known_expiry = initial_expiry
+                                anchor_ms = _lifecycle._now_mono_ms()
+                            else:
+                                known_expiry = int(new_expires)
+                        elif known_expiry is not None:
+                            known_expiry += ttl_ms
                     else:
+                        code = _extract_error_code(response)
+                        if response.status == 410 or code in _PERMANENT_EXTEND_CODES:
+                            logger.warning(
+                                "Stream heartbeat stopping permanently (%s, status=%d): id=%s",
+                                code, response.status, reservation_id,
+                            )
+                            return
                         logger.warning("Stream heartbeat failed: id=%s", reservation_id)
                 except Exception:
                     logger.warning("Stream heartbeat error: id=%s", reservation_id, exc_info=True)
@@ -450,6 +483,7 @@ class AsyncStreamReservation:
         self._start_time: float = 0.0
 
         self._heartbeat_task: asyncio.Task[None] | None = None
+        self._hb_ttl = ttl_ms
 
         self._retry_engine = AsyncCommitRetryEngine(client._config)
         self._retry_engine.set_client(client)
@@ -515,6 +549,9 @@ class AsyncStreamReservation:
         )
         _set_context(self._ctx)
 
+        self._hb_ttl = _lifecycle._effective_ttl_ms(
+            self._ttl_ms, result.expires_at_ms, response.server_date_ms
+        )
         self._start_time = time.monotonic()
         self._heartbeat_task = self._start_heartbeat()
 
@@ -644,31 +681,55 @@ class AsyncStreamReservation:
     def _start_heartbeat(self) -> asyncio.Task[None] | None:
         if self._ttl_ms <= 0:
             return None
-        interval_s = max(self._ttl_ms / 2, 1000) / 1000.0
+        interval_s = (self._hb_ttl / 2) / 1000.0  # no 1s floor — see lifecycle heartbeat
         assert self._reservation_id is not None
         reservation_id: str = self._reservation_id
         ctx = self._ctx
         client = self._client
-        ttl_ms = self._ttl_ms
+        ttl_ms = self._hb_ttl
 
         async def heartbeat_loop() -> None:
-            # Alternate-beat extension — see CyclesLifecycle heartbeat for rationale.
-            beats_since_extend = 1
+            # Lead-estimate heartbeat — see CyclesLifecycle heartbeat for rationale.
+            initial_expiry = ctx.expires_at_ms if ctx is not None else None
+            known_expiry = initial_expiry
+            anchor_ms = _lifecycle._now_mono_ms()
+            pending_body: dict[str, Any] | None = None
             try:
                 while True:
                     await asyncio.sleep(interval_s)
-                    beats_since_extend += 1
-                    if beats_since_extend < 2:
+                    elapsed = _lifecycle._now_mono_ms() - anchor_ms
+                    if initial_expiry is not None and known_expiry is not None:
+                        lead = (known_expiry - initial_expiry) + ttl_ms - elapsed
+                    else:
+                        lead = ttl_ms - elapsed
+                    if lead >= _LEAD_TARGET_FACTOR * ttl_ms:
                         continue
                     try:
-                        body = _build_extend_body(ttl_ms)
+                        body = pending_body if pending_body is not None else _build_extend_body(ttl_ms)
+                        pending_body = body
                         response = await client.extend_reservation(reservation_id, body)
                         if response.is_success:
-                            beats_since_extend = 0
+                            pending_body = None
                             new_expires = response.get_body_attribute("expires_at_ms")
-                            if new_expires is not None and ctx is not None:
-                                ctx.update_expires_at_ms(int(new_expires))
+                            if new_expires is not None:
+                                if ctx is not None:
+                                    ctx.update_expires_at_ms(int(new_expires))
+                                if initial_expiry is None:
+                                    initial_expiry = int(new_expires)
+                                    known_expiry = initial_expiry
+                                    anchor_ms = _lifecycle._now_mono_ms()
+                                else:
+                                    known_expiry = int(new_expires)
+                            elif known_expiry is not None:
+                                known_expiry += ttl_ms
                         else:
+                            code = _extract_error_code(response)
+                            if response.status == 410 or code in _PERMANENT_EXTEND_CODES:
+                                logger.warning(
+                                    "Async stream heartbeat stopping permanently (%s, status=%d): id=%s",
+                                    code, response.status, reservation_id,
+                                )
+                                return
                             logger.warning("Async stream heartbeat failed: id=%s", reservation_id)
                     except Exception:
                         logger.warning("Async stream heartbeat error: id=%s", reservation_id, exc_info=True)
