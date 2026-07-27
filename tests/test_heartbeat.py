@@ -196,6 +196,29 @@ class TestSyncHeartbeatLeadEstimate:
         # Cadence re-derived from the MEASURED grant (ttl/4 → beat at ttl/8).
         assert timeouts[1] == (TTL / 4 / 2) / 1000.0
 
+    def test_grant_clamp_misclassification_after_skip_is_transient(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # After a skip, the next measured grant arrives across a doubled
+        # gap, so grant ≈ elapsed and the beat lands in the lead-clamp arm
+        # once. The classifier's lower band (0.75×elapsed) must make that
+        # non-sticky: at the held cadence the ratio falls to ~0.5, the
+        # regime reads normal again, and cadence re-tightens — without the
+        # band the hold sticks and a ttl/4-grant lease decays to a lapse.
+        lifecycle, client = _make_sync()
+        grant = TTL // 4  # 15000 → cadence ttl/8 = 7500ms
+        client.extend_reservation.side_effect = [
+            _extend_ok(INITIAL_EXPIRY + (n + 1) * grant) for n in range(6)
+        ]
+
+        timeouts = _run_sync_beats(lifecycle, FakeClock(), monkeypatch, beats=7)
+
+        # b1-b3 extend @7.5s, b4 skips (lead 22.5k ≥ 1.5×15k), b5 extends
+        # across the doubled gap (misclassified → one 30s hold), b6
+        # re-tightens to 7.5s, b7 extends on cadence.
+        assert client.extend_reservation.call_count == 6
+        assert timeouts == [0.0, 7.5, 7.5, 7.5, 7.5, 30.0, 7.5, 7.5]
+
     def test_missing_expires_in_response_falls_back_to_plus_ttl(
         self, monkeypatch: pytest.MonkeyPatch,
     ) -> None:

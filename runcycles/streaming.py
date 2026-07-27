@@ -428,13 +428,18 @@ class StreamReservation:
                         grants_sum += grant
                         last_grant = grant
                         if grant <= 0 or (
-                            grant < 0.9 * ttl_ms and grant <= 1.25 * elapsed_since_success
+                            grant < 0.9 * ttl_ms
+                            and 0.75 * elapsed_since_success <= grant <= 1.25 * elapsed_since_success
                         ):
                             # Lead-clamping server: the grant mirrors elapsed
                             # time, not lease size — no cadence signal exists
                             # on the wire. Hold a bounded cadence; never
                             # tighten toward the floor (that would burn the
-                            # max_extensions budget in seconds).
+                            # max_extensions budget in seconds). The lower
+                            # band keeps this non-sticky: a real small grant
+                            # seen across a skip-doubled gap lands here once,
+                            # but at the held cadence its grant/elapsed ratio
+                            # falls below 0.75 and cadence re-tightens.
                             delay_ms = held_delay_ms
                             if not clamp_warned:
                                 clamp_warned = True
@@ -765,13 +770,18 @@ class AsyncStreamReservation:
                             grants_sum += grant
                             last_grant = grant
                             if grant <= 0 or (
-                                grant < 0.9 * ttl_ms and grant <= 1.25 * elapsed_since_success
+                                grant < 0.9 * ttl_ms
+                                and 0.75 * elapsed_since_success <= grant <= 1.25 * elapsed_since_success
                             ):
                                 # Lead-clamping server: the grant mirrors elapsed
                                 # time, not lease size — no cadence signal exists
                                 # on the wire. Hold a bounded cadence; never
                                 # tighten toward the floor (that would burn the
-                                # max_extensions budget in seconds).
+                                # max_extensions budget in seconds). The lower
+                                # band keeps this non-sticky: a real small grant
+                                # seen across a skip-doubled gap lands here once,
+                                # but at the held cadence its grant/elapsed ratio
+                                # falls below 0.75 and cadence re-tightens.
                                 delay_ms = held_delay_ms
                                 if not clamp_warned:
                                     clamp_warned = True

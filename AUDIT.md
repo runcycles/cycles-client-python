@@ -25,16 +25,18 @@ frame only, no cross-clock arithmetic); FIRST extension fires immediately
 (any bounded first delay can outlive a tenant-policy-capped lease);
 cadence splits by regime — a grant tracking the lease drives
 clamp(grant/2, 500ms, ttl/2), while a grant merely mirroring elapsed time
-(maximum-lead clamping) carries no wire cadence signal, so the loop holds
-min(ttl/2, 30s) and warns once instead of burning max_extensions at the
-floor; a transient failure on the primed beat backs off to the held
+(maximum-lead clamping: grant ≤ 0, or grant < 0.9×ttl inside a
+[0.75, 1.25]×elapsed band — the lower edge keeps a post-skip small grant
+from sticking in the hold) carries no wire cadence signal, so the loop
+holds min(ttl/2, 30s) and warns once instead of burning max_extensions at
+the floor; a transient failure on the primed beat backs off to the held
 cadence (no hot loop); skip at lead_min ≥ 1.5×last_grant; extend
 idempotency key reused on retries; permanent stop on expired/finalized/
 max-extensions/tenant-closed/not-found (and raw 404/410). The HTTP Date
 header plays no heartbeat role (RFC 9110 §6.6.1; Redis TIME vs container
 clock). Commits whose actual was defaulted from the estimate now carry
 metadata.actual_source="estimate" for audit honesty. Spec guidance:
-cycles-protocol#148. 532 tests pass at 100% coverage.
+cycles-protocol#148. 533 tests pass at 100% coverage.
 
 ## 2026-07-27 — Durable commit retries (journal + /v1/events fallback)
 
