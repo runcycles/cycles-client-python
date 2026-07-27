@@ -20,6 +20,7 @@ import json
 import logging
 import time
 from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -34,6 +35,22 @@ def default_journal_dir() -> Path:
     return Path.home() / ".runcycles" / "commit-journal"
 
 
+@lru_cache(maxsize=64)
+def _principal_digest(base_url: str, principal: str) -> str:
+    # PBKDF2 rather than a bare hash: the principal may embed a credential,
+    # and an expensive KDF makes offline recovery from a leaked directory
+    # name infeasible even for a weak user-chosen key. Parameters are fixed
+    # constants — the digest must be deterministic across processes and
+    # releases. Cached so the cost is paid once per identity per process.
+    digest = hashlib.pbkdf2_hmac(
+        "sha256",
+        principal.encode(),
+        f"runcycles-commit-journal\n{base_url}".encode(),
+        600_000,
+    )
+    return digest.hex()[:16]
+
+
 def auth_fingerprint(base_url: str, api_key: str, tenant: str | None = None) -> str:
     """Non-secret identity for one (server, principal) pair.
 
@@ -45,12 +62,11 @@ def auth_fingerprint(base_url: str, api_key: str, tenant: str | None = None) -> 
     the API key itself is the principal; rotating it then orphans pending
     records under the old fingerprint (records are plain JSON, so an
     operator can move them into the new identity directory — replay is
-    idempotent). A truncated SHA-256 is not reversible and API keys are
-    high-entropy, so the fingerprint is safe to use as a directory name.
+    idempotent). The truncated PBKDF2-HMAC-SHA256 digest is not reversible,
+    so the fingerprint is safe to use as a directory name.
     """
     principal = f"tenant\n{tenant}" if tenant else f"key\n{api_key}"
-    digest = hashlib.sha256(f"{base_url}\n{principal}".encode()).hexdigest()
-    return digest[:16]
+    return _principal_digest(base_url, principal)
 
 
 def _restrict_permissions(path: Path, mode: int) -> None:
