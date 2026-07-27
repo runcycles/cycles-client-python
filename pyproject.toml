@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "runcycles"
-version = "0.4.3"
+version = "0.5.0"
 description = "Python AI agent budget control — enforce LLM cost limits, tool permissions, and multi-tenant policies before agent actions execute."
 readme = "README.md"
 license = "Apache-2.0"

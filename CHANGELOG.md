@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog 1.1.0](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.5.0] - 2026-07-27
 
 Durable commit retries. Previously a commit that failed transiently lived only in an in-memory daemon thread (or an unreferenced asyncio task): a process exit — even a clean one — dropped it, and once the reservation's grace period elapsed the server's expiry sweep returned the reserved budget to the pool, permanently under-counting spend that had already happened. Pending commits are now journaled to disk before retry, replayed on the next run, flushed (bounded) at interpreter exit, and — when the reservation has already expired — recovered via `POST /v1/events`, the spec's post-hoc direct-debit endpoint.
 
