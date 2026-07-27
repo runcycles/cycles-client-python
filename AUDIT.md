@@ -21,14 +21,17 @@ is relative to current expiry — drifting expiry outward +ttl/2 per beat
 four heartbeats now alternate-beat extend (lead stays [ttl/2, 1.5×ttl]).
 Self-review found the first fix (alternate-beat) introduced inward-drift
 hazards (single-failure lead-0, sub-2s-ttl floor decay, RTT slippage); the
-heartbeat now runs on a clock-skew-free lead estimate from the
-authoritative expires_at_ms, derives the effective TTL from the Date
-header (tenant max_reservation_ttl_ms caps grants — default 1h), reuses
-the extend idempotency key on retries, and stops permanently on
-expired/finalized/max-extensions/tenant-closed/not-found.
+heartbeat now maintains a conservative lead LOWER BOUND (sum of grants
+measured from successive returned expires_at_ms minus monotonic elapsed
+— same server frame only), primes early, derives cadence from the
+measured grant (tenant max_reservation_ttl_ms clamps self-correct), uses
+the Date header only as a first-beat hint (RFC 9110 caveats; Redis TIME
+vs container clock), reuses the extend idempotency key on retries, and
+stops permanently on expired/finalized/max-extensions/tenant-closed/
+not-found.
 Commits whose actual was defaulted from the estimate now carry
 metadata.actual_source="estimate" for audit honesty. Spec guidance:
-cycles-protocol#148. 531 tests pass at 100% coverage.
+cycles-protocol#148. 533 tests pass at 100% coverage.
 
 ## 2026-07-27 — Durable commit retries (journal + /v1/events fallback)
 

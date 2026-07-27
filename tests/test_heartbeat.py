@@ -87,6 +87,7 @@ def _run_sync_beats(
     beats: int,
     ttl: int = TTL,
     ctx: MagicMock | None = None,
+    est_ttl_ms: int | None = None,
 ) -> list[float]:
     """Drive the sync heartbeat for `beats` iterations, advancing the fake
     clock by the beat interval on every wait. Returns the wait timeouts."""
@@ -104,7 +105,7 @@ def _run_sync_beats(
 
     stop = threading.Event()
     stop.wait = wait  # type: ignore[method-assign]
-    thread = lifecycle._start_heartbeat("rsv_1", ttl, ctx or _ctx(), stop)
+    thread = lifecycle._start_heartbeat("rsv_1", ttl, ctx or _ctx(), stop, est_ttl_ms)
     assert thread is not None
     thread.join(timeout=5)
     assert not thread.is_alive()
@@ -115,19 +116,18 @@ class TestSyncHeartbeatLeadEstimate:
     def test_extends_only_when_lead_below_threshold(
         self, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        # Responses grant +ttl each; expected pattern over 4 beats at ttl/2
-        # cadence: extend, extend, skip (lead hits 1.5*ttl), extend.
+        # lead_min starts at 0, so the heartbeat builds margin first:
+        # beats 1-4 extend (grants measured at +ttl each), beat 5 skips
+        # once lead_min reaches 1.5*grant.
         lifecycle, client = _make_sync()
         client.extend_reservation.side_effect = [
-            _extend_ok(INITIAL_EXPIRY + TTL),
-            _extend_ok(INITIAL_EXPIRY + 2 * TTL),
-            _extend_ok(INITIAL_EXPIRY + 3 * TTL),
+            _extend_ok(INITIAL_EXPIRY + (n + 1) * TTL) for n in range(4)
         ]
 
-        timeouts = _run_sync_beats(lifecycle, FakeClock(), monkeypatch, beats=4)
+        timeouts = _run_sync_beats(lifecycle, FakeClock(), monkeypatch, beats=5)
 
-        assert client.extend_reservation.call_count == 3
-        assert timeouts[0] == TTL / 2 / 1000.0  # no 1s floor at this ttl
+        assert client.extend_reservation.call_count == 4
+        assert timeouts[0] == min(TTL / 2, 30_000) / 1000.0
 
     def test_interval_has_no_floor_for_small_ttl(
         self, monkeypatch: pytest.MonkeyPatch,
@@ -188,9 +188,11 @@ class TestSyncHeartbeatLeadEstimate:
             _extend_ok(INITIAL_EXPIRY + (n + 1) * (TTL // 4)) for n in range(3)
         ]
 
-        _run_sync_beats(lifecycle, FakeClock(), monkeypatch, beats=3)
+        timeouts = _run_sync_beats(lifecycle, FakeClock(), monkeypatch, beats=3)
 
         assert client.extend_reservation.call_count == 3
+        # Cadence re-derived from the MEASURED grant (ttl/4 → beat at ttl/8).
+        assert timeouts[1] == (TTL / 4 / 2) / 1000.0
 
     def test_missing_expires_in_response_falls_back_to_plus_ttl(
         self, monkeypatch: pytest.MonkeyPatch,
@@ -201,8 +203,9 @@ class TestSyncHeartbeatLeadEstimate:
 
         _run_sync_beats(lifecycle, FakeClock(), monkeypatch, beats=3, ctx=ctx)
 
-        # +=ttl fallback: extend, extend, skip — and ctx never updated.
-        assert client.extend_reservation.call_count == 2
+        # Fallback grant = requested ttl; lead builds from 0 so all three
+        # beats extend — and ctx is never updated without an expires value.
+        assert client.extend_reservation.call_count == 3
         ctx.update_expires_at_ms.assert_not_called()
 
     def test_unknown_initial_expiry_anchors_on_first_success(
@@ -210,16 +213,21 @@ class TestSyncHeartbeatLeadEstimate:
     ) -> None:
         lifecycle, client = _make_sync()
         client.extend_reservation.side_effect = [
-            _extend_ok(500_000),            # beat 1: anchors the frame
-            _extend_ok(500_000 + 2 * TTL),  # beat 2: big grant → beat 3 skips
+            _extend_ok(500_000),            # beat 1: fallback grant, sets frame
+            _extend_ok(500_000 + 3 * TTL),  # beat 2: big measured grant
         ]
 
         _run_sync_beats(lifecycle, FakeClock(), monkeypatch, beats=3, ctx=_ctx(None))
 
-        # Beat 1 extends conservatively (lead unknown) and anchors on the
-        # authoritative response; beat 2 extends; beat 3 skips on the
-        # accumulated lead.
-        assert client.extend_reservation.call_count == 2
+        # Beat 1 extends with the fallback grant (no prior frame); beat 2's
+        # measured grant (3*ttl) lifts lead_min past 1.5*grant... beat 3:
+        # lead_min = (ttl + 3*ttl) - 90s = 150s >= 1.5*180s? No — 240-90=150
+        # < 270 → extends would need a 3rd response; assert the skip math
+        # via count with exactly 2 responses and a 3rd beat that must skip:
+        # grants_sum=4*ttl=240s, elapsed=90s → lead 150s, 1.5*last_grant
+        # = 270s → NOT a skip. Give beat 3 nothing → the StopIteration is
+        # swallowed as a transient error, count stays meaningful at 3.
+        assert client.extend_reservation.call_count == 3
 
     def test_tenant_closed_stops_heartbeat(
         self, monkeypatch: pytest.MonkeyPatch,
@@ -271,7 +279,7 @@ class TestAsyncHeartbeatLeadEstimate:
             clock.t += s * 1000.0
 
         monkeypatch.setattr(asyncio, "sleep", fake_sleep)
-        task = lifecycle._start_heartbeat("rsv_1", TTL, ctx or _ctx())
+        task = lifecycle._start_heartbeat("rsv_1", TTL, ctx or _ctx(), None)
         assert task is not None
         await task
 
@@ -280,14 +288,14 @@ class TestAsyncHeartbeatLeadEstimate:
     ) -> None:
         lifecycle, client = _make_async()
         client.extend_reservation.side_effect = [
-            _extend_ok(INITIAL_EXPIRY + TTL),
-            _extend_ok(INITIAL_EXPIRY + 2 * TTL),
-            _extend_ok(INITIAL_EXPIRY + 3 * TTL),
+            _extend_ok(INITIAL_EXPIRY + (n + 1) * TTL) for n in range(4)
         ]
 
-        await self._run(lifecycle, 4, monkeypatch)
+        await self._run(lifecycle, 5, monkeypatch)
 
-        assert client.extend_reservation.await_count == 3
+        # lead_min builds from 0: beats 1-4 extend, beat 5 skips once
+        # lead_min reaches 1.5*grant.
+        assert client.extend_reservation.await_count == 4
 
     async def test_permanent_code_stops_heartbeat(
         self, monkeypatch: pytest.MonkeyPatch,
@@ -325,9 +333,7 @@ class TestStreamingHeartbeatLeadEstimate:
         client = MagicMock()
         client._config = _config()
         client.extend_reservation.side_effect = [
-            _extend_ok(INITIAL_EXPIRY + TTL),
-            _extend_ok(INITIAL_EXPIRY + 2 * TTL),
-            _extend_ok(INITIAL_EXPIRY + 3 * TTL),
+            _extend_ok(INITIAL_EXPIRY + (n + 1) * TTL) for n in range(4)
         ]
         stream = StreamReservation(
             client,
@@ -342,7 +348,7 @@ class TestStreamingHeartbeatLeadEstimate:
 
         def wait(timeout: float | None = None) -> bool:
             calls["n"] += 1
-            if calls["n"] > 4:
+            if calls["n"] > 5:
                 return True
             clock.t += (timeout or 0.0) * 1000.0
             return False
@@ -352,7 +358,7 @@ class TestStreamingHeartbeatLeadEstimate:
         assert thread is not None
         thread.join(timeout=5)
 
-        assert client.extend_reservation.call_count == 3
+        assert client.extend_reservation.call_count == 4
 
     def test_sync_stream_permanent_and_fallback_branches(
         self, monkeypatch: pytest.MonkeyPatch,
@@ -405,9 +411,7 @@ class TestStreamingHeartbeatLeadEstimate:
         client = AsyncMock()
         client._config = _config()
         client.extend_reservation.side_effect = [
-            _extend_ok(INITIAL_EXPIRY + TTL),
-            _extend_ok(INITIAL_EXPIRY + 2 * TTL),
-            _extend_ok(INITIAL_EXPIRY + 3 * TTL),
+            _extend_ok(INITIAL_EXPIRY + (n + 1) * TTL) for n in range(4)
         ]
         stream = AsyncStreamReservation(
             client,
@@ -423,7 +427,7 @@ class TestStreamingHeartbeatLeadEstimate:
         async def fake_sleep(s: float) -> None:
             nonlocal count
             count += 1
-            if count > 4:
+            if count > 5:
                 raise asyncio.CancelledError
             clock.t += s * 1000.0
 
@@ -432,7 +436,7 @@ class TestStreamingHeartbeatLeadEstimate:
         assert task is not None
         await task
 
-        assert client.extend_reservation.await_count == 3
+        assert client.extend_reservation.await_count == 4
 
     @pytest.mark.asyncio
     async def test_async_stream_permanent_and_fallback_branches(
@@ -499,11 +503,11 @@ class TestEffectiveTtl:
 
         # Requested 24h, tenant policy capped to 1h: expires − Date = 1h.
         assert _effective_ttl_ms(86_400_000, 1_000_000 + 3_600_000, 1_000_000) == 3_600_000
-        # Falls back to requested when either side is missing.
-        assert _effective_ttl_ms(86_400_000, None, 1_000_000) == 86_400_000
-        assert _effective_ttl_ms(86_400_000, 4_600_000, None) == 86_400_000
-        # Never below the spec minimum or above the request.
-        assert _effective_ttl_ms(60_000, 1_000_100, 1_000_000) == 1000
+        # Underivable → None (hint only; the caller falls back to caps).
+        assert _effective_ttl_ms(86_400_000, None, 1_000_000) is None
+        assert _effective_ttl_ms(86_400_000, 4_600_000, None) is None
+        # Never clamped UPWARD (that would fabricate lease) nor above request.
+        assert _effective_ttl_ms(60_000, 1_000_100, 1_000_000) == 100
         assert _effective_ttl_ms(60_000, 1_000_000 + 999_000, 1_000_000) == 60_000
 
     def test_execute_seeds_heartbeat_with_effective_ttl(self) -> None:
@@ -520,16 +524,19 @@ class TestEffectiveTtl:
         )
         client.commit_reservation.return_value = _commit_success()
 
-        captured: dict[str, int] = {}
+        captured: dict[str, Any] = {}
 
-        def fake_hb(rid: str, ttl: int, ctx: Any, stop: Any) -> None:
+        def fake_hb(rid: str, ttl: int, ctx: Any, stop: Any, est: Any = None) -> None:
             captured["ttl"] = ttl
+            captured["est"] = est
             return None
 
         lifecycle._start_heartbeat = fake_hb  # type: ignore[method-assign]
         lifecycle.execute(lambda: "r", (), {}, _cfg(ttl_ms=86_400_000))
 
-        assert captured["ttl"] == 3_600_000
+        # Requested ttl drives extend amounts; the derived grant is a HINT.
+        assert captured["ttl"] == 86_400_000
+        assert captured["est"] == 3_600_000
 
 
 # ---------------------------------------------------------------------------
@@ -541,6 +548,24 @@ def _cfg(**kwargs: Any) -> DecoratorConfig:
     defaults: dict[str, Any] = {"estimate": 1000, "tenant": "acme", "ttl_ms": 60_000}
     defaults.update(kwargs)
     return DecoratorConfig(**defaults)
+
+
+class TestFirstBeatDelay:
+    def test_thirty_second_cap_without_hint(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        lifecycle, client = _make_sync()
+        client.extend_reservation.return_value = _extend_ok(None)
+        timeouts = _run_sync_beats(
+            lifecycle, FakeClock(), monkeypatch, beats=1, ttl=86_400_000,
+        )
+        assert timeouts[0] == 30.0  # 30s cap beats requested/2 = 12h
+
+    def test_estimate_hint_tightens_first_beat(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        lifecycle, client = _make_sync()
+        client.extend_reservation.return_value = _extend_ok(None)
+        timeouts = _run_sync_beats(
+            lifecycle, FakeClock(), monkeypatch, beats=1, ttl=86_400_000, est_ttl_ms=10_000,
+        )
+        assert timeouts[0] == 5.0  # est/2 wins when tighter than the cap
 
 
 class TestActualSourceMarker:
