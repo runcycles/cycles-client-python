@@ -266,6 +266,10 @@ class ReservationCreateResponse(BaseModel):
     reservation_id: str | None = None
     affected_scopes: list[str]
     expires_at_ms: int | None = None
+    # Server-authoritative remaining lease (ms) at response evaluation
+    # (spec v0.1.25.16). Optional: older servers omit it; when present the
+    # heartbeat schedules from it directly.
+    remaining_ttl_ms: int | None = None
     scope_path: str | None = None
     reserved: Amount | None = None
     caps: Caps | None = None

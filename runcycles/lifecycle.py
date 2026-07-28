@@ -220,6 +220,14 @@ _PERMANENT_EXTEND_CODES = frozenset(
 _LEAD_TARGET_FACTOR = 1.5
 
 
+def _authoritative_delay_ms(lead_floor_ms: float, rtt_max_ms: float) -> float:
+    """Next-beat delay from a server-authoritative remaining lease
+    (remaining_ttl_ms, spec v0.1.25.16): schedule inside the lease while
+    keeping a retry reserve of min(lead/2, max(1s, 2x max observed rtt))."""
+    reserve = min(lead_floor_ms / 2, max(1000.0, 2.0 * rtt_max_ms))
+    return max(0.0, lead_floor_ms - reserve)
+
+
 def _build_extend_body(ttl_ms: int) -> dict[str, Any]:
     validate_extend_by_ms(ttl_ms)
     return {"idempotency_key": str(uuid.uuid4()), "extend_by_ms": ttl_ms}
@@ -376,7 +384,9 @@ class CyclesLifecycle:
 
         # Start heartbeat
         heartbeat_stop = threading.Event()
-        heartbeat_thread = self._start_heartbeat(reservation_id, cfg.ttl_ms, ctx, heartbeat_stop)
+        heartbeat_thread = self._start_heartbeat(
+            reservation_id, cfg.ttl_ms, ctx, heartbeat_stop, res_result.remaining_ttl_ms,
+        )
 
         try:
             result = fn(*args, **kwargs)
@@ -492,7 +502,12 @@ class CyclesLifecycle:
             logger.exception("Failed to release: id=%s", reservation_id)
 
     def _start_heartbeat(
-        self, reservation_id: str, ttl_ms: int, ctx: CyclesContext, stop_event: threading.Event,
+        self,
+        reservation_id: str,
+        ttl_ms: int,
+        ctx: CyclesContext,
+        stop_event: threading.Event,
+        initial_remaining_ms: int | None = None,
     ) -> threading.Thread | None:
         if ttl_ms <= 0:
             return None
@@ -518,25 +533,41 @@ class CyclesLifecycle:
             grants_sum = 0.0
             last_grant: float | None = None
             pending_body: dict[str, Any] | None = None
-            # Immediate first extension: with lead_min starting at 0 and no
-            # trustworthy effective-TTL signal on the wire, any bounded first
-            # delay can outlive a policy-capped lease. Priming costs one
-            # extension; total protected runtime is unchanged.
-            delay_ms = 0.0
             last_success_ms = anchor_ms
             held_delay_ms = min(ttl_ms / 2, 30_000.0)
             clamp_warned = False
+            rtt_max_ms = 0.0
+            # Authoritative scheduling (spec v0.1.25.16): a response carrying
+            # remaining_ttl_ms is the server's own statement of the live
+            # lease, so the beat is scheduled from it directly. When the
+            # create response carried it, the first beat derives from it and
+            # no primed extension is spent.
+            lead_floor_ms: float | None = None
+            lead_anchor_ms = anchor_ms
+            authoritative = initial_remaining_ms is not None
+            if initial_remaining_ms is not None:
+                lead_floor_ms = float(initial_remaining_ms)
+                delay_ms = _authoritative_delay_ms(lead_floor_ms, rtt_max_ms)
+            else:
+                # Immediate first extension (fallback): with lead_min starting
+                # at 0 and no lease signal on the wire, any bounded first
+                # delay can outlive a policy-capped lease. Priming costs one
+                # extension; total protected runtime is unchanged.
+                delay_ms = 0.0
             while not stop_event.wait(timeout=delay_ms / 1000.0):
                 # After the primed (delay-0) first beat, the baseline cadence
                 # is the held delay — a transient failure must not hot-loop.
                 delay_ms = delay_ms or held_delay_ms
-                lead_min = grants_sum - (_now_mono_ms() - anchor_ms)
-                if last_grant is not None and lead_min >= _LEAD_TARGET_FACTOR * last_grant:
-                    continue
+                if not authoritative:
+                    lead_min = grants_sum - (_now_mono_ms() - anchor_ms)
+                    if last_grant is not None and lead_min >= _LEAD_TARGET_FACTOR * last_grant:
+                        continue
                 try:
                     body = pending_body if pending_body is not None else _build_extend_body(ttl_ms)
                     pending_body = body
+                    sent_ms = _now_mono_ms()
                     response = self._client.extend_reservation(reservation_id, body)
+                    recv_ms = _now_mono_ms()
                     if response.is_success:
                         pending_body = None
                         new_expires = response.get_body_attribute("expires_at_ms")
@@ -559,7 +590,18 @@ class CyclesLifecycle:
                         last_success_ms = now_ms
                         grants_sum += grant
                         last_grant = grant
-                        if grant <= 0 or (
+                        rtt_ms = recv_ms - sent_ms
+                        rtt_max_ms = max(rtt_max_ms, rtt_ms)
+                        remaining = response.get_body_attribute("remaining_ttl_ms")
+                        if remaining is not None:
+                            # Server-authoritative lease (spec v0.1.25.16):
+                            # schedule from it directly; the heuristic arms
+                            # below only serve servers that omit the field.
+                            authoritative = True
+                            lead_floor_ms = max(0.0, float(int(remaining)) - rtt_ms)
+                            lead_anchor_ms = recv_ms
+                            delay_ms = _authoritative_delay_ms(lead_floor_ms, rtt_max_ms)
+                        elif grant <= 0 or (
                             grant < 0.9 * ttl_ms
                             and 0.75 * elapsed_since_success <= grant <= 1.25 * elapsed_since_success
                         ):
@@ -572,6 +614,7 @@ class CyclesLifecycle:
                             # seen across a skip-doubled gap lands here once,
                             # but at the held cadence its grant/elapsed ratio
                             # falls below 0.75 and cadence re-tightens.
+                            authoritative = False
                             delay_ms = held_delay_ms
                             if not clamp_warned:
                                 clamp_warned = True
@@ -580,6 +623,7 @@ class CyclesLifecycle:
                                     reservation_id,
                                 )
                         else:
+                            authoritative = False
                             delay_ms = min(max(grant / 2, 500.0), ttl_ms / 2)
                         logger.debug("Heartbeat extend ok: id=%s", reservation_id)
                     else:
@@ -591,8 +635,22 @@ class CyclesLifecycle:
                             )
                             return
                         logger.warning("Heartbeat extend failed: id=%s, status=%d", reservation_id, response.status)
+                        if authoritative and lead_floor_ms is not None:
+                            # Retry inside the known lease: the failed extend may
+                            # have been applied server-side, so the SAME body (same
+                            # idempotency key) is retried at a bounded fraction of
+                            # the remaining lead.
+                            lead_now = max(0.0, lead_floor_ms - (_now_mono_ms() - lead_anchor_ms))
+                            delay_ms = min(max(lead_now / 4, 1000.0), 30_000.0)
                 except Exception:
                     logger.warning("Heartbeat extend error: id=%s", reservation_id, exc_info=True)
+                    if authoritative and lead_floor_ms is not None:
+                        # Retry inside the known lease: the failed extend may
+                        # have been applied server-side, so the SAME body (same
+                        # idempotency key) is retried at a bounded fraction of
+                        # the remaining lead.
+                        lead_now = max(0.0, lead_floor_ms - (_now_mono_ms() - lead_anchor_ms))
+                        delay_ms = min(max(lead_now / 4, 1000.0), 30_000.0)
 
         t = threading.Thread(target=heartbeat_loop, daemon=True, name=f"cycles-heartbeat-{reservation_id[:12]}")
         t.start()
@@ -668,7 +726,9 @@ class AsyncCyclesLifecycle:
         )
         _set_context(ctx)
 
-        heartbeat_task = self._start_heartbeat(reservation_id, cfg.ttl_ms, ctx)
+        heartbeat_task = self._start_heartbeat(
+            reservation_id, cfg.ttl_ms, ctx, res_result.remaining_ttl_ms,
+        )
 
         try:
             result = await fn(*args, **kwargs)
@@ -780,7 +840,11 @@ class AsyncCyclesLifecycle:
             logger.exception("Failed to release: id=%s", reservation_id)
 
     def _start_heartbeat(
-        self, reservation_id: str, ttl_ms: int, ctx: CyclesContext,
+        self,
+        reservation_id: str,
+        ttl_ms: int,
+        ctx: CyclesContext,
+        initial_remaining_ms: int | None = None,
     ) -> asyncio.Task[None] | None:
         if ttl_ms <= 0:
             return None
@@ -792,14 +856,27 @@ class AsyncCyclesLifecycle:
             grants_sum = 0.0
             last_grant: float | None = None
             pending_body: dict[str, Any] | None = None
-            # Immediate first extension: with lead_min starting at 0 and no
-            # trustworthy effective-TTL signal on the wire, any bounded first
-            # delay can outlive a policy-capped lease. Priming costs one
-            # extension; total protected runtime is unchanged.
-            delay_ms = 0.0
             last_success_ms = anchor_ms
             held_delay_ms = min(ttl_ms / 2, 30_000.0)
             clamp_warned = False
+            rtt_max_ms = 0.0
+            # Authoritative scheduling (spec v0.1.25.16): a response carrying
+            # remaining_ttl_ms is the server's own statement of the live
+            # lease, so the beat is scheduled from it directly. When the
+            # create response carried it, the first beat derives from it and
+            # no primed extension is spent.
+            lead_floor_ms: float | None = None
+            lead_anchor_ms = anchor_ms
+            authoritative = initial_remaining_ms is not None
+            if initial_remaining_ms is not None:
+                lead_floor_ms = float(initial_remaining_ms)
+                delay_ms = _authoritative_delay_ms(lead_floor_ms, rtt_max_ms)
+            else:
+                # Immediate first extension (fallback): with lead_min starting
+                # at 0 and no lease signal on the wire, any bounded first
+                # delay can outlive a policy-capped lease. Priming costs one
+                # extension; total protected runtime is unchanged.
+                delay_ms = 0.0
             try:
                 while True:
                     await asyncio.sleep(delay_ms / 1000.0)
@@ -807,13 +884,16 @@ class AsyncCyclesLifecycle:
                     # cadence is the held delay — a transient failure must
                     # not hot-loop.
                     delay_ms = delay_ms or held_delay_ms
-                    lead_min = grants_sum - (_now_mono_ms() - anchor_ms)
-                    if last_grant is not None and lead_min >= _LEAD_TARGET_FACTOR * last_grant:
-                        continue
+                    if not authoritative:
+                        lead_min = grants_sum - (_now_mono_ms() - anchor_ms)
+                        if last_grant is not None and lead_min >= _LEAD_TARGET_FACTOR * last_grant:
+                            continue
                     try:
                         body = pending_body if pending_body is not None else _build_extend_body(ttl_ms)
                         pending_body = body
+                        sent_ms = _now_mono_ms()
                         response = await self._client.extend_reservation(reservation_id, body)
+                        recv_ms = _now_mono_ms()
                         if response.is_success:
                             pending_body = None
                             new_expires = response.get_body_attribute("expires_at_ms")
@@ -836,7 +916,18 @@ class AsyncCyclesLifecycle:
                             last_success_ms = now_ms
                             grants_sum += grant
                             last_grant = grant
-                            if grant <= 0 or (
+                            rtt_ms = recv_ms - sent_ms
+                            rtt_max_ms = max(rtt_max_ms, rtt_ms)
+                            remaining = response.get_body_attribute("remaining_ttl_ms")
+                            if remaining is not None:
+                                # Server-authoritative lease (spec v0.1.25.16):
+                                # schedule from it directly; the heuristic arms
+                                # below only serve servers that omit the field.
+                                authoritative = True
+                                lead_floor_ms = max(0.0, float(int(remaining)) - rtt_ms)
+                                lead_anchor_ms = recv_ms
+                                delay_ms = _authoritative_delay_ms(lead_floor_ms, rtt_max_ms)
+                            elif grant <= 0 or (
                                 grant < 0.9 * ttl_ms
                                 and 0.75 * elapsed_since_success <= grant <= 1.25 * elapsed_since_success
                             ):
@@ -849,6 +940,7 @@ class AsyncCyclesLifecycle:
                                 # seen across a skip-doubled gap lands here once,
                                 # but at the held cadence its grant/elapsed ratio
                                 # falls below 0.75 and cadence re-tightens.
+                                authoritative = False
                                 delay_ms = held_delay_ms
                                 if not clamp_warned:
                                     clamp_warned = True
@@ -857,6 +949,7 @@ class AsyncCyclesLifecycle:
                                         reservation_id,
                                     )
                             else:
+                                authoritative = False
                                 delay_ms = min(max(grant / 2, 500.0), ttl_ms / 2)
                         else:
                             code = _extract_error_code(response)
@@ -867,8 +960,22 @@ class AsyncCyclesLifecycle:
                                 )
                                 return
                             logger.warning("Heartbeat extend failed: id=%s", reservation_id)
+                            if authoritative and lead_floor_ms is not None:
+                                # Retry inside the known lease: the failed extend may
+                                # have been applied server-side, so the SAME body (same
+                                # idempotency key) is retried at a bounded fraction of
+                                # the remaining lead.
+                                lead_now = max(0.0, lead_floor_ms - (_now_mono_ms() - lead_anchor_ms))
+                                delay_ms = min(max(lead_now / 4, 1000.0), 30_000.0)
                     except Exception:
                         logger.warning("Heartbeat extend error: id=%s", reservation_id, exc_info=True)
+                        if authoritative and lead_floor_ms is not None:
+                            # Retry inside the known lease: the failed extend may
+                            # have been applied server-side, so the SAME body (same
+                            # idempotency key) is retried at a bounded fraction of
+                            # the remaining lead.
+                            lead_now = max(0.0, lead_floor_ms - (_now_mono_ms() - lead_anchor_ms))
+                            delay_ms = min(max(lead_now / 4, 1000.0), 30_000.0)
             except asyncio.CancelledError:
                 return
 
