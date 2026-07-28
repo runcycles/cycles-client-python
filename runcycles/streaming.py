@@ -25,6 +25,12 @@ from runcycles.lifecycle import (
     _build_extend_body,
     _build_protocol_exception,
     _build_release_body,
+    _create_reservation_with_recovery,
+    _create_reservation_with_recovery_async,
+    _remaining_at_schedule_start,
+    _run_async_attempt,
+    _run_sync_attempt,
+    _schema_valid_extend,
     _timeout_budget_ms,
 )
 from runcycles.models import (
@@ -33,7 +39,6 @@ from runcycles.models import (
     Caps,
     CyclesMetrics,
     Decision,
-    ReservationCreateResponse,
     Subject,
 )
 from runcycles.retry import (
@@ -181,6 +186,7 @@ class StreamReservation:
         self._reservation_id: str | None = None
         self._initial_remaining: int | None = None
         self._create_rtt: float | None = None
+        self._create_received_ms: float | None = None
         self._caps: Caps | None = None
         self._decision: Decision = Decision.ALLOW
         self._ctx: CyclesContext | None = None
@@ -220,14 +226,10 @@ class StreamReservation:
             self._grace_period_ms,
         )
 
-        _create_sent_ms = _lifecycle._now_mono_ms()
-        response = self._client.create_reservation(body)
-        _create_rtt_ms = _lifecycle._now_mono_ms() - _create_sent_ms
-
-        if not response.is_success:
-            raise _build_protocol_exception("Failed to create reservation", response)
-
-        result = ReservationCreateResponse.model_validate(response.body)
+        response, result, _create_rtt_ms, _create_received_ms = _create_reservation_with_recovery(
+            self._client,
+            body,
+        )
 
         if result.decision == Decision.DENY:
             raise _build_protocol_exception("Reservation denied", response)
@@ -241,6 +243,7 @@ class StreamReservation:
         self._reservation_id = result.reservation_id
         self._initial_remaining = result.remaining_ttl_ms
         self._create_rtt = _create_rtt_ms
+        self._create_received_ms = _create_received_ms
         self._decision = result.decision
         self._caps = result.caps
 
@@ -290,9 +293,7 @@ class StreamReservation:
 
     def _handle_commit(self) -> None:
         elapsed_ms = int((time.monotonic() - self._start_time) * 1000)
-        actual, actual_from_estimate = _resolve_actual_cost(
-            self._usage, self._cost_fn, self._estimate.amount
-        )
+        actual, actual_from_estimate = _resolve_actual_cost(self._usage, self._cost_fn, self._estimate.amount)
         ctx_metrics = self._ctx.metrics if self._ctx else None
         metrics = _build_stream_metrics(self._usage, elapsed_ms, ctx_metrics)
         unit = self._estimate.unit if isinstance(self._estimate.unit, str) else self._estimate.unit.value
@@ -327,7 +328,9 @@ class StreamReservation:
                     # honoring the server's Retry-After.
                     logger.warning("Stream commit rate-limited; scheduling retry: id=%s", self._reservation_id)
                     self._retry_engine.schedule(
-                        self._reservation_id, commit_body, event_fallback,
+                        self._reservation_id,
+                        commit_body,
+                        event_fallback,
                         retry_after_ms=response.retry_after_ms_header,
                     )
                 elif response.status in (401, 403):
@@ -336,7 +339,8 @@ class StreamReservation:
                     # that would return budget for real spend.
                     logger.error(
                         "Stream commit got authentication failure (status=%d); journaling for replay: id=%s",
-                        response.status, self._reservation_id,
+                        response.status,
+                        self._reservation_id,
                     )
                     self._retry_engine.schedule(self._reservation_id, commit_body, event_fallback)
                 elif response.status == 410 or error_code == "RESERVATION_EXPIRED":
@@ -357,7 +361,9 @@ class StreamReservation:
                     logger.error(
                         "Stream commit got unclassifiable client error (status=%d, error=%s); "
                         "journaling for replay: id=%s",
-                        response.status, error_code, self._reservation_id,
+                        response.status,
+                        error_code,
+                        self._reservation_id,
                     )
                     self._retry_engine.schedule(self._reservation_id, commit_body, event_fallback)
                 else:
@@ -395,6 +401,7 @@ class StreamReservation:
             pending_body: dict[str, Any] | None = None
             initial_remaining_ms = self._initial_remaining
             initial_rtt_ms = self._create_rtt
+            initial_received_ms = self._create_received_ms
             last_success_ms = anchor_ms
             held_delay_ms = min(ttl_ms / 2, 30_000.0)
             clamp_warned = False
@@ -402,11 +409,21 @@ class StreamReservation:
             # a schema-valid 200 carrying remaining_ttl_ms drives scheduling
             # exactly; the measured-grant heuristic below is the
             # NON-NORMATIVE fallback for servers that omit the field.
-            sched = _AuthoritativeScheduler(_timeout_budget_ms(self._client._config))
+            timeout_budget_ms = _timeout_budget_ms(self._client._config)
+            sched = _AuthoritativeScheduler(timeout_budget_ms)
+            if initial_rtt_ms is not None:
+                sched.observe_rtt(initial_rtt_ms)
             authoritative = initial_remaining_ms is not None
             if initial_remaining_ms is not None:
+                remaining_at_start = _remaining_at_schedule_start(
+                    initial_remaining_ms,
+                    initial_received_ms,
+                    anchor_ms,
+                )
                 first_delay = sched.on_valid_success(
-                    initial_remaining_ms, initial_rtt_ms or 0.0, anchor_ms,
+                    remaining_at_start,
+                    initial_rtt_ms or 0.0,
+                    anchor_ms,
                 )
                 # Unreachable on the first scheduler call (the zero-delay
                 # streak cannot be exhausted yet); kept as a typed guard.
@@ -438,40 +455,36 @@ class StreamReservation:
                     body = pending_body if pending_body is not None else _build_extend_body(ttl_ms)
                     pending_body = body
                     sent_ms = _lifecycle._now_mono_ms()
-                    response = self._client.extend_reservation(reservation_id, body)
+                    response = _run_sync_attempt(
+                        lambda: self._client.extend_reservation(reservation_id, body),
+                        timeout_budget_ms,
+                    )
+                    parsed_extend = _schema_valid_extend(response)
                     recv_ms = _lifecycle._now_mono_ms()
-                    if response.is_success and authoritative and response.status != 200:
-                        # Ambiguous non-200 2xx in authoritative mode: NOT an
-                        # observed success (spec) — same-key recovery.
+                    if response.is_success and parsed_extend is None:
                         logger.warning(
-                            "Heartbeat ambiguous 2xx (status=%d): id=%s",
-                            response.status, reservation_id,
+                            "Heartbeat ambiguous response (status=%d): id=%s",
+                            response.status,
+                            reservation_id,
                         )
-                        nxt = sched.on_transient_failure(_lifecycle._now_mono_ms())
-                        if nxt is None:
-                            logger.warning(
-                                "Heartbeat stopping: no safe recovery window remains: id=%s",
-                                reservation_id,
-                            )
-                            return
-                        delay_ms = nxt
-                    elif response.is_success:
-                        pending_body = None
-                        new_expires = response.get_body_attribute("expires_at_ms")
-                        if new_expires is not None:
-                            new_expires = int(new_expires)
-                            if ctx is not None:
-                                ctx.update_expires_at_ms(new_expires)
-                            grant = (
-                                float(new_expires - prev_expiry)
-                                if prev_expiry is not None
-                                else float(ttl_ms)
-                            )
-                            prev_expiry = new_expires
+                        if authoritative:
+                            nxt = sched.on_transient_failure(_lifecycle._now_mono_ms())
+                            if nxt is None:
+                                logger.warning(
+                                    "Heartbeat stopping: no safe recovery window remains: id=%s",
+                                    reservation_id,
+                                )
+                                return
+                            delay_ms = nxt
                         else:
-                            grant = float(ttl_ms)
-                            if prev_expiry is not None:
-                                prev_expiry += ttl_ms
+                            delay_ms = held_delay_ms
+                    elif parsed_extend is not None:
+                        pending_body = None
+                        new_expires = parsed_extend.expires_at_ms
+                        if ctx is not None:
+                            ctx.update_expires_at_ms(new_expires)
+                        grant = float(new_expires - prev_expiry) if prev_expiry is not None else float(ttl_ms)
+                        prev_expiry = new_expires
                         grant = max(grant, 0.0)
                         now_ms = _lifecycle._now_mono_ms()
                         elapsed_since_success = now_ms - last_success_ms
@@ -479,14 +492,15 @@ class StreamReservation:
                         grants_sum += grant
                         last_grant = grant
                         rtt_ms = recv_ms - sent_ms
-                        remaining = response.get_body_attribute("remaining_ttl_ms")
-                        if response.status == 200 and remaining is not None:
+                        sched.observe_rtt(rtt_ms)
+                        remaining = parsed_extend.remaining_ttl_ms
+                        if remaining is not None:
                             # Server-authoritative lease (spec v0.1.25.16
                             # PRIMARY ALGORITHM): schedule from this response
                             # alone; the heuristic arms below only serve
                             # servers that omit the field.
                             authoritative = True
-                            nxt = sched.on_valid_success(int(remaining), rtt_ms, recv_ms)
+                            nxt = sched.on_valid_success(remaining, rtt_ms, recv_ms)
                             if nxt is None:
                                 logger.warning(
                                     "Heartbeat stopping: lease shorter than the retry-safety budget: id=%s",
@@ -523,23 +537,36 @@ class StreamReservation:
                         if response.status in (404, 410) or code in _PERMANENT_EXTEND_CODES:
                             logger.warning(
                                 "Stream heartbeat stopping permanently (%s, status=%d): id=%s",
-                                code, response.status, reservation_id,
+                                code,
+                                response.status,
+                                reservation_id,
                             )
                             return
                         logger.warning("Stream heartbeat failed: id=%s", reservation_id)
                         if authoritative:
-                            rate_limited = response.status == 429 or code == "LIMIT_EXCEEDED"
+                            rate_limited = response.status == 429
                             if not rate_limited and 400 <= response.status < 500:
                                 # Unrecoverable request/auth failure (spec): never
                                 # rotate the key on an unchanged request.
                                 logger.warning(
                                     "Heartbeat stopping on client error (%s, status=%d): id=%s",
-                                    code, response.status, reservation_id,
+                                    code,
+                                    response.status,
+                                    reservation_id,
+                                )
+                                return
+                            if not _lifecycle._extend_error_is_recoverable(response):
+                                logger.warning(
+                                    "Heartbeat stopping on unexpected HTTP status %d: id=%s",
+                                    response.status,
+                                    reservation_id,
                                 )
                                 return
                             retry_after = response.retry_after_ms_header if rate_limited else None
                             nxt = sched.on_transient_failure(
-                                _lifecycle._now_mono_ms(), rate_limited=rate_limited, retry_after_ms=retry_after,
+                                _lifecycle._now_mono_ms(),
+                                rate_limited=rate_limited,
+                                retry_after_ms=retry_after,
                             )
                             if nxt is None:
                                 logger.warning(
@@ -612,6 +639,7 @@ class AsyncStreamReservation:
         self._reservation_id: str | None = None
         self._initial_remaining: int | None = None
         self._create_rtt: float | None = None
+        self._create_received_ms: float | None = None
         self._caps: Caps | None = None
         self._decision: Decision = Decision.ALLOW
         self._ctx: CyclesContext | None = None
@@ -650,14 +678,9 @@ class AsyncStreamReservation:
             self._grace_period_ms,
         )
 
-        _create_sent_ms = _lifecycle._now_mono_ms()
-        response = await self._client.create_reservation(body)
-        _create_rtt_ms = _lifecycle._now_mono_ms() - _create_sent_ms
-
-        if not response.is_success:
-            raise _build_protocol_exception("Failed to create reservation", response)
-
-        result = ReservationCreateResponse.model_validate(response.body)
+        response, result, _create_rtt_ms, _create_received_ms = await _create_reservation_with_recovery_async(
+            self._client, body
+        )
 
         if result.decision == Decision.DENY:
             raise _build_protocol_exception("Reservation denied", response)
@@ -671,6 +694,7 @@ class AsyncStreamReservation:
         self._reservation_id = result.reservation_id
         self._initial_remaining = result.remaining_ttl_ms
         self._create_rtt = _create_rtt_ms
+        self._create_received_ms = _create_received_ms
         self._decision = result.decision
         self._caps = result.caps
 
@@ -723,9 +747,7 @@ class AsyncStreamReservation:
 
     async def _handle_commit(self) -> None:
         elapsed_ms = int((time.monotonic() - self._start_time) * 1000)
-        actual, actual_from_estimate = _resolve_actual_cost(
-            self._usage, self._cost_fn, self._estimate.amount
-        )
+        actual, actual_from_estimate = _resolve_actual_cost(self._usage, self._cost_fn, self._estimate.amount)
         ctx_metrics = self._ctx.metrics if self._ctx else None
         metrics = _build_stream_metrics(self._usage, elapsed_ms, ctx_metrics)
         unit = self._estimate.unit if isinstance(self._estimate.unit, str) else self._estimate.unit.value
@@ -758,11 +780,11 @@ class AsyncStreamReservation:
                     # Rate-limited, not rejected: releasing here would return
                     # budget for spend that already happened. Retry instead,
                     # honoring the server's Retry-After.
-                    logger.warning(
-                        "Async stream commit rate-limited; scheduling retry: id=%s", self._reservation_id
-                    )
+                    logger.warning("Async stream commit rate-limited; scheduling retry: id=%s", self._reservation_id)
                     self._retry_engine.schedule(
-                        self._reservation_id, commit_body, event_fallback,
+                        self._reservation_id,
+                        commit_body,
+                        event_fallback,
                         retry_after_ms=response.retry_after_ms_header,
                     )
                 elif response.status in (401, 403):
@@ -771,7 +793,8 @@ class AsyncStreamReservation:
                     # that would return budget for real spend.
                     logger.error(
                         "Stream commit got authentication failure (status=%d); journaling for replay: id=%s",
-                        response.status, self._reservation_id,
+                        response.status,
+                        self._reservation_id,
                     )
                     self._retry_engine.schedule(self._reservation_id, commit_body, event_fallback)
                 elif response.status == 410 or error_code == "RESERVATION_EXPIRED":
@@ -792,7 +815,9 @@ class AsyncStreamReservation:
                     logger.error(
                         "Async stream commit got unclassifiable client error (status=%d, error=%s); "
                         "journaling for replay: id=%s",
-                        response.status, error_code, self._reservation_id,
+                        response.status,
+                        error_code,
+                        self._reservation_id,
                     )
                     self._retry_engine.schedule(self._reservation_id, commit_body, event_fallback)
                 else:
@@ -831,6 +856,7 @@ class AsyncStreamReservation:
             pending_body: dict[str, Any] | None = None
             initial_remaining_ms = self._initial_remaining
             initial_rtt_ms = self._create_rtt
+            initial_received_ms = self._create_received_ms
             last_success_ms = anchor_ms
             held_delay_ms = min(ttl_ms / 2, 30_000.0)
             clamp_warned = False
@@ -838,11 +864,21 @@ class AsyncStreamReservation:
             # a schema-valid 200 carrying remaining_ttl_ms drives scheduling
             # exactly; the measured-grant heuristic below is the
             # NON-NORMATIVE fallback for servers that omit the field.
-            sched = _AuthoritativeScheduler(_timeout_budget_ms(self._client._config))
+            timeout_budget_ms = _timeout_budget_ms(self._client._config)
+            sched = _AuthoritativeScheduler(timeout_budget_ms)
+            if initial_rtt_ms is not None:
+                sched.observe_rtt(initial_rtt_ms)
             authoritative = initial_remaining_ms is not None
             if initial_remaining_ms is not None:
+                remaining_at_start = _remaining_at_schedule_start(
+                    initial_remaining_ms,
+                    initial_received_ms,
+                    anchor_ms,
+                )
                 first_delay = sched.on_valid_success(
-                    initial_remaining_ms, initial_rtt_ms or 0.0, anchor_ms,
+                    remaining_at_start,
+                    initial_rtt_ms or 0.0,
+                    anchor_ms,
                 )
                 # Unreachable on the first scheduler call (the zero-delay
                 # streak cannot be exhausted yet); kept as a typed guard.
@@ -877,40 +913,36 @@ class AsyncStreamReservation:
                         body = pending_body if pending_body is not None else _build_extend_body(ttl_ms)
                         pending_body = body
                         sent_ms = _lifecycle._now_mono_ms()
-                        response = await client.extend_reservation(reservation_id, body)
+                        response = await _run_async_attempt(
+                            lambda: client.extend_reservation(reservation_id, body),
+                            timeout_budget_ms,
+                        )
+                        parsed_extend = _schema_valid_extend(response)
                         recv_ms = _lifecycle._now_mono_ms()
-                        if response.is_success and authoritative and response.status != 200:
-                            # Ambiguous non-200 2xx in authoritative mode: NOT an
-                            # observed success (spec) — same-key recovery.
+                        if response.is_success and parsed_extend is None:
                             logger.warning(
-                                "Heartbeat ambiguous 2xx (status=%d): id=%s",
-                                response.status, reservation_id,
+                                "Heartbeat ambiguous response (status=%d): id=%s",
+                                response.status,
+                                reservation_id,
                             )
-                            nxt = sched.on_transient_failure(_lifecycle._now_mono_ms())
-                            if nxt is None:
-                                logger.warning(
-                                    "Heartbeat stopping: no safe recovery window remains: id=%s",
-                                    reservation_id,
-                                )
-                                return
-                            delay_ms = nxt
-                        elif response.is_success:
-                            pending_body = None
-                            new_expires = response.get_body_attribute("expires_at_ms")
-                            if new_expires is not None:
-                                new_expires = int(new_expires)
-                                if ctx is not None:
-                                    ctx.update_expires_at_ms(new_expires)
-                                grant = (
-                                    float(new_expires - prev_expiry)
-                                    if prev_expiry is not None
-                                    else float(ttl_ms)
-                                )
-                                prev_expiry = new_expires
+                            if authoritative:
+                                nxt = sched.on_transient_failure(_lifecycle._now_mono_ms())
+                                if nxt is None:
+                                    logger.warning(
+                                        "Heartbeat stopping: no safe recovery window remains: id=%s",
+                                        reservation_id,
+                                    )
+                                    return
+                                delay_ms = nxt
                             else:
-                                grant = float(ttl_ms)
-                                if prev_expiry is not None:
-                                    prev_expiry += ttl_ms
+                                delay_ms = held_delay_ms
+                        elif parsed_extend is not None:
+                            pending_body = None
+                            new_expires = parsed_extend.expires_at_ms
+                            if ctx is not None:
+                                ctx.update_expires_at_ms(new_expires)
+                            grant = float(new_expires - prev_expiry) if prev_expiry is not None else float(ttl_ms)
+                            prev_expiry = new_expires
                             grant = max(grant, 0.0)
                             now_ms = _lifecycle._now_mono_ms()
                             elapsed_since_success = now_ms - last_success_ms
@@ -918,14 +950,15 @@ class AsyncStreamReservation:
                             grants_sum += grant
                             last_grant = grant
                             rtt_ms = recv_ms - sent_ms
-                            remaining = response.get_body_attribute("remaining_ttl_ms")
-                            if response.status == 200 and remaining is not None:
+                            sched.observe_rtt(rtt_ms)
+                            remaining = parsed_extend.remaining_ttl_ms
+                            if remaining is not None:
                                 # Server-authoritative lease (spec v0.1.25.16
                                 # PRIMARY ALGORITHM): schedule from this response
                                 # alone; the heuristic arms below only serve
                                 # servers that omit the field.
                                 authoritative = True
-                                nxt = sched.on_valid_success(int(remaining), rtt_ms, recv_ms)
+                                nxt = sched.on_valid_success(remaining, rtt_ms, recv_ms)
                                 if nxt is None:
                                     logger.warning(
                                         "Heartbeat stopping: lease shorter than the retry-safety budget: id=%s",
@@ -962,23 +995,36 @@ class AsyncStreamReservation:
                             if response.status in (404, 410) or code in _PERMANENT_EXTEND_CODES:
                                 logger.warning(
                                     "Async stream heartbeat stopping permanently (%s, status=%d): id=%s",
-                                    code, response.status, reservation_id,
+                                    code,
+                                    response.status,
+                                    reservation_id,
                                 )
                                 return
                             logger.warning("Async stream heartbeat failed: id=%s", reservation_id)
                             if authoritative:
-                                rate_limited = response.status == 429 or code == "LIMIT_EXCEEDED"
+                                rate_limited = response.status == 429
                                 if not rate_limited and 400 <= response.status < 500:
                                     # Unrecoverable request/auth failure (spec): never
                                     # rotate the key on an unchanged request.
                                     logger.warning(
                                         "Heartbeat stopping on client error (%s, status=%d): id=%s",
-                                        code, response.status, reservation_id,
+                                        code,
+                                        response.status,
+                                        reservation_id,
+                                    )
+                                    return
+                                if not _lifecycle._extend_error_is_recoverable(response):
+                                    logger.warning(
+                                        "Heartbeat stopping on unexpected HTTP status %d: id=%s",
+                                        response.status,
+                                        reservation_id,
                                     )
                                     return
                                 retry_after = response.retry_after_ms_header if rate_limited else None
                                 nxt = sched.on_transient_failure(
-                                    _lifecycle._now_mono_ms(), rate_limited=rate_limited, retry_after_ms=retry_after,
+                                    _lifecycle._now_mono_ms(),
+                                    rate_limited=rate_limited,
+                                    retry_after_ms=retry_after,
                                 )
                                 if nxt is None:
                                     logger.warning(

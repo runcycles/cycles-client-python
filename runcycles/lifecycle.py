@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import math
+import queue
 import threading
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -34,6 +37,7 @@ from runcycles.models import (
     Decision,
     DryRunResult,
     ReservationCreateResponse,
+    ReservationExtendResponse,
     Subject,
 )
 from runcycles.response import CyclesResponse
@@ -155,7 +159,10 @@ def _build_reservation_body(
 
 
 def _build_commit_body(
-    actual: int, unit: str, metrics: CyclesMetrics | None, metadata: dict[str, Any] | None,
+    actual: int,
+    unit: str,
+    metrics: CyclesMetrics | None,
+    metadata: dict[str, Any] | None,
 ) -> dict[str, Any]:
     body: dict[str, Any] = {
         "idempotency_key": str(uuid.uuid4()),
@@ -169,7 +176,10 @@ def _build_commit_body(
 
 
 def _build_event_fallback_body(
-    reservation_id: str, subject: dict[str, Any], action: dict[str, Any], commit_body: dict[str, Any],
+    reservation_id: str,
+    subject: dict[str, Any],
+    action: dict[str, Any],
+    commit_body: dict[str, Any],
 ) -> dict[str, Any]:
     """Build a POST /v1/events body that records the spend of a commit whose
     reservation expired before the commit landed (the server has already
@@ -221,11 +231,225 @@ _LEAD_TARGET_FACTOR = 1.5
 
 
 def _timeout_budget_ms(config: Any) -> float:
-    """The client's enforced upper bound for one complete extend attempt in
-    ms (connect + read + the fixed 5s write timeout) — the spec's
-    request_timeout_budget. The SDK always enforces finite httpx timeouts,
-    so the unknown/unbounded-timeout arm of the spec never applies here."""
-    return (float(config.connect_timeout) + float(config.read_timeout) + 5.0) * 1000.0
+    """Outer deadline enforced around one complete create/extend attempt.
+
+    HTTPX's connect/read/write/pool settings are phase or inactivity
+    timeouts, not a whole-request deadline. The lifecycle therefore wraps
+    each lease-bearing attempt in this total deadline. Pool acquisition and
+    response-body parsing are inside the same bound.
+    """
+    parts = (float(config.connect_timeout), float(config.read_timeout), 5.0)
+    if any(not math.isfinite(part) or part <= 0 for part in parts):
+        return math.inf
+    return sum(parts) * 1000.0
+
+
+def _remaining_at_schedule_start(
+    remaining_ms: int,
+    received_ms: float | None,
+    now_ms: float,
+) -> int:
+    """Deduct local setup time elapsed after the create response arrived."""
+    if received_ms is None:
+        return remaining_ms
+    elapsed_ms = now_ms - received_ms
+    if not math.isfinite(elapsed_ms) or elapsed_ms < 0:
+        return 0
+    return max(0, math.floor(remaining_ms - elapsed_ms))
+
+
+def _run_sync_attempt(call: Callable[[], CyclesResponse], timeout_budget_ms: float) -> CyclesResponse:
+    """Run one synchronous HTTP attempt under a real whole-attempt deadline.
+
+    HTTPX cannot impose a total deadline over all pool/connect/write/read
+    phases. A daemon worker lets the heartbeat regain control at the
+    configured deadline. A timed-out request may still finish in the
+    background, which is why every recovery reuses the same idempotency key.
+    """
+    if not math.isfinite(timeout_budget_ms):
+        return call()
+
+    result: queue.Queue[tuple[bool, CyclesResponse | Exception]] = queue.Queue(maxsize=1)
+
+    def invoke() -> None:
+        try:
+            result.put((True, call()))
+        except Exception as exc:  # propagate the original client failure
+            result.put((False, exc))
+
+    worker = threading.Thread(target=invoke, daemon=True, name="cycles-http-attempt")
+    worker.start()
+    worker.join(timeout_budget_ms / 1000.0)
+    if worker.is_alive():
+        raise TimeoutError(f"Cycles HTTP attempt exceeded {timeout_budget_ms:g}ms")
+    ok, value = result.get_nowait()
+    if ok:
+        return value  # type: ignore[return-value]
+    raise value  # type: ignore[misc]
+
+
+async def _run_async_attempt(
+    call: Callable[[], Awaitable[CyclesResponse]],
+    timeout_budget_ms: float,
+) -> CyclesResponse:
+    """Run one asynchronous HTTP attempt under a whole-attempt deadline."""
+    if not math.isfinite(timeout_budget_ms):
+        return await call()
+    return await asyncio.wait_for(call(), timeout=timeout_budget_ms / 1000.0)
+
+
+_CREATE_RESPONSE_FIELDS = frozenset(
+    {
+        "decision",
+        "reservation_id",
+        "affected_scopes",
+        "expires_at_ms",
+        "remaining_ttl_ms",
+        "scope_path",
+        "reserved",
+        "caps",
+        "reason_code",
+        "retry_after_ms",
+        "balances",
+        "cycles_evidence",
+    }
+)
+
+
+def _contains_json_null(value: Any) -> bool:
+    """Whether a lease response contains an OpenAPI-non-nullable JSON null."""
+    if value is None:
+        return True
+    if isinstance(value, dict):
+        return any(_contains_json_null(item) for item in value.values())
+    if isinstance(value, list):
+        return any(_contains_json_null(item) for item in value)
+    return False
+
+
+def _schema_valid_create(response: CyclesResponse) -> ReservationCreateResponse | None:
+    """Return a fully validated create body only for exact HTTP 200."""
+    if response.status != 200 or not isinstance(response.body, dict):
+        return None
+    body = response.body
+    if set(body) - _CREATE_RESPONSE_FIELDS:
+        return None
+    if _contains_json_null(body):
+        return None
+    remaining = body.get("remaining_ttl_ms")
+    if remaining is not None and (not isinstance(remaining, int) or isinstance(remaining, bool) or remaining < 0):
+        return None
+    expires = body.get("expires_at_ms")
+    if expires is not None and (not isinstance(expires, int) or isinstance(expires, bool) or expires < 0):
+        return None
+    affected = body.get("affected_scopes")
+    if not isinstance(affected, list) or any(not isinstance(scope, str) for scope in affected):
+        return None
+    try:
+        return ReservationCreateResponse.model_validate_json(json.dumps(body), strict=True)
+    except Exception:
+        return None
+
+
+def _schema_valid_extend(response: CyclesResponse) -> ReservationExtendResponse | None:
+    """Return a fully validated extend body only for exact HTTP 200."""
+    if response.status != 200 or not isinstance(response.body, dict):
+        return None
+    body = response.body
+    if set(body) - {"status", "expires_at_ms", "remaining_ttl_ms", "balances"}:
+        return None
+    if _contains_json_null(body):
+        return None
+    for name in ("expires_at_ms", "remaining_ttl_ms"):
+        value = body.get(name)
+        if value is not None and (not isinstance(value, int) or isinstance(value, bool) or value < 0):
+            return None
+    try:
+        return ReservationExtendResponse.model_validate_json(json.dumps(body), strict=True)
+    except Exception:
+        return None
+
+
+def _create_is_recoverable(response: CyclesResponse) -> bool:
+    return response.status < 0 or response.status >= 500 or 200 <= response.status < 300
+
+
+def _extend_error_is_recoverable(response: CyclesResponse) -> bool:
+    """Whether a non-2xx extend outcome is recoverable in field mode."""
+    return response.is_transport_error or response.is_server_error or response.status == 429
+
+
+def _ambiguous_create_error(response: CyclesResponse) -> CyclesProtocolError:
+    return CyclesProtocolError(
+        "Create reservation did not produce a schema-valid HTTP 200 response",
+        status=response.status,
+    )
+
+
+def _create_reservation_with_recovery(
+    client: CyclesClient,
+    body: dict[str, Any],
+) -> tuple[CyclesResponse, ReservationCreateResponse, float, float]:
+    """Create with at most one immediate same-key ambiguity recovery."""
+    timeout_budget_ms = _timeout_budget_ms(client._config)
+    last_exception: Exception | None = None
+    for attempt in range(2):
+        sent_ms = _now_mono_ms()
+        try:
+            response = _run_sync_attempt(
+                lambda: client.create_reservation(body),
+                timeout_budget_ms,
+            )
+        except Exception as exc:
+            last_exception = exc
+            if attempt == 0:
+                continue
+            raise CyclesProtocolError(
+                f"Create reservation remained ambiguous after same-key retry: {exc}",
+            ) from exc
+        parsed = _schema_valid_create(response)
+        if parsed is not None:
+            received_ms = _now_mono_ms()
+            return response, parsed, received_ms - sent_ms, received_ms
+        if attempt == 0 and _create_is_recoverable(response):
+            continue
+        if response.status < 200 or response.status >= 300:
+            raise _build_protocol_exception("Failed to create reservation", response)
+        raise _ambiguous_create_error(response)
+    raise AssertionError(last_exception)  # pragma: no cover
+
+
+async def _create_reservation_with_recovery_async(
+    client: AsyncCyclesClient,
+    body: dict[str, Any],
+) -> tuple[CyclesResponse, ReservationCreateResponse, float, float]:
+    """Async create with at most one immediate same-key ambiguity recovery."""
+    timeout_budget_ms = _timeout_budget_ms(client._config)
+    last_exception: Exception | None = None
+    for attempt in range(2):
+        sent_ms = _now_mono_ms()
+        try:
+            response = await _run_async_attempt(
+                lambda: client.create_reservation(body),
+                timeout_budget_ms,
+            )
+        except Exception as exc:
+            last_exception = exc
+            if attempt == 0:
+                continue
+            raise CyclesProtocolError(
+                f"Create reservation remained ambiguous after same-key retry: {exc}",
+            ) from exc
+        parsed = _schema_valid_create(response)
+        if parsed is not None:
+            received_ms = _now_mono_ms()
+            return response, parsed, received_ms - sent_ms, received_ms
+        if attempt == 0 and _create_is_recoverable(response):
+            continue
+        if response.status < 200 or response.status >= 300:
+            raise _build_protocol_exception("Failed to create reservation", response)
+        raise _ambiguous_create_error(response)
+    raise AssertionError(last_exception)  # pragma: no cover
 
 
 class _AuthoritativeScheduler:
@@ -252,15 +476,29 @@ class _AuthoritativeScheduler:
     def _safety_margin_ms(self) -> float:
         return max(1000.0, 2.0 * self._rtt_max_ms)
 
+    def observe_rtt(self, rtt_ms: float) -> None:
+        """Retain every reliable schema-valid create/extend RTT sample."""
+        if math.isfinite(rtt_ms) and rtt_ms >= 0:
+            self._rtt_max_ms = max(self._rtt_max_ms, rtt_ms)
+
     def on_valid_success(
-        self, remaining_ms: int, rtt_ms: float, now_ms: float,
+        self,
+        remaining_ms: int,
+        rtt_ms: float,
+        now_ms: float,
     ) -> float | None:
         """Schema-valid HTTP 200 carrying remaining_ttl_ms. retry_reserve =
         2×attempt_budget + safety_margin covers one failed attempt, one
         same-key retry, and margin."""
-        self._rtt_max_ms = max(self._rtt_max_ms, rtt_ms)
+        if not math.isfinite(rtt_ms) or rtt_ms < 0:
+            # Unknown/unreliable timing cannot be treated as zero elapsed.
+            self._rtt_max_ms = math.inf
+            lead_floor_ms = 0.0
+        else:
+            self.observe_rtt(rtt_ms)
+            lead_floor_ms = max(0.0, float(remaining_ms) - rtt_ms)
         self._prev_fail_window = None
-        self._lead_floor_ms = max(0.0, float(remaining_ms) - max(rtt_ms, 0.0))
+        self._lead_floor_ms = lead_floor_ms
         self._lead_anchor_ms = now_ms
         reserve = 2.0 * self._attempt_budget_ms() + self._safety_margin_ms()
         delay = self._lead_floor_ms - reserve
@@ -279,7 +517,10 @@ class _AuthoritativeScheduler:
     def lead_estimate_ms(self, now_ms: float) -> float:
         if self._lead_floor_ms is None or self._lead_anchor_ms is None:
             return 0.0
-        return max(0.0, self._lead_floor_ms - (now_ms - self._lead_anchor_ms))
+        elapsed_ms = now_ms - self._lead_anchor_ms
+        if not math.isfinite(elapsed_ms) or elapsed_ms < 0:
+            return 0.0
+        return max(0.0, self._lead_floor_ms - elapsed_ms)
 
     def on_transient_failure(
         self,
@@ -378,7 +619,10 @@ class CyclesLifecycle:
     """Synchronous lifecycle orchestrator: reserve → execute → commit/release."""
 
     def __init__(
-        self, client: CyclesClient, retry_engine: CommitRetryEngine, default_subject: dict[str, str | None],
+        self,
+        client: CyclesClient,
+        retry_engine: CommitRetryEngine,
+        default_subject: dict[str, str | None],
     ) -> None:
         self._client = client
         self._retry_engine = retry_engine
@@ -401,15 +645,10 @@ class CyclesLifecycle:
         logger.debug("Creating reservation: body=%s", create_body)
 
         res_t1 = time.monotonic()
-        _create_sent_ms = _now_mono_ms()
-        res_response = self._client.create_reservation(create_body)
-        _create_rtt_ms = _now_mono_ms() - _create_sent_ms
-
-        if not res_response.is_success:
-            logger.error("Reservation failed: response=%s", res_response)
-            raise _build_protocol_exception("Failed to create reservation", res_response)
-
-        res_result = ReservationCreateResponse.model_validate(res_response.body)
+        res_response, res_result, _create_rtt_ms, _create_received_ms = _create_reservation_with_recovery(
+            self._client,
+            create_body,
+        )
         res_t2 = time.monotonic()
 
         decision = res_result.decision
@@ -444,7 +683,9 @@ class CyclesLifecycle:
 
         logger.info(
             "Reservation created: id=%s, decision=%s, elapsed=%dms",
-            reservation_id, decision, int((res_t2 - res_t1) * 1000),
+            reservation_id,
+            decision,
+            int((res_t2 - res_t1) * 1000),
         )
 
         # Set context
@@ -464,8 +705,13 @@ class CyclesLifecycle:
         # Start heartbeat
         heartbeat_stop = threading.Event()
         heartbeat_thread = self._start_heartbeat(
-            reservation_id, cfg.ttl_ms, ctx, heartbeat_stop,
-            res_result.remaining_ttl_ms, _create_rtt_ms,
+            reservation_id,
+            cfg.ttl_ms,
+            ctx,
+            heartbeat_stop,
+            res_result.remaining_ttl_ms,
+            _create_rtt_ms,
+            _create_received_ms,
         )
 
         try:
@@ -492,7 +738,10 @@ class CyclesLifecycle:
                 commit_metadata = {**(commit_metadata or {}), "actual_source": "estimate"}
             commit_body = _build_commit_body(actual_amount, cfg.unit, metrics, commit_metadata)
             event_fallback = _build_event_fallback_body(
-                reservation_id, create_body["subject"], create_body["action"], commit_body,
+                reservation_id,
+                create_body["subject"],
+                create_body["action"],
+                commit_body,
             )
             self._handle_commit(reservation_id, commit_body, event_fallback)
 
@@ -509,7 +758,10 @@ class CyclesLifecycle:
             _clear_context()
 
     def _handle_commit(
-        self, reservation_id: str, commit_body: dict[str, Any], event_fallback_body: dict[str, Any],
+        self,
+        reservation_id: str,
+        commit_body: dict[str, Any],
+        event_fallback_body: dict[str, Any],
     ) -> None:
         try:
             logger.debug("Committing: id=%s", reservation_id)
@@ -530,7 +782,9 @@ class CyclesLifecycle:
                     # honoring the server's Retry-After.
                     logger.warning("Commit rate-limited; scheduling retry: id=%s", reservation_id)
                     self._retry_engine.schedule(
-                        reservation_id, commit_body, event_fallback_body,
+                        reservation_id,
+                        commit_body,
+                        event_fallback_body,
                         retry_after_ms=response.retry_after_ms_header,
                     )
                 elif response.status in (401, 403):
@@ -539,7 +793,8 @@ class CyclesLifecycle:
                     # that would return budget for real spend.
                     logger.error(
                         "Commit got authentication failure (status=%d); journaling for replay: id=%s",
-                        response.status, reservation_id,
+                        response.status,
+                        reservation_id,
                     )
                     self._retry_engine.schedule(reservation_id, commit_body, event_fallback_body)
                 elif response.status == 410 or error_code == "RESERVATION_EXPIRED":
@@ -558,9 +813,10 @@ class CyclesLifecycle:
                     # Codeless or forward-compat-unknown 4xx: neither release
                     # nor drop — retain the spend record.
                     logger.error(
-                        "Commit got unclassifiable client error (status=%d, error=%s); "
-                        "journaling for replay: id=%s",
-                        response.status, error_code, reservation_id,
+                        "Commit got unclassifiable client error (status=%d, error=%s); journaling for replay: id=%s",
+                        response.status,
+                        error_code,
+                        reservation_id,
                     )
                     self._retry_engine.schedule(reservation_id, commit_body, event_fallback_body)
                 else:
@@ -589,6 +845,7 @@ class CyclesLifecycle:
         stop_event: threading.Event,
         initial_remaining_ms: int | None = None,
         initial_rtt_ms: float | None = None,
+        initial_received_ms: float | None = None,
     ) -> threading.Thread | None:
         if ttl_ms <= 0:
             return None
@@ -621,11 +878,21 @@ class CyclesLifecycle:
             # a schema-valid 200 carrying remaining_ttl_ms drives scheduling
             # exactly; the measured-grant heuristic below is the
             # NON-NORMATIVE fallback for servers that omit the field.
-            sched = _AuthoritativeScheduler(_timeout_budget_ms(self._client._config))
+            timeout_budget_ms = _timeout_budget_ms(self._client._config)
+            sched = _AuthoritativeScheduler(timeout_budget_ms)
+            if initial_rtt_ms is not None:
+                sched.observe_rtt(initial_rtt_ms)
             authoritative = initial_remaining_ms is not None
             if initial_remaining_ms is not None:
+                remaining_at_start = _remaining_at_schedule_start(
+                    initial_remaining_ms,
+                    initial_received_ms,
+                    anchor_ms,
+                )
                 first_delay = sched.on_valid_success(
-                    initial_remaining_ms, initial_rtt_ms or 0.0, anchor_ms,
+                    remaining_at_start,
+                    initial_rtt_ms or 0.0,
+                    anchor_ms,
                 )
                 # Unreachable on the first scheduler call (the zero-delay
                 # streak cannot be exhausted yet); kept as a typed guard.
@@ -657,39 +924,37 @@ class CyclesLifecycle:
                     body = pending_body if pending_body is not None else _build_extend_body(ttl_ms)
                     pending_body = body
                     sent_ms = _now_mono_ms()
-                    response = self._client.extend_reservation(reservation_id, body)
+                    response = _run_sync_attempt(
+                        lambda: self._client.extend_reservation(reservation_id, body),
+                        timeout_budget_ms,
+                    )
+                    parsed_extend = _schema_valid_extend(response)
                     recv_ms = _now_mono_ms()
-                    if response.is_success and authoritative and response.status != 200:
-                        # Ambiguous non-200 2xx in authoritative mode: NOT an
-                        # observed success (spec) — same-key recovery.
+                    if response.is_success and parsed_extend is None:
+                        # Any non-200 or schema-invalid 2xx is ambiguous: it is
+                        # never an observed success and the key stays pending.
                         logger.warning(
-                            "Heartbeat ambiguous 2xx (status=%d): id=%s",
-                            response.status, reservation_id,
+                            "Heartbeat ambiguous response (status=%d): id=%s",
+                            response.status,
+                            reservation_id,
                         )
-                        nxt = sched.on_transient_failure(_now_mono_ms())
-                        if nxt is None:
-                            logger.warning(
-                                "Heartbeat stopping: no safe recovery window remains: id=%s",
-                                reservation_id,
-                            )
-                            return
-                        delay_ms = nxt
-                    elif response.is_success:
-                        pending_body = None
-                        new_expires = response.get_body_attribute("expires_at_ms")
-                        if new_expires is not None:
-                            new_expires = int(new_expires)
-                            ctx.update_expires_at_ms(new_expires)
-                            grant = (
-                                float(new_expires - prev_expiry)
-                                if prev_expiry is not None
-                                else float(ttl_ms)
-                            )
-                            prev_expiry = new_expires
+                        if authoritative:
+                            nxt = sched.on_transient_failure(_now_mono_ms())
+                            if nxt is None:
+                                logger.warning(
+                                    "Heartbeat stopping: no safe recovery window remains: id=%s",
+                                    reservation_id,
+                                )
+                                return
+                            delay_ms = nxt
                         else:
-                            grant = float(ttl_ms)
-                            if prev_expiry is not None:
-                                prev_expiry += ttl_ms
+                            delay_ms = held_delay_ms
+                    elif parsed_extend is not None:
+                        pending_body = None
+                        new_expires = parsed_extend.expires_at_ms
+                        ctx.update_expires_at_ms(new_expires)
+                        grant = float(new_expires - prev_expiry) if prev_expiry is not None else float(ttl_ms)
+                        prev_expiry = new_expires
                         grant = max(grant, 0.0)
                         now_ms = _now_mono_ms()
                         elapsed_since_success = now_ms - last_success_ms
@@ -697,14 +962,15 @@ class CyclesLifecycle:
                         grants_sum += grant
                         last_grant = grant
                         rtt_ms = recv_ms - sent_ms
-                        remaining = response.get_body_attribute("remaining_ttl_ms")
-                        if response.status == 200 and remaining is not None:
+                        sched.observe_rtt(rtt_ms)
+                        remaining = parsed_extend.remaining_ttl_ms
+                        if remaining is not None:
                             # Server-authoritative lease (spec v0.1.25.16
                             # PRIMARY ALGORITHM): schedule from this response
                             # alone; the heuristic arms below only serve
                             # servers that omit the field.
                             authoritative = True
-                            nxt = sched.on_valid_success(int(remaining), rtt_ms, recv_ms)
+                            nxt = sched.on_valid_success(remaining, rtt_ms, recv_ms)
                             if nxt is None:
                                 logger.warning(
                                     "Heartbeat stopping: lease shorter than the retry-safety budget: id=%s",
@@ -742,23 +1008,36 @@ class CyclesLifecycle:
                         if response.status in (404, 410) or code in _PERMANENT_EXTEND_CODES:
                             logger.warning(
                                 "Heartbeat stopping permanently (%s, status=%d): id=%s",
-                                code, response.status, reservation_id,
+                                code,
+                                response.status,
+                                reservation_id,
                             )
                             return
                         logger.warning("Heartbeat extend failed: id=%s, status=%d", reservation_id, response.status)
                         if authoritative:
-                            rate_limited = response.status == 429 or code == "LIMIT_EXCEEDED"
+                            rate_limited = response.status == 429
                             if not rate_limited and 400 <= response.status < 500:
                                 # Unrecoverable request/auth failure (spec): never
                                 # rotate the key on an unchanged request.
                                 logger.warning(
                                     "Heartbeat stopping on client error (%s, status=%d): id=%s",
-                                    code, response.status, reservation_id,
+                                    code,
+                                    response.status,
+                                    reservation_id,
+                                )
+                                return
+                            if not _extend_error_is_recoverable(response):
+                                logger.warning(
+                                    "Heartbeat stopping on unexpected HTTP status %d: id=%s",
+                                    response.status,
+                                    reservation_id,
                                 )
                                 return
                             retry_after = response.retry_after_ms_header if rate_limited else None
                             nxt = sched.on_transient_failure(
-                                _now_mono_ms(), rate_limited=rate_limited, retry_after_ms=retry_after,
+                                _now_mono_ms(),
+                                rate_limited=rate_limited,
+                                retry_after_ms=retry_after,
                             )
                             if nxt is None:
                                 logger.warning(
@@ -788,7 +1067,10 @@ class AsyncCyclesLifecycle:
     """Asynchronous lifecycle orchestrator: reserve → execute → commit/release."""
 
     def __init__(
-        self, client: AsyncCyclesClient, retry_engine: AsyncCommitRetryEngine, default_subject: dict[str, str | None],
+        self,
+        client: AsyncCyclesClient,
+        retry_engine: AsyncCommitRetryEngine,
+        default_subject: dict[str, str | None],
     ) -> None:
         self._client = client
         self._retry_engine = retry_engine
@@ -806,14 +1088,9 @@ class AsyncCyclesLifecycle:
         logger.debug("Estimated usage: estimate=%d", estimate)
 
         create_body = _build_reservation_body(cfg, estimate, self._default_subject, args, kwargs)
-        _create_sent_ms = _now_mono_ms()
-        res_response = await self._client.create_reservation(create_body)
-        _create_rtt_ms = _now_mono_ms() - _create_sent_ms
-
-        if not res_response.is_success:
-            raise _build_protocol_exception("Failed to create reservation", res_response)
-
-        res_result = ReservationCreateResponse.model_validate(res_response.body)
+        res_response, res_result, _create_rtt_ms, _create_received_ms = await _create_reservation_with_recovery_async(
+            self._client, create_body
+        )
         res_t2 = time.monotonic()
 
         decision = res_result.decision
@@ -856,8 +1133,12 @@ class AsyncCyclesLifecycle:
         _set_context(ctx)
 
         heartbeat_task = self._start_heartbeat(
-            reservation_id, cfg.ttl_ms, ctx,
-            res_result.remaining_ttl_ms, _create_rtt_ms,
+            reservation_id,
+            cfg.ttl_ms,
+            ctx,
+            res_result.remaining_ttl_ms,
+            _create_rtt_ms,
+            _create_received_ms,
         )
 
         try:
@@ -880,7 +1161,10 @@ class AsyncCyclesLifecycle:
                 commit_metadata = {**(commit_metadata or {}), "actual_source": "estimate"}
             commit_body = _build_commit_body(actual_amount, cfg.unit, metrics, commit_metadata)
             event_fallback = _build_event_fallback_body(
-                reservation_id, create_body["subject"], create_body["action"], commit_body,
+                reservation_id,
+                create_body["subject"],
+                create_body["action"],
+                commit_body,
             )
             await self._handle_commit(reservation_id, commit_body, event_fallback)
 
@@ -900,7 +1184,10 @@ class AsyncCyclesLifecycle:
             _clear_context()
 
     async def _handle_commit(
-        self, reservation_id: str, commit_body: dict[str, Any], event_fallback_body: dict[str, Any],
+        self,
+        reservation_id: str,
+        commit_body: dict[str, Any],
+        event_fallback_body: dict[str, Any],
     ) -> None:
         try:
             response = await self._client.commit_reservation(reservation_id, commit_body)
@@ -919,7 +1206,9 @@ class AsyncCyclesLifecycle:
                     # honoring the server's Retry-After.
                     logger.warning("Commit rate-limited; scheduling retry: id=%s", reservation_id)
                     self._retry_engine.schedule(
-                        reservation_id, commit_body, event_fallback_body,
+                        reservation_id,
+                        commit_body,
+                        event_fallback_body,
                         retry_after_ms=response.retry_after_ms_header,
                     )
                 elif response.status in (401, 403):
@@ -928,7 +1217,8 @@ class AsyncCyclesLifecycle:
                     # that would return budget for real spend.
                     logger.error(
                         "Commit got authentication failure (status=%d); journaling for replay: id=%s",
-                        response.status, reservation_id,
+                        response.status,
+                        reservation_id,
                     )
                     self._retry_engine.schedule(reservation_id, commit_body, event_fallback_body)
                 elif response.status == 410 or error_code == "RESERVATION_EXPIRED":
@@ -947,9 +1237,10 @@ class AsyncCyclesLifecycle:
                     # Codeless or forward-compat-unknown 4xx: neither release
                     # nor drop — retain the spend record.
                     logger.error(
-                        "Commit got unclassifiable client error (status=%d, error=%s); "
-                        "journaling for replay: id=%s",
-                        response.status, error_code, reservation_id,
+                        "Commit got unclassifiable client error (status=%d, error=%s); journaling for replay: id=%s",
+                        response.status,
+                        error_code,
+                        reservation_id,
                     )
                     self._retry_engine.schedule(reservation_id, commit_body, event_fallback_body)
                 else:
@@ -976,6 +1267,7 @@ class AsyncCyclesLifecycle:
         ctx: CyclesContext,
         initial_remaining_ms: int | None = None,
         initial_rtt_ms: float | None = None,
+        initial_received_ms: float | None = None,
     ) -> asyncio.Task[None] | None:
         if ttl_ms <= 0:
             return None
@@ -994,11 +1286,21 @@ class AsyncCyclesLifecycle:
             # a schema-valid 200 carrying remaining_ttl_ms drives scheduling
             # exactly; the measured-grant heuristic below is the
             # NON-NORMATIVE fallback for servers that omit the field.
-            sched = _AuthoritativeScheduler(_timeout_budget_ms(self._client._config))
+            timeout_budget_ms = _timeout_budget_ms(self._client._config)
+            sched = _AuthoritativeScheduler(timeout_budget_ms)
+            if initial_rtt_ms is not None:
+                sched.observe_rtt(initial_rtt_ms)
             authoritative = initial_remaining_ms is not None
             if initial_remaining_ms is not None:
+                remaining_at_start = _remaining_at_schedule_start(
+                    initial_remaining_ms,
+                    initial_received_ms,
+                    anchor_ms,
+                )
                 first_delay = sched.on_valid_success(
-                    initial_remaining_ms, initial_rtt_ms or 0.0, anchor_ms,
+                    remaining_at_start,
+                    initial_rtt_ms or 0.0,
+                    anchor_ms,
                 )
                 # Unreachable on the first scheduler call (the zero-delay
                 # streak cannot be exhausted yet); kept as a typed guard.
@@ -1033,39 +1335,37 @@ class AsyncCyclesLifecycle:
                         body = pending_body if pending_body is not None else _build_extend_body(ttl_ms)
                         pending_body = body
                         sent_ms = _now_mono_ms()
-                        response = await self._client.extend_reservation(reservation_id, body)
+                        response = await _run_async_attempt(
+                            lambda: self._client.extend_reservation(reservation_id, body),
+                            timeout_budget_ms,
+                        )
+                        parsed_extend = _schema_valid_extend(response)
                         recv_ms = _now_mono_ms()
-                        if response.is_success and authoritative and response.status != 200:
-                            # Ambiguous non-200 2xx in authoritative mode: NOT an
-                            # observed success (spec) — same-key recovery.
+                        if response.is_success and parsed_extend is None:
+                            # Any non-200 or schema-invalid 2xx is ambiguous:
+                            # never rotate the pending idempotency key.
                             logger.warning(
-                                "Heartbeat ambiguous 2xx (status=%d): id=%s",
-                                response.status, reservation_id,
+                                "Heartbeat ambiguous response (status=%d): id=%s",
+                                response.status,
+                                reservation_id,
                             )
-                            nxt = sched.on_transient_failure(_now_mono_ms())
-                            if nxt is None:
-                                logger.warning(
-                                    "Heartbeat stopping: no safe recovery window remains: id=%s",
-                                    reservation_id,
-                                )
-                                return
-                            delay_ms = nxt
-                        elif response.is_success:
-                            pending_body = None
-                            new_expires = response.get_body_attribute("expires_at_ms")
-                            if new_expires is not None:
-                                new_expires = int(new_expires)
-                                ctx.update_expires_at_ms(new_expires)
-                                grant = (
-                                    float(new_expires - prev_expiry)
-                                    if prev_expiry is not None
-                                    else float(ttl_ms)
-                                )
-                                prev_expiry = new_expires
+                            if authoritative:
+                                nxt = sched.on_transient_failure(_now_mono_ms())
+                                if nxt is None:
+                                    logger.warning(
+                                        "Heartbeat stopping: no safe recovery window remains: id=%s",
+                                        reservation_id,
+                                    )
+                                    return
+                                delay_ms = nxt
                             else:
-                                grant = float(ttl_ms)
-                                if prev_expiry is not None:
-                                    prev_expiry += ttl_ms
+                                delay_ms = held_delay_ms
+                        elif parsed_extend is not None:
+                            pending_body = None
+                            new_expires = parsed_extend.expires_at_ms
+                            ctx.update_expires_at_ms(new_expires)
+                            grant = float(new_expires - prev_expiry) if prev_expiry is not None else float(ttl_ms)
+                            prev_expiry = new_expires
                             grant = max(grant, 0.0)
                             now_ms = _now_mono_ms()
                             elapsed_since_success = now_ms - last_success_ms
@@ -1073,14 +1373,15 @@ class AsyncCyclesLifecycle:
                             grants_sum += grant
                             last_grant = grant
                             rtt_ms = recv_ms - sent_ms
-                            remaining = response.get_body_attribute("remaining_ttl_ms")
-                            if response.status == 200 and remaining is not None:
+                            sched.observe_rtt(rtt_ms)
+                            remaining = parsed_extend.remaining_ttl_ms
+                            if remaining is not None:
                                 # Server-authoritative lease (spec v0.1.25.16
                                 # PRIMARY ALGORITHM): schedule from this response
                                 # alone; the heuristic arms below only serve
                                 # servers that omit the field.
                                 authoritative = True
-                                nxt = sched.on_valid_success(int(remaining), rtt_ms, recv_ms)
+                                nxt = sched.on_valid_success(remaining, rtt_ms, recv_ms)
                                 if nxt is None:
                                     logger.warning(
                                         "Heartbeat stopping: lease shorter than the retry-safety budget: id=%s",
@@ -1117,23 +1418,36 @@ class AsyncCyclesLifecycle:
                             if response.status in (404, 410) or code in _PERMANENT_EXTEND_CODES:
                                 logger.warning(
                                     "Heartbeat stopping permanently (%s, status=%d): id=%s",
-                                    code, response.status, reservation_id,
+                                    code,
+                                    response.status,
+                                    reservation_id,
                                 )
                                 return
                             logger.warning("Heartbeat extend failed: id=%s", reservation_id)
                             if authoritative:
-                                rate_limited = response.status == 429 or code == "LIMIT_EXCEEDED"
+                                rate_limited = response.status == 429
                                 if not rate_limited and 400 <= response.status < 500:
                                     # Unrecoverable request/auth failure (spec): never
                                     # rotate the key on an unchanged request.
                                     logger.warning(
                                         "Heartbeat stopping on client error (%s, status=%d): id=%s",
-                                        code, response.status, reservation_id,
+                                        code,
+                                        response.status,
+                                        reservation_id,
+                                    )
+                                    return
+                                if not _extend_error_is_recoverable(response):
+                                    logger.warning(
+                                        "Heartbeat stopping on unexpected HTTP status %d: id=%s",
+                                        response.status,
+                                        reservation_id,
                                     )
                                     return
                                 retry_after = response.retry_after_ms_header if rate_limited else None
                                 nxt = sched.on_transient_failure(
-                                    _now_mono_ms(), rate_limited=rate_limited, retry_after_ms=retry_after,
+                                    _now_mono_ms(),
+                                    rate_limited=rate_limited,
+                                    retry_after_ms=retry_after,
                                 )
                                 if nxt is None:
                                     logger.warning(

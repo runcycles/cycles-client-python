@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from email.utils import parsedate_to_datetime
 from typing import Any
@@ -26,7 +27,11 @@ class CyclesResponse:
 
     @classmethod
     def http_error(
-        cls, status: int, error_message: str, body: dict[str, Any] | None = None, headers: dict[str, str] | None = None,
+        cls,
+        status: int,
+        error_message: str,
+        body: dict[str, Any] | None = None,
+        headers: dict[str, str] | None = None,
     ) -> CyclesResponse:
         return cls(status=status, body=body, error_message=error_message, headers=headers or {})
 
@@ -69,19 +74,22 @@ class CyclesResponse:
         val = self.headers.get("retry-after")
         if val is None:
             return None
-        try:
-            return int(val) * 1000
-        except ValueError:
+        stripped = val.strip()
+        if re.fullmatch(r"[0-9]+", stripped) is None:
             return None
+        seconds = int(stripped)
+        if seconds > 9_223_372_036_854_775_807 // 1000:
+            return None
+        return seconds * 1000
 
     @property
     def server_date_ms(self) -> int | None:
-        """HTTP ``Date`` header as epoch milliseconds (server wall clock).
+        """HTTP ``Date`` header as epoch milliseconds.
 
-        Server-frame, so differencing it against other server-frame values
-        (like ``expires_at_ms``) is clock-skew-free to within the header's
-        one-second resolution plus transit latency. Returns ``None`` when
-        absent or unparseable.
+        ``Date`` is best-effort HTTP metadata and may come from a different
+        clock than body timestamps or be replaced by an intermediary. It is
+        not used for heartbeat scheduling. Returns ``None`` when absent or
+        unparseable.
         """
         val = self.headers.get("date")
         if val is None:

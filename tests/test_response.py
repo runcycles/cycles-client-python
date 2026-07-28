@@ -76,10 +76,43 @@ class TestResponseHeaders:
         assert resp.retry_after_ms_header == 3000
 
     def test_retry_after_header_non_numeric_ignored(self) -> None:
+        for value in (
+            "Wed, 21 Oct 2026 07:28:00 GMT",
+            "-1",
+            "+1",
+            "1e2",
+            "1.5",
+            "9223372036854775808",
+        ):
+            resp = CyclesResponse.http_error(
+                429,
+                "Rate limited",
+                headers={"retry-after": value},
+            )
+            assert resp.retry_after_ms_header is None
+
+    def test_retry_after_header_allows_ows(self) -> None:
         resp = CyclesResponse.http_error(
-            429, "Rate limited", headers={"retry-after": "Wed, 21 Oct 2026 07:28:00 GMT"},
+            429,
+            "Rate limited",
+            headers={"retry-after": " 0 "},
         )
-        assert resp.retry_after_ms_header is None
+        assert resp.retry_after_ms_header == 0
+
+    def test_retry_after_header_checks_millisecond_overflow(self) -> None:
+        max_seconds = 9_223_372_036_854_775_807 // 1000
+        accepted = CyclesResponse.http_error(
+            429,
+            "Rate limited",
+            headers={"retry-after": str(max_seconds)},
+        )
+        overflow = CyclesResponse.http_error(
+            429,
+            "Rate limited",
+            headers={"retry-after": str(max_seconds + 1)},
+        )
+        assert accepted.retry_after_ms_header == max_seconds * 1000
+        assert overflow.retry_after_ms_header is None
 
     def test_missing_headers_return_none(self) -> None:
         resp = CyclesResponse.success(200, {})
@@ -95,7 +128,5 @@ class TestResponseHeaders:
         assert resp.headers == {}
 
     def test_cycles_tenant_header(self) -> None:
-        resp = CyclesResponse.success(
-            200, {}, headers={"x-cycles-tenant": "acme"}
-        )
+        resp = CyclesResponse.success(200, {}, headers={"x-cycles-tenant": "acme"})
         assert resp.cycles_tenant == "acme"

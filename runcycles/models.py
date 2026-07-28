@@ -4,8 +4,9 @@ from __future__ import annotations
 
 from enum import Enum
 from typing import Annotated, Any
+from urllib.parse import urlsplit
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class Unit(str, Enum):
@@ -97,21 +98,21 @@ class ErrorCode(str, Enum):
 
 # --- Core value objects ---
 
-_SNAKE_CASE_CONFIG = ConfigDict(populate_by_name=True)
+_SNAKE_CASE_CONFIG = ConfigDict(populate_by_name=True, extra="forbid")
 
 
 class Amount(BaseModel):
     model_config = _SNAKE_CASE_CONFIG
 
     unit: Unit
-    amount: int = Field(ge=0)
+    amount: int = Field(ge=0, le=9_223_372_036_854_775_807)
 
 
 class SignedAmount(BaseModel):
     model_config = _SNAKE_CASE_CONFIG
 
     unit: Unit
-    amount: int  # can be negative
+    amount: int = Field(ge=-9_223_372_036_854_775_808, le=9_223_372_036_854_775_807)
 
 
 class Subject(BaseModel):
@@ -192,6 +193,22 @@ class Balance(BaseModel):
     is_over_limit: bool | None = None
 
 
+class CyclesEvidenceRef(BaseModel):
+    """Transport reference to a server-issued CyclesEvidence envelope."""
+
+    model_config = _SNAKE_CASE_CONFIG
+
+    evidence_id: str = Field(pattern=r"^[0-9a-f]{64}$")
+    cycles_evidence_url: str = Field(min_length=1)
+
+    @field_validator("cycles_evidence_url")
+    @classmethod
+    def require_absolute_uri(cls, value: str) -> str:
+        if not urlsplit(value).scheme:
+            raise ValueError("cycles_evidence_url must be an absolute URI")
+        return value
+
+
 # --- Request models ---
 
 
@@ -265,17 +282,18 @@ class ReservationCreateResponse(BaseModel):
     decision: Decision
     reservation_id: str | None = None
     affected_scopes: list[str]
-    expires_at_ms: int | None = None
+    expires_at_ms: Annotated[int, Field(ge=0, le=9_223_372_036_854_775_807)] | None = None
     # Server-authoritative remaining lease (ms) at response evaluation
     # (spec v0.1.25.16). Optional: older servers omit it; when present the
     # heartbeat schedules from it directly.
-    remaining_ttl_ms: int | None = None
+    remaining_ttl_ms: Annotated[int, Field(ge=0, le=9_223_372_036_854_775_807)] | None = None
     scope_path: str | None = None
     reserved: Amount | None = None
     caps: Caps | None = None
-    reason_code: str | None = None
-    retry_after_ms: int | None = None
+    reason_code: Annotated[str, Field(max_length=128)] | None = None
+    retry_after_ms: Annotated[int, Field(ge=0)] | None = None
     balances: list[Balance] | None = None
+    cycles_evidence: CyclesEvidenceRef | None = None
 
     def is_allowed(self) -> bool:
         return self.decision in (Decision.ALLOW, Decision.ALLOW_WITH_CAPS)
@@ -305,7 +323,8 @@ class ReservationExtendResponse(BaseModel):
     model_config = _SNAKE_CASE_CONFIG
 
     status: ExtendStatus
-    expires_at_ms: int
+    expires_at_ms: Annotated[int, Field(ge=0, le=9_223_372_036_854_775_807)]
+    remaining_ttl_ms: Annotated[int, Field(ge=0, le=9_223_372_036_854_775_807)] | None = None
     balances: list[Balance] | None = None
 
 

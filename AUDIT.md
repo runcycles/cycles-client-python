@@ -33,8 +33,12 @@ window, other 4xx stop without key rotation; a lease that cannot hold the
 reserve gets one immediate fresh attempt then stop-and-surface; lead_min
 skip bypassed; no primed extension when the create carries the field.
 Bookkeeping keeps running so the v2.3+band heuristic (now explicitly
-best-effort fallback) resumes seamlessly if the field disappears;
-fieldless servers see unchanged behavior. 568 tests pass at 100% coverage.
+best-effort fallback) resumes seamlessly if the field disappears. Final
+self-review also made the response contract uniform across both scheduling
+modes: only a complete schema-valid HTTP 200 create/extend response succeeds;
+ambiguous 2xx keeps the same key. The enforced timeout covers the whole
+attempt, first-delay setup time is deducted, and reliable pre-field RTT
+samples remain in the safety budget. 597 tests pass at 99.07% coverage.
 
 ## 2026-07-27 — Heartbeat conservative-lead redesign + actual_source marker (v0.5.1)
 

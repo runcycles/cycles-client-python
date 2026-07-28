@@ -12,9 +12,21 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-import runcycles.lifecycle as lifecycle_mod
 from runcycles.config import CyclesConfig
-from runcycles.lifecycle import AsyncCyclesLifecycle, CyclesLifecycle, DecoratorConfig
+from runcycles.exceptions import CyclesProtocolError
+from runcycles.lifecycle import (
+    AsyncCyclesLifecycle,
+    CyclesLifecycle,
+    DecoratorConfig,
+    _AuthoritativeScheduler,
+    _create_reservation_with_recovery,
+    _create_reservation_with_recovery_async,
+    _remaining_at_schedule_start,
+    _run_async_attempt,
+    _run_sync_attempt,
+    _schema_valid_create,
+    _schema_valid_extend,
+)
 from runcycles.models import Action, Amount, Subject, Unit
 from runcycles.response import CyclesResponse
 from runcycles.retry import AsyncCommitRetryEngine, CommitRetryEngine
@@ -34,13 +46,16 @@ class FakeClock:
 
 def _config() -> CyclesConfig:
     return CyclesConfig(
-        base_url="http://localhost:7878", api_key="test-key", tenant="acme",
+        base_url="http://localhost:7878",
+        api_key="test-key",
+        tenant="acme",
         retry_enabled=False,
     )
 
 
 def _extend_ok(
-    expires_at_ms: int | None, remaining_ttl_ms: int | None = None,
+    expires_at_ms: int | None,
+    remaining_ttl_ms: int | None = None,
 ) -> CyclesResponse:
     body: dict[str, Any] = {"status": "ACTIVE"}
     if expires_at_ms is not None:
@@ -51,14 +66,17 @@ def _extend_ok(
 
 
 def _allow_response() -> CyclesResponse:
-    return CyclesResponse.success(200, {
-        "decision": "ALLOW",
-        "reservation_id": "rsv_test",
-        "expires_at_ms": int(time.time() * 1000) + 600_000,
-        "affected_scopes": ["tenant:acme"],
-        "scope_path": "tenant:acme",
-        "reserved": {"unit": "USD_MICROCENTS", "amount": 1000},
-    })
+    return CyclesResponse.success(
+        200,
+        {
+            "decision": "ALLOW",
+            "reservation_id": "rsv_test",
+            "expires_at_ms": int(time.time() * 1000) + 600_000,
+            "affected_scopes": ["tenant:acme"],
+            "scope_path": "tenant:acme",
+            "reserved": {"unit": "USD_MICROCENTS", "amount": 1000},
+        },
+    )
 
 
 def _commit_success() -> CyclesResponse:
@@ -96,7 +114,7 @@ def _run_sync_beats(
 ) -> list[float]:
     """Drive the sync heartbeat for `beats` iterations, advancing the fake
     clock by the beat interval on every wait. Returns the wait timeouts."""
-    monkeypatch.setattr(lifecycle_mod, "_now_mono_ms", clock.now)
+    monkeypatch.setattr("runcycles.lifecycle._now_mono_ms", clock.now)
     timeouts: list[float] = []
     calls = {"n": 0}
 
@@ -111,7 +129,11 @@ def _run_sync_beats(
     stop = threading.Event()
     stop.wait = wait  # type: ignore[method-assign]
     thread = lifecycle._start_heartbeat(
-        "rsv_1", ttl, ctx or _ctx(), stop, initial_remaining_ms,
+        "rsv_1",
+        ttl,
+        ctx or _ctx(),
+        stop,
+        initial_remaining_ms,
     )
     assert thread is not None
     thread.join(timeout=5)
@@ -119,17 +141,201 @@ def _run_sync_beats(
     return timeouts
 
 
+class TestStrictLeaseAttemptContract:
+    def test_field_mode_retains_rtt_observed_before_field_appears(self) -> None:
+        scheduler = _AuthoritativeScheduler(7_000)
+        scheduler.observe_rtt(6_000)
+
+        assert scheduler.on_valid_success(60_000, 100, 0) == 23_900
+
+    @pytest.mark.parametrize(
+        ("received_ms", "now_ms", "expected"),
+        [(1000.0, 3000.0, 58_000.0), (3000.0, 1000.0, 0.0), (None, 3000.0, 60_000.0)],
+    )
+    def test_create_lead_deducts_post_receipt_setup_time(
+        self,
+        received_ms: float | None,
+        now_ms: float,
+        expected: float,
+    ) -> None:
+        assert _remaining_at_schedule_start(60_000, received_ms, now_ms) == expected
+
+    def test_sync_create_recovers_once_with_same_body(self) -> None:
+        client = MagicMock()
+        client._config = _config()
+        body = {"idempotency_key": "same-key"}
+        client.create_reservation.side_effect = [
+            CyclesResponse.success(202, _allow_response().body),
+            _allow_response(),
+        ]
+
+        response, parsed, rtt_ms, received_ms = _create_reservation_with_recovery(client, body)
+
+        assert response.status == 200
+        assert parsed.reservation_id == "rsv_test"
+        assert rtt_ms >= 0
+        assert received_ms >= rtt_ms
+        assert client.create_reservation.call_count == 2
+        assert all(call.args[0] is body for call in client.create_reservation.call_args_list)
+
+    def test_sync_create_rejects_malformed_200_after_one_recovery(self) -> None:
+        client = MagicMock()
+        client._config = _config()
+        malformed = CyclesResponse.success(
+            200,
+            {
+                "decision": "ALLOW",
+                "reservation_id": "rsv_test",
+                "affected_scopes": ["tenant:acme"],
+                "unexpected": True,
+            },
+        )
+        client.create_reservation.return_value = malformed
+
+        with pytest.raises(CyclesProtocolError, match="schema-valid HTTP 200"):
+            _create_reservation_with_recovery(client, {"idempotency_key": "same-key"})
+
+        assert client.create_reservation.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_async_create_recovers_transport_failure_with_same_body(self) -> None:
+        client = AsyncMock()
+        client._config = _config()
+        body = {"idempotency_key": "same-key"}
+        client.create_reservation.side_effect = [ConnectionError("lost"), _allow_response()]
+
+        response, parsed, rtt_ms, received_ms = await _create_reservation_with_recovery_async(client, body)
+
+        assert response.status == 200
+        assert parsed.reservation_id == "rsv_test"
+        assert rtt_ms >= 0
+        assert received_ms >= rtt_ms
+        assert client.create_reservation.await_count == 2
+        assert all(call.args[0] is body for call in client.create_reservation.call_args_list)
+
+    @pytest.mark.parametrize(
+        "response",
+        [
+            CyclesResponse.success(
+                202,
+                {"status": "ACTIVE", "expires_at_ms": 1, "remaining_ttl_ms": 0},
+            ),
+            CyclesResponse.success(200, {"status": "ACTIVE"}),
+            CyclesResponse.success(200, {"status": "ACTIVE", "expires_at_ms": -1}),
+            CyclesResponse.success(200, {"status": "UNKNOWN", "expires_at_ms": 1}),
+            CyclesResponse.success(200, {"status": "ACTIVE", "expires_at_ms": 1, "balances": {}}),
+            CyclesResponse.success(200, {"status": "ACTIVE", "expires_at_ms": 1, "extra": True}),
+        ],
+    )
+    def test_extend_rejects_non_200_or_non_schema_response(
+        self,
+        response: CyclesResponse,
+    ) -> None:
+        assert _schema_valid_extend(response) is None
+
+    def test_strict_create_and_extend_accept_schema_valid_200(self) -> None:
+        assert _schema_valid_create(_allow_response()) is not None
+        parsed = _schema_valid_extend(
+            CyclesResponse.success(
+                200,
+                {"status": "ACTIVE", "expires_at_ms": 1, "remaining_ttl_ms": 0, "balances": []},
+            ),
+        )
+        assert parsed is not None
+        assert parsed.remaining_ttl_ms == 0
+
+    @pytest.mark.parametrize(
+        "body",
+        [
+            {"decision": "ALLOW", "affected_scopes": [], "caps": None},
+            {
+                "decision": "ALLOW",
+                "affected_scopes": [],
+                "reserved": {"unit": "TOKENS", "amount": "1"},
+            },
+            {
+                "decision": "ALLOW",
+                "affected_scopes": [],
+                "balances": [
+                    {
+                        "scope": "tenant:acme",
+                        "scope_path": "tenant:acme",
+                        "remaining": {"unit": "TOKENS", "amount": 1},
+                        "reserved": None,
+                    }
+                ],
+            },
+            {
+                "decision": "ALLOW",
+                "affected_scopes": [],
+                "cycles_evidence": {
+                    "evidence_id": "a" * 64,
+                    "cycles_evidence_url": "relative",
+                },
+            },
+            {
+                "decision": "ALLOW",
+                "affected_scopes": [],
+                "remaining_ttl_ms": 9_223_372_036_854_775_808,
+            },
+            {
+                "decision": "ALLOW",
+                "affected_scopes": [],
+                "expires_at_ms": -1,
+            },
+        ],
+    )
+    def test_create_rejects_non_schema_optional_fields(self, body: dict[str, Any]) -> None:
+        assert _schema_valid_create(CyclesResponse.success(200, body)) is None
+
+    def test_extend_rejects_nested_null_and_int64_overflow(self) -> None:
+        for body in (
+            {
+                "status": "ACTIVE",
+                "expires_at_ms": 1,
+                "balances": [
+                    {
+                        "scope": "tenant:acme",
+                        "scope_path": "tenant:acme",
+                        "remaining": {"unit": "TOKENS", "amount": 1},
+                        "debt": None,
+                    }
+                ],
+            },
+            {
+                "status": "ACTIVE",
+                "expires_at_ms": 9_223_372_036_854_775_808,
+            },
+        ):
+            assert _schema_valid_extend(CyclesResponse.success(200, body)) is None
+
+    def test_sync_outer_deadline_covers_complete_attempt(self) -> None:
+        with pytest.raises(TimeoutError, match="exceeded"):
+            _run_sync_attempt(
+                lambda: (time.sleep(0.05), _allow_response())[1],
+                timeout_budget_ms=1,
+            )
+
+    @pytest.mark.asyncio
+    async def test_async_outer_deadline_covers_complete_attempt(self) -> None:
+        async def slow() -> CyclesResponse:
+            await asyncio.sleep(0.05)
+            return _allow_response()
+
+        with pytest.raises(asyncio.TimeoutError):
+            await _run_async_attempt(slow, timeout_budget_ms=1)
+
+
 class TestSyncHeartbeatLeadEstimate:
     def test_extends_only_when_lead_below_threshold(
-        self, monkeypatch: pytest.MonkeyPatch,
+        self,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         # lead_min starts at 0 and the first beat fires IMMEDIATELY: beats
         # 1-3 extend (grants measured at +ttl each), beat 4 skips once
         # lead_min reaches 1.5*grant (180k-90k=90k), beat 5 extends again.
         lifecycle, client = _make_sync()
-        client.extend_reservation.side_effect = [
-            _extend_ok(INITIAL_EXPIRY + (n + 1) * TTL) for n in range(4)
-        ]
+        client.extend_reservation.side_effect = [_extend_ok(INITIAL_EXPIRY + (n + 1) * TTL) for n in range(4)]
 
         timeouts = _run_sync_beats(lifecycle, FakeClock(), monkeypatch, beats=5)
 
@@ -138,7 +344,8 @@ class TestSyncHeartbeatLeadEstimate:
         assert timeouts[1] == min(TTL / 2, 30_000) / 1000.0
 
     def test_interval_has_no_floor_for_small_ttl(
-        self, monkeypatch: pytest.MonkeyPatch,
+        self,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         # ttl=1200 → after the immediate first beat, cadence must be 600ms
         # (the old 1s floor guaranteed lapse in this spec-legal range).
@@ -147,14 +354,20 @@ class TestSyncHeartbeatLeadEstimate:
 
         ctx = _ctx(1200)
         timeouts = _run_sync_beats(
-            lifecycle, FakeClock(), monkeypatch, beats=2, ttl=1200, ctx=ctx,
+            lifecycle,
+            FakeClock(),
+            monkeypatch,
+            beats=2,
+            ttl=1200,
+            ctx=ctx,
         )
 
         assert timeouts[0] == 0.0
         assert timeouts[1] == 0.6
 
     def test_failed_extend_retries_with_same_idempotency_key(
-        self, monkeypatch: pytest.MonkeyPatch,
+        self,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         # A lost/failed extend may have been applied server-side: the retry
         # must reuse the same key so it cannot double-extend. After a
@@ -174,11 +387,13 @@ class TestSyncHeartbeatLeadEstimate:
         assert bodies[2]["idempotency_key"] != bodies[0]["idempotency_key"]
 
     def test_permanent_code_stops_heartbeat(
-        self, monkeypatch: pytest.MonkeyPatch,
+        self,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         lifecycle, client = _make_sync()
         client.extend_reservation.return_value = CyclesResponse.http_error(
-            409, "capped",
+            409,
+            "capped",
             body={"error": "MAX_EXTENSIONS_EXCEEDED", "message": "m", "request_id": "r"},
         )
 
@@ -188,14 +403,13 @@ class TestSyncHeartbeatLeadEstimate:
         assert client.extend_reservation.call_count == 1
 
     def test_clamped_grants_extend_every_beat(
-        self, monkeypatch: pytest.MonkeyPatch,
+        self,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         # Server clamps each grant to ttl/4: the lead estimate sees the
         # small grants (authoritative expires_at) and keeps extending.
         lifecycle, client = _make_sync()
-        client.extend_reservation.side_effect = [
-            _extend_ok(INITIAL_EXPIRY + (n + 1) * (TTL // 4)) for n in range(3)
-        ]
+        client.extend_reservation.side_effect = [_extend_ok(INITIAL_EXPIRY + (n + 1) * (TTL // 4)) for n in range(3)]
 
         timeouts = _run_sync_beats(lifecycle, FakeClock(), monkeypatch, beats=3)
 
@@ -204,7 +418,8 @@ class TestSyncHeartbeatLeadEstimate:
         assert timeouts[1] == (TTL / 4 / 2) / 1000.0
 
     def test_grant_clamp_misclassification_after_skip_is_transient(
-        self, monkeypatch: pytest.MonkeyPatch,
+        self,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         # After a skip, the next measured grant arrives across a doubled
         # gap, so grant ≈ elapsed and the beat lands in the lead-clamp arm
@@ -214,9 +429,7 @@ class TestSyncHeartbeatLeadEstimate:
         # band the hold sticks and a ttl/4-grant lease decays to a lapse.
         lifecycle, client = _make_sync()
         grant = TTL // 4  # 15000 → cadence ttl/8 = 7500ms
-        client.extend_reservation.side_effect = [
-            _extend_ok(INITIAL_EXPIRY + (n + 1) * grant) for n in range(6)
-        ]
+        client.extend_reservation.side_effect = [_extend_ok(INITIAL_EXPIRY + (n + 1) * grant) for n in range(6)]
 
         timeouts = _run_sync_beats(lifecycle, FakeClock(), monkeypatch, beats=7)
 
@@ -227,7 +440,8 @@ class TestSyncHeartbeatLeadEstimate:
         assert timeouts == [0.0, 7.5, 7.5, 7.5, 7.5, 30.0, 7.5, 7.5]
 
     def test_missing_expires_in_response_falls_back_to_plus_ttl(
-        self, monkeypatch: pytest.MonkeyPatch,
+        self,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         lifecycle, client = _make_sync()
         client.extend_reservation.return_value = _extend_ok(None)
@@ -241,11 +455,12 @@ class TestSyncHeartbeatLeadEstimate:
         ctx.update_expires_at_ms.assert_not_called()
 
     def test_unknown_initial_expiry_anchors_on_first_success(
-        self, monkeypatch: pytest.MonkeyPatch,
+        self,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         lifecycle, client = _make_sync()
         client.extend_reservation.side_effect = [
-            _extend_ok(500_000),            # beat 1: fallback grant, sets frame
+            _extend_ok(500_000),  # beat 1: fallback grant, sets frame
             _extend_ok(500_000 + 3 * TTL),  # beat 2: big measured grant
         ]
 
@@ -259,11 +474,13 @@ class TestSyncHeartbeatLeadEstimate:
         assert client.extend_reservation.call_count == 3
 
     def test_tenant_closed_stops_heartbeat(
-        self, monkeypatch: pytest.MonkeyPatch,
+        self,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         lifecycle, client = _make_sync()
         client.extend_reservation.return_value = CyclesResponse.http_error(
-            409, "closed",
+            409,
+            "closed",
             body={"error": "TENANT_CLOSED", "message": "m", "request_id": "r"},
         )
 
@@ -272,7 +489,8 @@ class TestSyncHeartbeatLeadEstimate:
         assert client.extend_reservation.call_count == 1
 
     def test_transient_failure_then_recovery(
-        self, monkeypatch: pytest.MonkeyPatch,
+        self,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         # Non-permanent failures warn and keep the loop alive.
         lifecycle, client = _make_sync()
@@ -297,7 +515,7 @@ class TestAsyncHeartbeatLeadEstimate:
         ctx: MagicMock | None = None,
     ) -> None:
         clock = FakeClock()
-        monkeypatch.setattr(lifecycle_mod, "_now_mono_ms", clock.now)
+        monkeypatch.setattr("runcycles.lifecycle._now_mono_ms", clock.now)
         count = 0
 
         async def fake_sleep(s: float) -> None:
@@ -313,12 +531,11 @@ class TestAsyncHeartbeatLeadEstimate:
         await task
 
     async def test_extends_only_when_lead_below_threshold(
-        self, monkeypatch: pytest.MonkeyPatch,
+        self,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         lifecycle, client = _make_async()
-        client.extend_reservation.side_effect = [
-            _extend_ok(INITIAL_EXPIRY + (n + 1) * TTL) for n in range(4)
-        ]
+        client.extend_reservation.side_effect = [_extend_ok(INITIAL_EXPIRY + (n + 1) * TTL) for n in range(4)]
 
         await self._run(lifecycle, 5, monkeypatch)
 
@@ -327,7 +544,8 @@ class TestAsyncHeartbeatLeadEstimate:
         assert client.extend_reservation.await_count == 4
 
     async def test_permanent_code_stops_heartbeat(
-        self, monkeypatch: pytest.MonkeyPatch,
+        self,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         lifecycle, client = _make_async()
         client.extend_reservation.return_value = CyclesResponse.http_error(410, "gone")
@@ -337,15 +555,16 @@ class TestAsyncHeartbeatLeadEstimate:
         assert client.extend_reservation.await_count == 1
 
     async def test_transient_failure_missing_expires_and_late_anchor(
-        self, monkeypatch: pytest.MonkeyPatch,
+        self,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         # Covers the async warn-continue, +=ttl fallback, and late-anchor branches.
         lifecycle, client = _make_async()
         client.extend_reservation.side_effect = [
             CyclesResponse.http_error(500, "boom"),
-            _extend_ok(None),        # frame not yet anchored
-            _extend_ok(700_000),     # late anchor
-            _extend_ok(None),        # anchored: += ttl fallback
+            _extend_ok(None),  # frame not yet anchored
+            _extend_ok(700_000),  # late anchor
+            _extend_ok(None),  # anchored: += ttl fallback
         ]
 
         await self._run(lifecycle, 4, monkeypatch, ctx=_ctx(None))
@@ -355,15 +574,14 @@ class TestAsyncHeartbeatLeadEstimate:
 
 class TestStreamingHeartbeatLeadEstimate:
     def test_sync_stream_lead_estimate_pattern(
-        self, monkeypatch: pytest.MonkeyPatch,
+        self,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         clock = FakeClock()
-        monkeypatch.setattr(lifecycle_mod, "_now_mono_ms", clock.now)
+        monkeypatch.setattr("runcycles.lifecycle._now_mono_ms", clock.now)
         client = MagicMock()
         client._config = _config()
-        client.extend_reservation.side_effect = [
-            _extend_ok(INITIAL_EXPIRY + (n + 1) * TTL) for n in range(4)
-        ]
+        client.extend_reservation.side_effect = [_extend_ok(INITIAL_EXPIRY + (n + 1) * TTL) for n in range(4)]
         stream = StreamReservation(
             client,
             subject=Subject(tenant="acme"),
@@ -390,20 +608,21 @@ class TestStreamingHeartbeatLeadEstimate:
         assert client.extend_reservation.call_count == 4
 
     def test_sync_stream_permanent_and_fallback_branches(
-        self, monkeypatch: pytest.MonkeyPatch,
+        self,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         # Covers the sync-stream +=ttl fallback, late-anchor, transient-warn,
         # and permanent-stop branches in one deterministic run.
         clock = FakeClock()
-        monkeypatch.setattr(lifecycle_mod, "_now_mono_ms", clock.now)
+        monkeypatch.setattr("runcycles.lifecycle._now_mono_ms", clock.now)
         client = MagicMock()
         client._config = _config()
         client.extend_reservation.side_effect = [
-            CyclesResponse.http_error(500, "boom"),      # transient: warn, retry
-            _extend_ok(None),                            # no anchor yet: no-op
-            _extend_ok(900_000),                         # late anchor
-            _extend_ok(None),                            # anchored: += ttl fallback
-            CyclesResponse.http_error(410, "gone"),      # permanent: stop
+            CyclesResponse.http_error(500, "boom"),  # transient: warn, retry
+            _extend_ok(None),  # no anchor yet: no-op
+            _extend_ok(900_000),  # late anchor
+            _extend_ok(None),  # anchored: += ttl fallback
+            CyclesResponse.http_error(410, "gone"),  # permanent: stop
         ]
         stream = StreamReservation(
             client,
@@ -432,19 +651,20 @@ class TestStreamingHeartbeatLeadEstimate:
         assert client.extend_reservation.call_count == 5
 
     def test_sync_stream_field_mode_cycle(
-        self, monkeypatch: pytest.MonkeyPatch,
+        self,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         # Authoritative mode in the sync stream heartbeat: create field
         # drives the first delay; 503 and exception retries stay bounded.
         clock = FakeClock()
-        monkeypatch.setattr(lifecycle_mod, "_now_mono_ms", clock.now)
+        monkeypatch.setattr("runcycles.lifecycle._now_mono_ms", clock.now)
         client = MagicMock()
         client._config = _config()
         client.extend_reservation.side_effect = [
-            _extend_ok(None, remaining_ttl_ms=60_000),
+            _extend_ok(INITIAL_EXPIRY + TTL, remaining_ttl_ms=60_000),
             CyclesResponse.http_error(503, "unavailable"),
             ConnectionError("down"),
-            _extend_ok(None, remaining_ttl_ms=60_000),
+            _extend_ok(INITIAL_EXPIRY + 2 * TTL, remaining_ttl_ms=60_000),
         ]
         stream = StreamReservation(
             client,
@@ -479,17 +699,18 @@ class TestStreamingHeartbeatLeadEstimate:
 
     @pytest.mark.asyncio
     async def test_async_stream_field_mode_cycle(
-        self, monkeypatch: pytest.MonkeyPatch,
+        self,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         clock = FakeClock()
-        monkeypatch.setattr(lifecycle_mod, "_now_mono_ms", clock.now)
+        monkeypatch.setattr("runcycles.lifecycle._now_mono_ms", clock.now)
         client = AsyncMock()
         client._config = _config()
         client.extend_reservation.side_effect = [
-            _extend_ok(None, remaining_ttl_ms=60_000),
+            _extend_ok(INITIAL_EXPIRY + TTL, remaining_ttl_ms=60_000),
             CyclesResponse.http_error(503, "unavailable"),
             ConnectionError("down"),
-            _extend_ok(None, remaining_ttl_ms=60_000),
+            _extend_ok(INITIAL_EXPIRY + 2 * TTL, remaining_ttl_ms=60_000),
         ]
         stream = AsyncStreamReservation(
             client,
@@ -524,15 +745,14 @@ class TestStreamingHeartbeatLeadEstimate:
 
     @pytest.mark.asyncio
     async def test_async_stream_lead_estimate_pattern(
-        self, monkeypatch: pytest.MonkeyPatch,
+        self,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         clock = FakeClock()
-        monkeypatch.setattr(lifecycle_mod, "_now_mono_ms", clock.now)
+        monkeypatch.setattr("runcycles.lifecycle._now_mono_ms", clock.now)
         client = AsyncMock()
         client._config = _config()
-        client.extend_reservation.side_effect = [
-            _extend_ok(INITIAL_EXPIRY + (n + 1) * TTL) for n in range(4)
-        ]
+        client.extend_reservation.side_effect = [_extend_ok(INITIAL_EXPIRY + (n + 1) * TTL) for n in range(4)]
         stream = AsyncStreamReservation(
             client,
             subject=Subject(tenant="acme"),
@@ -560,17 +780,18 @@ class TestStreamingHeartbeatLeadEstimate:
 
     @pytest.mark.asyncio
     async def test_async_stream_permanent_and_fallback_branches(
-        self, monkeypatch: pytest.MonkeyPatch,
+        self,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         clock = FakeClock()
-        monkeypatch.setattr(lifecycle_mod, "_now_mono_ms", clock.now)
+        monkeypatch.setattr("runcycles.lifecycle._now_mono_ms", clock.now)
         client = AsyncMock()
         client._config = _config()
         client.extend_reservation.side_effect = [
             CyclesResponse.http_error(500, "boom"),
-            _extend_ok(None),        # no anchor yet: no-op
-            _extend_ok(900_000),     # late anchor
-            _extend_ok(None),        # anchored: += ttl fallback
+            _extend_ok(None),  # no anchor yet: no-op
+            _extend_ok(900_000),  # late anchor
+            _extend_ok(None),  # anchored: += ttl fallback
             CyclesResponse.http_error(410, "gone"),
         ]
         stream = AsyncStreamReservation(
@@ -611,17 +832,25 @@ class TestAuthoritativeScheduling:
     RESERVE = 25_000.0
 
     def test_create_remaining_drives_first_beat_and_steady_cadence(
-        self, monkeypatch: pytest.MonkeyPatch,
+        self,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         # remaining=60000 → next_delay = 60000 − 25000 = 35000ms. Every
         # extend echoes the field, so the cadence holds at 35s and the
         # heuristic lead_min skip NEVER fires even though accumulated
         # fallback grants would trip it.
         lifecycle, client = _make_sync()
-        client.extend_reservation.return_value = _extend_ok(None, remaining_ttl_ms=60_000)
+        client.extend_reservation.return_value = _extend_ok(
+            INITIAL_EXPIRY + TTL,
+            remaining_ttl_ms=60_000,
+        )
 
         timeouts = _run_sync_beats(
-            lifecycle, FakeClock(), monkeypatch, beats=4, initial_remaining_ms=60_000,
+            lifecycle,
+            FakeClock(),
+            monkeypatch,
+            beats=4,
+            initial_remaining_ms=60_000,
         )
 
         assert client.extend_reservation.call_count == 4
@@ -638,12 +867,19 @@ class TestAuthoritativeScheduling:
         # and surface (spec zero-delay guard) rather than tight-loop a
         # maximum-lead server's extension budget away.
         lifecycle, client = _make_sync()
-        client.extend_reservation.return_value = _extend_ok(None, remaining_ttl_ms=1_000)
+        client.extend_reservation.return_value = _extend_ok(
+            INITIAL_EXPIRY + TTL,
+            remaining_ttl_ms=1_000,
+        )
 
         with caplog.at_level(logging.WARNING, logger="runcycles.lifecycle"):
             timeouts = _run_sync_beats(
-                lifecycle, FakeClock(), monkeypatch, beats=4,
-                ttl=86_400_000, initial_remaining_ms=1_000,
+                lifecycle,
+                FakeClock(),
+                monkeypatch,
+                beats=4,
+                ttl=86_400_000,
+                initial_remaining_ms=1_000,
             )
 
         # Immediate first beat (streak 1), its success hits streak 2 → stop.
@@ -670,7 +906,11 @@ class TestAuthoritativeScheduling:
 
         with caplog.at_level(logging.WARNING, logger="runcycles.lifecycle"):
             timeouts = _run_sync_beats(
-                lifecycle, clock, monkeypatch, beats=3, initial_remaining_ms=60_000,
+                lifecycle,
+                clock,
+                monkeypatch,
+                beats=3,
+                initial_remaining_ms=60_000,
             )
 
         assert client.extend_reservation.call_count == 3
@@ -678,18 +918,23 @@ class TestAuthoritativeScheduling:
         assert not [r for r in caplog.records if "clamp lease lead" in r.message]
 
     def test_field_disappearing_mid_flight_resumes_heuristic(
-        self, monkeypatch: pytest.MonkeyPatch,
+        self,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         # Beat 1's response lacks the field → the v2.3+band heuristic takes
         # over seamlessly from its maintained bookkeeping.
         lifecycle, client = _make_sync()
         client.extend_reservation.side_effect = [
-            _extend_ok(INITIAL_EXPIRY + TTL),          # no field: fallback
+            _extend_ok(INITIAL_EXPIRY + TTL),  # no field: fallback
             _extend_ok(INITIAL_EXPIRY + 2 * TTL),
         ]
 
         timeouts = _run_sync_beats(
-            lifecycle, FakeClock(), monkeypatch, beats=2, initial_remaining_ms=60_000,
+            lifecycle,
+            FakeClock(),
+            monkeypatch,
+            beats=2,
+            initial_remaining_ms=60_000,
         )
 
         assert client.extend_reservation.call_count == 2
@@ -699,7 +944,8 @@ class TestAuthoritativeScheduling:
         assert timeouts[1] == 30.0
 
     def test_transient_failure_recovery_window_shrinks_then_same_key(
-        self, monkeypatch: pytest.MonkeyPatch,
+        self,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         # 503 at the scheduled beat (t=35s): lead_est = 60000 − 35000 =
         # 25000; retry_window = 25000 − 12000 − 1000 = 12000 → retry after
@@ -707,11 +953,15 @@ class TestAuthoritativeScheduling:
         lifecycle, client = _make_sync()
         client.extend_reservation.side_effect = [
             CyclesResponse.http_error(503, "unavailable"),
-            _extend_ok(None, remaining_ttl_ms=60_000),
+            _extend_ok(INITIAL_EXPIRY + TTL, remaining_ttl_ms=60_000),
         ]
 
         timeouts = _run_sync_beats(
-            lifecycle, FakeClock(), monkeypatch, beats=2, initial_remaining_ms=60_000,
+            lifecycle,
+            FakeClock(),
+            monkeypatch,
+            beats=2,
+            initial_remaining_ms=60_000,
         )
 
         assert client.extend_reservation.call_count == 2
@@ -733,7 +983,11 @@ class TestAuthoritativeScheduling:
 
         with caplog.at_level(logging.WARNING, logger="runcycles.lifecycle"):
             timeouts = _run_sync_beats(
-                lifecycle, FakeClock(), monkeypatch, beats=10, initial_remaining_ms=60_000,
+                lifecycle,
+                FakeClock(),
+                monkeypatch,
+                beats=10,
+                initial_remaining_ms=60_000,
             )
 
         assert client.extend_reservation.call_count == 5
@@ -743,18 +997,23 @@ class TestAuthoritativeScheduling:
         assert len(keys) == 1  # every recovery reused the same key
 
     def test_ambiguous_2xx_is_not_applied_same_key_recovery(
-        self, monkeypatch: pytest.MonkeyPatch,
+        self,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         # A non-200 2xx in authoritative mode is ambiguous (spec): never
         # scheduled from — recovered with the SAME idempotency key.
         lifecycle, client = _make_sync()
         client.extend_reservation.side_effect = [
             CyclesResponse.success(202, {"status": "ACTIVE", "remaining_ttl_ms": 60_000}),
-            _extend_ok(None, remaining_ttl_ms=60_000),
+            _extend_ok(INITIAL_EXPIRY + 2 * TTL, remaining_ttl_ms=60_000),
         ]
 
         timeouts = _run_sync_beats(
-            lifecycle, FakeClock(), monkeypatch, beats=2, initial_remaining_ms=60_000,
+            lifecycle,
+            FakeClock(),
+            monkeypatch,
+            beats=2,
+            initial_remaining_ms=60_000,
         )
 
         assert client.extend_reservation.call_count == 2
@@ -763,17 +1022,22 @@ class TestAuthoritativeScheduling:
         assert bodies[0]["idempotency_key"] == bodies[1]["idempotency_key"]
 
     def test_429_honored_only_within_window(
-        self, monkeypatch: pytest.MonkeyPatch,
+        self,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         # Retry-After 3s ≤ window 12000 → retried after exactly 3s, same key.
         lifecycle, client = _make_sync()
         client.extend_reservation.side_effect = [
             CyclesResponse.http_error(429, "limited", headers={"retry-after": "3"}),
-            _extend_ok(None, remaining_ttl_ms=60_000),
+            _extend_ok(INITIAL_EXPIRY + TTL, remaining_ttl_ms=60_000),
         ]
 
         timeouts = _run_sync_beats(
-            lifecycle, FakeClock(), monkeypatch, beats=2, initial_remaining_ms=60_000,
+            lifecycle,
+            FakeClock(),
+            monkeypatch,
+            beats=2,
+            initial_remaining_ms=60_000,
         )
 
         assert client.extend_reservation.call_count == 2
@@ -790,12 +1054,18 @@ class TestAuthoritativeScheduling:
         # re-invented earlier: stop and surface.
         lifecycle, client = _make_sync()
         client.extend_reservation.return_value = CyclesResponse.http_error(
-            429, "limited", headers={"retry-after": "20"},
+            429,
+            "limited",
+            headers={"retry-after": "20"},
         )
 
         with caplog.at_level(logging.WARNING, logger="runcycles.lifecycle"):
             _run_sync_beats(
-                lifecycle, FakeClock(), monkeypatch, beats=4, initial_remaining_ms=60_000,
+                lifecycle,
+                FakeClock(),
+                monkeypatch,
+                beats=4,
+                initial_remaining_ms=60_000,
             )
 
         assert client.extend_reservation.call_count == 1
@@ -808,32 +1078,58 @@ class TestAuthoritativeScheduling:
     ) -> None:
         lifecycle, client = _make_sync()
         client.extend_reservation.return_value = CyclesResponse.http_error(
-            400, "bad",
+            400,
+            "bad",
             body={"error": "INVALID_REQUEST", "message": "m", "request_id": "r"},
         )
 
         with caplog.at_level(logging.WARNING, logger="runcycles.lifecycle"):
             _run_sync_beats(
-                lifecycle, FakeClock(), monkeypatch, beats=4, initial_remaining_ms=60_000,
+                lifecycle,
+                FakeClock(),
+                monkeypatch,
+                beats=4,
+                initial_remaining_ms=60_000,
             )
 
         assert client.extend_reservation.call_count == 1
         assert [r for r in caplog.records if "client error" in r.message]
 
+    def test_unexpected_3xx_stops_without_retry(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        lifecycle, client = _make_sync()
+        client.extend_reservation.return_value = CyclesResponse.http_error(302, "redirect")
+
+        with caplog.at_level(logging.WARNING, logger="runcycles.lifecycle"):
+            _run_sync_beats(
+                lifecycle,
+                FakeClock(),
+                monkeypatch,
+                beats=4,
+                initial_remaining_ms=60_000,
+            )
+
+        assert client.extend_reservation.call_count == 1
+        assert [r for r in caplog.records if "unexpected HTTP status" in r.message]
+
     @pytest.mark.asyncio
     async def test_async_field_mode_full_cycle(
-        self, monkeypatch: pytest.MonkeyPatch,
+        self,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         # Covers the async authoritative arms: initial field delay, 503
         # recovery, exception recovery with a shrinking window, success.
         clock = FakeClock()
-        monkeypatch.setattr(lifecycle_mod, "_now_mono_ms", clock.now)
+        monkeypatch.setattr("runcycles.lifecycle._now_mono_ms", clock.now)
         lifecycle, client = _make_async()
         client.extend_reservation.side_effect = [
-            _extend_ok(None, remaining_ttl_ms=60_000),
+            _extend_ok(INITIAL_EXPIRY + TTL, remaining_ttl_ms=60_000),
             CyclesResponse.http_error(503, "unavailable"),
             ConnectionError("down"),
-            _extend_ok(None, remaining_ttl_ms=60_000),
+            _extend_ok(INITIAL_EXPIRY + 2 * TTL, remaining_ttl_ms=60_000),
         ]
         count = 0
         sleeps: list[float] = []
@@ -852,8 +1148,8 @@ class TestAuthoritativeScheduling:
         await task
 
         assert client.extend_reservation.await_count == 4
-        assert sleeps[0] == 35.0    # from the create field
-        assert sleeps[2] == 6.25    # 503: window 12000, lead_est/4 = 6250
+        assert sleeps[0] == 35.0  # from the create field
+        assert sleeps[2] == 6.25  # 503: window 12000, lead_est/4 = 6250
         assert sleeps[3] == 4.6875  # exception: window shrank to 5750
 
     def test_scheduler_edge_cases_direct(self) -> None:
@@ -870,6 +1166,10 @@ class TestAuthoritativeScheduling:
         sched2 = _AuthoritativeScheduler(12_000.0)
         sched2.on_valid_success(60_000, 0.0, 0.0)
         assert sched2.on_transient_failure(35_000.0, rate_limited=True, retry_after_ms=-1) is None
+        # Unknown/backward timing never fabricates lease lead.
+        sched3 = _AuthoritativeScheduler(12_000.0)
+        assert sched3.on_valid_success(60_000, -1.0, 0.0) == 0.0
+        assert sched3.lead_estimate_ms(-1.0) == 0.0
 
     def test_sync_repeated_ambiguous_2xx_stops(
         self,
@@ -881,7 +1181,11 @@ class TestAuthoritativeScheduling:
 
         with caplog.at_level(logging.WARNING, logger="runcycles.lifecycle"):
             _run_sync_beats(
-                lifecycle, FakeClock(), monkeypatch, beats=10, initial_remaining_ms=60_000,
+                lifecycle,
+                FakeClock(),
+                monkeypatch,
+                beats=10,
+                initial_remaining_ms=60_000,
             )
 
         assert client.extend_reservation.call_count == 5
@@ -897,7 +1201,11 @@ class TestAuthoritativeScheduling:
 
         with caplog.at_level(logging.WARNING, logger="runcycles.lifecycle"):
             _run_sync_beats(
-                lifecycle, FakeClock(), monkeypatch, beats=10, initial_remaining_ms=60_000,
+                lifecycle,
+                FakeClock(),
+                monkeypatch,
+                beats=10,
+                initial_remaining_ms=60_000,
             )
 
         assert client.extend_reservation.call_count == 5
@@ -930,10 +1238,18 @@ class TestAuthoritativeScheduling:
 _STOP_MATRIX = [
     ("s503", lambda: CyclesResponse.http_error(503, "down"), 60_000, 5),
     ("s202", lambda: CyclesResponse.success(202, {"status": "ACTIVE"}), 60_000, 5),
-    ("s400", lambda: CyclesResponse.http_error(
-        400, "bad", body={"error": "INVALID_REQUEST", "message": "m", "request_id": "r"},
-    ), 60_000, 1),
-    ("szero", lambda: _extend_ok(None, remaining_ttl_ms=1_000), 1_000, 1),
+    (
+        "s400",
+        lambda: CyclesResponse.http_error(
+            400,
+            "bad",
+            body={"error": "INVALID_REQUEST", "message": "m", "request_id": "r"},
+        ),
+        60_000,
+        1,
+    ),
+    ("s302", lambda: CyclesResponse.http_error(302, "redirect"), 60_000, 1),
+    ("szero", lambda: _extend_ok(INITIAL_EXPIRY + TTL, remaining_ttl_ms=1_000), 1_000, 1),
     ("sexc", lambda: ConnectionError("down"), 60_000, 5),
 ]
 
@@ -944,6 +1260,7 @@ def _matrix_side_effect(factory: Any) -> Any:
         if isinstance(result, Exception):
             raise result
         return result
+
     return _effect
 
 
@@ -955,11 +1272,15 @@ class TestAuthoritativeStopMatrix:
     )
     @pytest.mark.asyncio
     async def test_async_lifecycle_arms(
-        self, name: str, factory: Any, initial: int, expected: int,
+        self,
+        name: str,
+        factory: Any,
+        initial: int,
+        expected: int,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         clock = FakeClock()
-        monkeypatch.setattr(lifecycle_mod, "_now_mono_ms", clock.now)
+        monkeypatch.setattr("runcycles.lifecycle._now_mono_ms", clock.now)
         lifecycle, client = _make_async()
         client.extend_reservation.side_effect = _matrix_side_effect(factory)
         count = 0
@@ -980,14 +1301,15 @@ class TestAuthoritativeStopMatrix:
 
     @pytest.mark.asyncio
     async def test_async_lifecycle_429_honored(
-        self, monkeypatch: pytest.MonkeyPatch,
+        self,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         clock = FakeClock()
-        monkeypatch.setattr(lifecycle_mod, "_now_mono_ms", clock.now)
+        monkeypatch.setattr("runcycles.lifecycle._now_mono_ms", clock.now)
         lifecycle, client = _make_async()
         client.extend_reservation.side_effect = [
             CyclesResponse.http_error(429, "limited", headers={"retry-after": "3"}),
-            _extend_ok(None, remaining_ttl_ms=60_000),
+            _extend_ok(INITIAL_EXPIRY + TTL, remaining_ttl_ms=60_000),
         ]
         count = 0
         sleeps: list[float] = []
@@ -1028,11 +1350,15 @@ class TestAuthoritativeStopMatrix:
         ids=[m[0] for m in _STOP_MATRIX],
     )
     def test_sync_stream_arms(
-        self, name: str, factory: Any, initial: int, expected: int,
+        self,
+        name: str,
+        factory: Any,
+        initial: int,
+        expected: int,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         clock = FakeClock()
-        monkeypatch.setattr(lifecycle_mod, "_now_mono_ms", clock.now)
+        monkeypatch.setattr("runcycles.lifecycle._now_mono_ms", clock.now)
         stream, client = self._make_stream()
         client.extend_reservation.side_effect = _matrix_side_effect(factory)
         stream._initial_remaining = initial
@@ -1054,11 +1380,11 @@ class TestAuthoritativeStopMatrix:
 
     def test_sync_stream_429_honored(self, monkeypatch: pytest.MonkeyPatch) -> None:
         clock = FakeClock()
-        monkeypatch.setattr(lifecycle_mod, "_now_mono_ms", clock.now)
+        monkeypatch.setattr("runcycles.lifecycle._now_mono_ms", clock.now)
         stream, client = self._make_stream()
         client.extend_reservation.side_effect = [
             CyclesResponse.http_error(429, "limited", headers={"retry-after": "3"}),
-            _extend_ok(None, remaining_ttl_ms=60_000),
+            _extend_ok(INITIAL_EXPIRY + TTL, remaining_ttl_ms=60_000),
         ]
         stream._initial_remaining = 60_000
         timeouts: list[float] = []
@@ -1101,11 +1427,15 @@ class TestAuthoritativeStopMatrix:
     )
     @pytest.mark.asyncio
     async def test_async_stream_arms(
-        self, name: str, factory: Any, initial: int, expected: int,
+        self,
+        name: str,
+        factory: Any,
+        initial: int,
+        expected: int,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         clock = FakeClock()
-        monkeypatch.setattr(lifecycle_mod, "_now_mono_ms", clock.now)
+        monkeypatch.setattr("runcycles.lifecycle._now_mono_ms", clock.now)
         stream, client = self._make_async_stream()
         client.extend_reservation.side_effect = _matrix_side_effect(factory)
         stream._initial_remaining = initial
@@ -1127,14 +1457,15 @@ class TestAuthoritativeStopMatrix:
 
     @pytest.mark.asyncio
     async def test_async_stream_429_honored(
-        self, monkeypatch: pytest.MonkeyPatch,
+        self,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         clock = FakeClock()
-        monkeypatch.setattr(lifecycle_mod, "_now_mono_ms", clock.now)
+        monkeypatch.setattr("runcycles.lifecycle._now_mono_ms", clock.now)
         stream, client = self._make_async_stream()
         client.extend_reservation.side_effect = [
             CyclesResponse.http_error(429, "limited", headers={"retry-after": "3"}),
-            _extend_ok(None, remaining_ttl_ms=60_000),
+            _extend_ok(INITIAL_EXPIRY + TTL, remaining_ttl_ms=60_000),
         ]
         stream._initial_remaining = 60_000
         count = 0
@@ -1166,16 +1497,15 @@ class TestAuthoritativeStopMatrix:
 class TestServerDateAccessor:
     def test_server_date_ms_parses_http_date(self) -> None:
         response = CyclesResponse.success(
-            200, {}, headers={"date": "Mon, 27 Jul 2026 12:00:00 GMT"},
+            200,
+            {},
+            headers={"date": "Mon, 27 Jul 2026 12:00:00 GMT"},
         )
         assert response.server_date_ms == 1785153600000
 
     def test_server_date_ms_absent_or_garbage(self) -> None:
         assert CyclesResponse.success(200, {}).server_date_ms is None
-        assert (
-            CyclesResponse.success(200, {}, headers={"date": "not a date"}).server_date_ms
-            is None
-        )
+        assert CyclesResponse.success(200, {}, headers={"date": "not a date"}).server_date_ms is None
 
 
 # ---------------------------------------------------------------------------
@@ -1191,7 +1521,8 @@ def _cfg(**kwargs: Any) -> DecoratorConfig:
 
 class TestFirstBeatAndRegimes:
     def test_first_beat_is_immediate_even_for_huge_ttl(
-        self, monkeypatch: pytest.MonkeyPatch,
+        self,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         # A 24h request silently capped to a small lease by tenant policy
         # must still survive: only a zero first delay guarantees the first
@@ -1199,12 +1530,17 @@ class TestFirstBeatAndRegimes:
         lifecycle, client = _make_sync()
         client.extend_reservation.return_value = _extend_ok(None)
         timeouts = _run_sync_beats(
-            lifecycle, FakeClock(), monkeypatch, beats=1, ttl=86_400_000,
+            lifecycle,
+            FakeClock(),
+            monkeypatch,
+            beats=1,
+            ttl=86_400_000,
         )
         assert timeouts[0] == 0.0
 
     def test_first_beat_failure_does_not_hot_loop(
-        self, monkeypatch: pytest.MonkeyPatch,
+        self,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         # A transient failure on the primed (delay-0) beat must back off to
         # the held cadence, not spin at 0ms against a down server.
