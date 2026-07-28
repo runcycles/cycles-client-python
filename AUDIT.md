@@ -13,6 +13,58 @@
 
 ---
 
+## 2026-07-28 — Server-authoritative heartbeat via remaining_ttl_ms (v0.5.1, same PR)
+
+Spec review round 5 proved the fallback heuristic's regime detection
+undecidable (sticky band window [0.75×min(ttl/2,30s), 0.9×ttl)) and
+immediate priming schedule-dependent under maximum-lead clamping, so the
+protocol adopted remaining_ttl_ms on create+extend responses (spec
+v0.1.25.16; cycles-server v0.1.25.59 emits it, recomputed fresh on
+idempotent replays and excluded from evidence). The SDK implements the
+spec's hardened NORMATIVE algorithm when the field is present: per-attempt
+rtt, lead_floor = max(0, remaining − rtt), retry_reserve =
+2×max(request_timeout_budget, 1s, 2×rtt_max) + max(1s, 2×rtt_max) (the
+enforced httpx timeouts define the budget), next beat at lead_floor −
+retry_reserve from response receipt, recomputed per schema-valid 200
+(non-200 2xx is ambiguous → same-key recovery); recovery repeats while
+retry_window = lead_estimate − attempt_budget − safety_margin stays
+positive with a no-progress guard, 429 Retry-After honored only inside the
+window, other 4xx stop without key rotation; a lease that cannot hold the
+reserve gets one immediate fresh attempt then stop-and-surface; lead_min
+skip bypassed; no primed extension when the create carries the field.
+Bookkeeping keeps running so the v2.3+band heuristic (now explicitly
+best-effort fallback) resumes seamlessly if the field disappears. Final
+self-review also made the response contract uniform across both scheduling
+modes: only a complete schema-valid HTTP 200 create/extend response succeeds;
+ambiguous 2xx keeps the same key. The enforced timeout covers the whole
+attempt, first-delay setup time is deducted, and reliable pre-field RTT
+samples remain in the safety budget. 597 tests pass at 99.07% coverage.
+
+## 2026-07-27 — Heartbeat conservative-lead redesign + actual_source marker (v0.5.1)
+
+The heartbeat extended by full ttl_ms every ttl/2 beat while extend_by_ms
+is relative to current expiry — drifting expiry outward +ttl/2 per beat
+(zombie budget lockup on kill; max_extensions burned 2× too fast). Four
+adversarial review rounds refined the replacement; final (v2.3) design:
+conservative lead LOWER BOUND lead_min = Σ measured grants − monotonic
+elapsed (grants from successive returned expires_at_ms — same server
+frame only, no cross-clock arithmetic); FIRST extension fires immediately
+(any bounded first delay can outlive a tenant-policy-capped lease);
+cadence splits by regime — a grant tracking the lease drives
+clamp(grant/2, 500ms, ttl/2), while a grant merely mirroring elapsed time
+(maximum-lead clamping: grant ≤ 0, or grant < 0.9×ttl inside a
+[0.75, 1.25]×elapsed band — the lower edge keeps a post-skip small grant
+from sticking in the hold) carries no wire cadence signal, so the loop
+holds min(ttl/2, 30s) and warns once instead of burning max_extensions at
+the floor; a transient failure on the primed beat backs off to the held
+cadence (no hot loop); skip at lead_min ≥ 1.5×last_grant; extend
+idempotency key reused on retries; permanent stop on expired/finalized/
+max-extensions/tenant-closed/not-found (and raw 404/410). The HTTP Date
+header plays no heartbeat role (RFC 9110 §6.6.1; Redis TIME vs container
+clock). Commits whose actual was defaulted from the estimate now carry
+metadata.actual_source="estimate" for audit honesty. Spec guidance:
+cycles-protocol#148. 533 tests pass at 100% coverage.
+
 ## 2026-07-27 — Durable commit retries (journal + /v1/events fallback)
 
 Pending commits no longer exist only in memory: the retry engines journal
