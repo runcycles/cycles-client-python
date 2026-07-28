@@ -473,9 +473,9 @@ class TestStreamingHeartbeatLeadEstimate:
         thread.join(timeout=5)
 
         assert client.extend_reservation.call_count == 4
-        assert timeouts[0] == 59.0
-        assert timeouts[2] == 1.0
-        assert timeouts[3] == 1.0
+        assert timeouts[0] == 35.0
+        assert timeouts[2] == 6.25
+        assert timeouts[3] == 4.6875
 
     @pytest.mark.asyncio
     async def test_async_stream_field_mode_cycle(
@@ -518,9 +518,9 @@ class TestStreamingHeartbeatLeadEstimate:
         await task
 
         assert client.extend_reservation.await_count == 4
-        assert sleeps[0] == 59.0
-        assert sleeps[2] == 1.0
-        assert sleeps[3] == 1.0
+        assert sleeps[0] == 35.0
+        assert sleeps[2] == 6.25
+        assert sleeps[3] == 4.6875
 
     @pytest.mark.asyncio
     async def test_async_stream_lead_estimate_pattern(
@@ -605,13 +605,18 @@ class TestStreamingHeartbeatLeadEstimate:
 
 
 class TestAuthoritativeScheduling:
+    # With the SDK's enforced httpx timeouts (connect 2s + read 5s + write
+    # 5s), request_timeout_budget = 12000ms; at rtt 0: attempt_budget =
+    # 12000, safety_margin = 1000, retry_reserve = 2×12000 + 1000 = 25000.
+    RESERVE = 25_000.0
+
     def test_create_remaining_drives_first_beat_and_steady_cadence(
         self, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        # remaining=60000, rtt=0 → reserve = min(30000, max(1000, 0)) = 1000,
-        # first delay 59000ms. Every extend echoes the field, so the cadence
-        # holds at 59s and the heuristic lead_min skip NEVER fires even
-        # though accumulated fallback grants would trip it.
+        # remaining=60000 → next_delay = 60000 − 25000 = 35000ms. Every
+        # extend echoes the field, so the cadence holds at 35s and the
+        # heuristic lead_min skip NEVER fires even though accumulated
+        # fallback grants would trip it.
         lifecycle, client = _make_sync()
         client.extend_reservation.return_value = _extend_ok(None, remaining_ttl_ms=60_000)
 
@@ -620,24 +625,31 @@ class TestAuthoritativeScheduling:
         )
 
         assert client.extend_reservation.call_count == 4
-        assert timeouts == [59.0, 59.0, 59.0, 59.0, 59.0]
+        assert timeouts == [35.0, 35.0, 35.0, 35.0, 35.0]
 
-    def test_capped_create_first_beat_lands_inside_small_lease(
-        self, monkeypatch: pytest.MonkeyPatch,
+    def test_lease_below_reserve_one_immediate_attempt_then_stop(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
     ) -> None:
-        # 24h request, tenant caps to 1s: remaining=1000 → reserve =
-        # min(500, 1000) = 500 → first beat at 500ms, inside the real lease.
-        # This is the exact case that motivated the wire field.
+        # 24h request capped to a 1s lease: the lease cannot hold the
+        # 25s retry reserve → next_delay 0 → ONE immediate fresh attempt is
+        # permitted; when its success also yields 0, the client MUST stop
+        # and surface (spec zero-delay guard) rather than tight-loop a
+        # maximum-lead server's extension budget away.
         lifecycle, client = _make_sync()
         client.extend_reservation.return_value = _extend_ok(None, remaining_ttl_ms=1_000)
 
-        timeouts = _run_sync_beats(
-            lifecycle, FakeClock(), monkeypatch, beats=1,
-            ttl=86_400_000, initial_remaining_ms=1_000,
-        )
+        with caplog.at_level(logging.WARNING, logger="runcycles.lifecycle"):
+            timeouts = _run_sync_beats(
+                lifecycle, FakeClock(), monkeypatch, beats=4,
+                ttl=86_400_000, initial_remaining_ms=1_000,
+            )
 
-        assert timeouts[0] == 0.5
+        # Immediate first beat (streak 1), its success hits streak 2 → stop.
+        assert timeouts[0] == 0.0
         assert client.extend_reservation.call_count == 1
+        assert [r for r in caplog.records if "retry-safety budget" in r.message]
 
     def test_lead_clamp_server_with_field_no_warn_no_collapse(
         self,
@@ -646,24 +658,23 @@ class TestAuthoritativeScheduling:
     ) -> None:
         # A maximum-lead-clamping server that DOES emit remaining_ttl_ms:
         # expiry echoes elapsed (grant ≈ elapsed, the heuristic's worst
-        # case) but the field carries the true lease → authoritative arm
+        # case) but the field carries the true 60s lead → authoritative arm
         # schedules cleanly and the clamp warning never fires.
         clock = FakeClock()
         lifecycle, client = _make_sync()
 
         def clamped_extend(rid: str, body: dict[str, Any]) -> CyclesResponse:
-            return _extend_ok(INITIAL_EXPIRY + int(clock.t), remaining_ttl_ms=15_000)
+            return _extend_ok(INITIAL_EXPIRY + int(clock.t), remaining_ttl_ms=60_000)
 
         client.extend_reservation.side_effect = clamped_extend
 
         with caplog.at_level(logging.WARNING, logger="runcycles.lifecycle"):
             timeouts = _run_sync_beats(
-                lifecycle, clock, monkeypatch, beats=3, initial_remaining_ms=15_000,
+                lifecycle, clock, monkeypatch, beats=3, initial_remaining_ms=60_000,
             )
 
         assert client.extend_reservation.call_count == 3
-        # remaining=15000 → reserve min(7500, 1000) = 1000 → delay 14s.
-        assert timeouts == [14.0, 14.0, 14.0, 14.0]
+        assert timeouts == [35.0, 35.0, 35.0, 35.0]
         assert not [r for r in caplog.records if "clamp lease lead" in r.message]
 
     def test_field_disappearing_mid_flight_resumes_heuristic(
@@ -682,17 +693,17 @@ class TestAuthoritativeScheduling:
         )
 
         assert client.extend_reservation.call_count == 2
-        # First delay authoritative (59s); after the fieldless response the
+        # First delay authoritative (35s); after the fieldless response the
         # normal-regime cadence (ttl/2 = 30s) applies.
-        assert timeouts[0] == 59.0
+        assert timeouts[0] == 35.0
         assert timeouts[1] == 30.0
 
-    def test_transient_failure_in_field_mode_retries_bounded_same_key(
+    def test_transient_failure_recovery_window_shrinks_then_same_key(
         self, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        # At the scheduled beat the remaining lead estimate is ~the retry
-        # reserve (1000ms) → retry delay clamp(lead/4, 1s, 30s) = 1s, with
-        # the SAME idempotency key; the following success uses a fresh key.
+        # 503 at the scheduled beat (t=35s): lead_est = 60000 − 35000 =
+        # 25000; retry_window = 25000 − 12000 − 1000 = 12000 → retry after
+        # min(30000, 25000/4, 12000) = 6250ms, with the SAME key.
         lifecycle, client = _make_sync()
         client.extend_reservation.side_effect = [
             CyclesResponse.http_error(503, "unavailable"),
@@ -704,17 +715,41 @@ class TestAuthoritativeScheduling:
         )
 
         assert client.extend_reservation.call_count == 2
-        assert timeouts[0] == 59.0
-        assert timeouts[1] == 1.0
+        assert timeouts[0] == 35.0
+        assert timeouts[1] == 6.25
         bodies = [c.args[1] for c in client.extend_reservation.call_args_list]
         assert bodies[0]["idempotency_key"] == bodies[1]["idempotency_key"]
 
-    def test_exception_in_field_mode_retries_bounded_same_key(
+    def test_repeated_failures_stop_when_no_window_progress(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        # Recovery repeats with the same key while the freshly recomputed
+        # retry_window shrinks: 6250 → 4687.5 → 1062.5 → 0 (one immediate
+        # retry) → no progress at 0 → MUST stop. Five attempts total.
+        lifecycle, client = _make_sync()
+        client.extend_reservation.return_value = CyclesResponse.http_error(503, "down")
+
+        with caplog.at_level(logging.WARNING, logger="runcycles.lifecycle"):
+            timeouts = _run_sync_beats(
+                lifecycle, FakeClock(), monkeypatch, beats=10, initial_remaining_ms=60_000,
+            )
+
+        assert client.extend_reservation.call_count == 5
+        assert timeouts == [35.0, 6.25, 4.6875, 1.0625, 0.0]
+        assert [r for r in caplog.records if "no safe recovery window" in r.message]
+        keys = {c.args[1]["idempotency_key"] for c in client.extend_reservation.call_args_list}
+        assert len(keys) == 1  # every recovery reused the same key
+
+    def test_ambiguous_2xx_is_not_applied_same_key_recovery(
         self, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
+        # A non-200 2xx in authoritative mode is ambiguous (spec): never
+        # scheduled from — recovered with the SAME idempotency key.
         lifecycle, client = _make_sync()
         client.extend_reservation.side_effect = [
-            ConnectionError("down"),
+            CyclesResponse.success(202, {"status": "ACTIVE", "remaining_ttl_ms": 60_000}),
             _extend_ok(None, remaining_ttl_ms=60_000),
         ]
 
@@ -723,16 +758,74 @@ class TestAuthoritativeScheduling:
         )
 
         assert client.extend_reservation.call_count == 2
-        assert timeouts[1] == 1.0
+        assert timeouts[1] == 6.25
         bodies = [c.args[1] for c in client.extend_reservation.call_args_list]
         assert bodies[0]["idempotency_key"] == bodies[1]["idempotency_key"]
+
+    def test_429_honored_only_within_window(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # Retry-After 3s ≤ window 12000 → retried after exactly 3s, same key.
+        lifecycle, client = _make_sync()
+        client.extend_reservation.side_effect = [
+            CyclesResponse.http_error(429, "limited", headers={"retry-after": "3"}),
+            _extend_ok(None, remaining_ttl_ms=60_000),
+        ]
+
+        timeouts = _run_sync_beats(
+            lifecycle, FakeClock(), monkeypatch, beats=2, initial_remaining_ms=60_000,
+        )
+
+        assert client.extend_reservation.call_count == 2
+        assert timeouts[1] == 3.0
+        bodies = [c.args[1] for c in client.extend_reservation.call_args_list]
+        assert bodies[0]["idempotency_key"] == bodies[1]["idempotency_key"]
+
+    def test_429_missing_or_oversized_retry_after_stops(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        # Retry-After exceeding the retry window (20s > 12000ms) must not be
+        # re-invented earlier: stop and surface.
+        lifecycle, client = _make_sync()
+        client.extend_reservation.return_value = CyclesResponse.http_error(
+            429, "limited", headers={"retry-after": "20"},
+        )
+
+        with caplog.at_level(logging.WARNING, logger="runcycles.lifecycle"):
+            _run_sync_beats(
+                lifecycle, FakeClock(), monkeypatch, beats=4, initial_remaining_ms=60_000,
+            )
+
+        assert client.extend_reservation.call_count == 1
+        assert [r for r in caplog.records if "no safe recovery window" in r.message]
+
+    def test_other_4xx_stops_without_key_rotation(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        lifecycle, client = _make_sync()
+        client.extend_reservation.return_value = CyclesResponse.http_error(
+            400, "bad",
+            body={"error": "INVALID_REQUEST", "message": "m", "request_id": "r"},
+        )
+
+        with caplog.at_level(logging.WARNING, logger="runcycles.lifecycle"):
+            _run_sync_beats(
+                lifecycle, FakeClock(), monkeypatch, beats=4, initial_remaining_ms=60_000,
+            )
+
+        assert client.extend_reservation.call_count == 1
+        assert [r for r in caplog.records if "client error" in r.message]
 
     @pytest.mark.asyncio
     async def test_async_field_mode_full_cycle(
         self, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         # Covers the async authoritative arms: initial field delay, 503
-        # bounded retry, exception bounded retry, and field-driven success.
+        # recovery, exception recovery with a shrinking window, success.
         clock = FakeClock()
         monkeypatch.setattr(lifecycle_mod, "_now_mono_ms", clock.now)
         lifecycle, client = _make_async()
@@ -759,9 +852,56 @@ class TestAuthoritativeScheduling:
         await task
 
         assert client.extend_reservation.await_count == 4
-        assert sleeps[0] == 59.0   # from the create field
-        assert sleeps[2] == 1.0    # bounded 503 retry inside the known lease
-        assert sleeps[3] == 1.0    # bounded exception retry
+        assert sleeps[0] == 35.0    # from the create field
+        assert sleeps[2] == 6.25    # 503: window 12000, lead_est/4 = 6250
+        assert sleeps[3] == 4.6875  # exception: window shrank to 5750
+
+    def test_scheduler_edge_cases_direct(self) -> None:
+        from runcycles.lifecycle import _AuthoritativeScheduler
+
+        sched = _AuthoritativeScheduler(12_000.0)
+        # No schema-valid response yet → lead estimate is 0 and any failure
+        # has no recovery window.
+        assert sched.lead_estimate_ms(1_000.0) == 0.0
+        assert sched.on_transient_failure(1_000.0) is None
+        # Establish a lead, then: missing and negative Retry-After stop.
+        assert sched.on_valid_success(60_000, 0.0, 0.0) == 35_000.0
+        assert sched.on_transient_failure(35_000.0, rate_limited=True, retry_after_ms=None) is None
+        sched2 = _AuthoritativeScheduler(12_000.0)
+        sched2.on_valid_success(60_000, 0.0, 0.0)
+        assert sched2.on_transient_failure(35_000.0, rate_limited=True, retry_after_ms=-1) is None
+
+    def test_sync_repeated_ambiguous_2xx_stops(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        lifecycle, client = _make_sync()
+        client.extend_reservation.return_value = CyclesResponse.success(202, {"status": "ACTIVE"})
+
+        with caplog.at_level(logging.WARNING, logger="runcycles.lifecycle"):
+            _run_sync_beats(
+                lifecycle, FakeClock(), monkeypatch, beats=10, initial_remaining_ms=60_000,
+            )
+
+        assert client.extend_reservation.call_count == 5
+        assert [r for r in caplog.records if "no safe recovery window" in r.message]
+
+    def test_sync_repeated_exceptions_stop(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        lifecycle, client = _make_sync()
+        client.extend_reservation.side_effect = ConnectionError("down")
+
+        with caplog.at_level(logging.WARNING, logger="runcycles.lifecycle"):
+            _run_sync_beats(
+                lifecycle, FakeClock(), monkeypatch, beats=10, initial_remaining_ms=60_000,
+            )
+
+        assert client.extend_reservation.call_count == 5
+        assert [r for r in caplog.records if "no safe recovery window" in r.message]
 
     def test_create_response_model_parses_remaining(self) -> None:
         from runcycles.models import ReservationCreateResponse
@@ -777,6 +917,244 @@ class TestAuthoritativeScheduling:
         assert parsed.remaining_ttl_ms == 10_000
         body.pop("remaining_ttl_ms")
         assert ReservationCreateResponse.model_validate(body).remaining_ttl_ms is None
+
+
+# Scenario matrix for the authoritative stop/recovery arms, exercised
+# against every loop variant (async lifecycle, sync stream, async stream).
+# Each entry: (responses factory, initial_remaining, expected extend calls).
+#   - repeated 503 / ambiguous 202 / exceptions: recovery windows shrink
+#     6250 → 4687.5 → 1062.5 → 0 → no-progress stop = 5 attempts;
+#   - 400: unrecoverable client error, stop after 1;
+#   - tiny lease: zero-delay guard, 1 immediate attempt then stop;
+#   - 429 with Retry-After 3s inside the window: honored, then success.
+_STOP_MATRIX = [
+    ("s503", lambda: CyclesResponse.http_error(503, "down"), 60_000, 5),
+    ("s202", lambda: CyclesResponse.success(202, {"status": "ACTIVE"}), 60_000, 5),
+    ("s400", lambda: CyclesResponse.http_error(
+        400, "bad", body={"error": "INVALID_REQUEST", "message": "m", "request_id": "r"},
+    ), 60_000, 1),
+    ("szero", lambda: _extend_ok(None, remaining_ttl_ms=1_000), 1_000, 1),
+    ("sexc", lambda: ConnectionError("down"), 60_000, 5),
+]
+
+
+def _matrix_side_effect(factory: Any) -> Any:
+    def _effect(*args: Any, **kwargs: Any) -> CyclesResponse:
+        result = factory()
+        if isinstance(result, Exception):
+            raise result
+        return result
+    return _effect
+
+
+class TestAuthoritativeStopMatrix:
+    @pytest.mark.parametrize(
+        ("name", "factory", "initial", "expected"),
+        _STOP_MATRIX,
+        ids=[m[0] for m in _STOP_MATRIX],
+    )
+    @pytest.mark.asyncio
+    async def test_async_lifecycle_arms(
+        self, name: str, factory: Any, initial: int, expected: int,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        clock = FakeClock()
+        monkeypatch.setattr(lifecycle_mod, "_now_mono_ms", clock.now)
+        lifecycle, client = _make_async()
+        client.extend_reservation.side_effect = _matrix_side_effect(factory)
+        count = 0
+
+        async def fake_sleep(s: float) -> None:
+            nonlocal count
+            count += 1
+            if count > 10:
+                raise asyncio.CancelledError
+            clock.t += s * 1000.0
+
+        monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+        task = lifecycle._start_heartbeat("rsv_1", TTL, _ctx(), initial)
+        assert task is not None
+        await task
+
+        assert client.extend_reservation.await_count == expected
+
+    @pytest.mark.asyncio
+    async def test_async_lifecycle_429_honored(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        clock = FakeClock()
+        monkeypatch.setattr(lifecycle_mod, "_now_mono_ms", clock.now)
+        lifecycle, client = _make_async()
+        client.extend_reservation.side_effect = [
+            CyclesResponse.http_error(429, "limited", headers={"retry-after": "3"}),
+            _extend_ok(None, remaining_ttl_ms=60_000),
+        ]
+        count = 0
+        sleeps: list[float] = []
+
+        async def fake_sleep(s: float) -> None:
+            nonlocal count
+            sleeps.append(s)
+            count += 1
+            if count > 2:
+                raise asyncio.CancelledError
+            clock.t += s * 1000.0
+
+        monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+        task = lifecycle._start_heartbeat("rsv_1", TTL, _ctx(), 60_000)
+        assert task is not None
+        await task
+
+        assert client.extend_reservation.await_count == 2
+        assert sleeps[1] == 3.0
+
+    def _make_stream(self) -> tuple[StreamReservation, MagicMock]:
+        client = MagicMock()
+        client._config = _config()
+        stream = StreamReservation(
+            client,
+            subject=Subject(tenant="acme"),
+            action=Action(kind="k", name="n"),
+            estimate=Amount(unit=Unit.USD_MICROCENTS, amount=1000),
+            ttl_ms=TTL,
+        )
+        stream._reservation_id = "rsv_1"
+        stream._ctx = _ctx()
+        return stream, client
+
+    @pytest.mark.parametrize(
+        ("name", "factory", "initial", "expected"),
+        _STOP_MATRIX,
+        ids=[m[0] for m in _STOP_MATRIX],
+    )
+    def test_sync_stream_arms(
+        self, name: str, factory: Any, initial: int, expected: int,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        clock = FakeClock()
+        monkeypatch.setattr(lifecycle_mod, "_now_mono_ms", clock.now)
+        stream, client = self._make_stream()
+        client.extend_reservation.side_effect = _matrix_side_effect(factory)
+        stream._initial_remaining = initial
+        calls = {"n": 0}
+
+        def wait(timeout: float | None = None) -> bool:
+            calls["n"] += 1
+            if calls["n"] > 10:
+                return True
+            clock.t += (timeout or 0.0) * 1000.0
+            return False
+
+        stream._heartbeat_stop.wait = wait  # type: ignore[method-assign]
+        thread = stream._start_heartbeat()
+        assert thread is not None
+        thread.join(timeout=5)
+
+        assert client.extend_reservation.call_count == expected
+
+    def test_sync_stream_429_honored(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        clock = FakeClock()
+        monkeypatch.setattr(lifecycle_mod, "_now_mono_ms", clock.now)
+        stream, client = self._make_stream()
+        client.extend_reservation.side_effect = [
+            CyclesResponse.http_error(429, "limited", headers={"retry-after": "3"}),
+            _extend_ok(None, remaining_ttl_ms=60_000),
+        ]
+        stream._initial_remaining = 60_000
+        timeouts: list[float] = []
+        calls = {"n": 0}
+
+        def wait(timeout: float | None = None) -> bool:
+            timeouts.append(timeout or 0.0)
+            calls["n"] += 1
+            if calls["n"] > 2:
+                return True
+            clock.t += (timeout or 0.0) * 1000.0
+            return False
+
+        stream._heartbeat_stop.wait = wait  # type: ignore[method-assign]
+        thread = stream._start_heartbeat()
+        assert thread is not None
+        thread.join(timeout=5)
+
+        assert client.extend_reservation.call_count == 2
+        assert timeouts[1] == 3.0
+
+    def _make_async_stream(self) -> tuple[AsyncStreamReservation, AsyncMock]:
+        client = AsyncMock()
+        client._config = _config()
+        stream = AsyncStreamReservation(
+            client,
+            subject=Subject(tenant="acme"),
+            action=Action(kind="k", name="n"),
+            estimate=Amount(unit=Unit.USD_MICROCENTS, amount=1000),
+            ttl_ms=TTL,
+        )
+        stream._reservation_id = "rsv_1"
+        stream._ctx = _ctx()
+        return stream, client
+
+    @pytest.mark.parametrize(
+        ("name", "factory", "initial", "expected"),
+        _STOP_MATRIX,
+        ids=[m[0] for m in _STOP_MATRIX],
+    )
+    @pytest.mark.asyncio
+    async def test_async_stream_arms(
+        self, name: str, factory: Any, initial: int, expected: int,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        clock = FakeClock()
+        monkeypatch.setattr(lifecycle_mod, "_now_mono_ms", clock.now)
+        stream, client = self._make_async_stream()
+        client.extend_reservation.side_effect = _matrix_side_effect(factory)
+        stream._initial_remaining = initial
+        count = 0
+
+        async def fake_sleep(s: float) -> None:
+            nonlocal count
+            count += 1
+            if count > 10:
+                raise asyncio.CancelledError
+            clock.t += s * 1000.0
+
+        monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+        task = stream._start_heartbeat()
+        assert task is not None
+        await task
+
+        assert client.extend_reservation.await_count == expected
+
+    @pytest.mark.asyncio
+    async def test_async_stream_429_honored(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        clock = FakeClock()
+        monkeypatch.setattr(lifecycle_mod, "_now_mono_ms", clock.now)
+        stream, client = self._make_async_stream()
+        client.extend_reservation.side_effect = [
+            CyclesResponse.http_error(429, "limited", headers={"retry-after": "3"}),
+            _extend_ok(None, remaining_ttl_ms=60_000),
+        ]
+        stream._initial_remaining = 60_000
+        count = 0
+        sleeps: list[float] = []
+
+        async def fake_sleep(s: float) -> None:
+            nonlocal count
+            sleeps.append(s)
+            count += 1
+            if count > 2:
+                raise asyncio.CancelledError
+            clock.t += s * 1000.0
+
+        monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+        task = stream._start_heartbeat()
+        assert task is not None
+        await task
+
+        assert client.extend_reservation.await_count == 2
+        assert sleeps[1] == 3.0
 
 
 # ---------------------------------------------------------------------------

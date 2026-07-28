@@ -16,20 +16,25 @@
 ## 2026-07-28 — Server-authoritative heartbeat via remaining_ttl_ms (v0.5.1, same PR)
 
 Spec review round 5 proved the fallback heuristic's regime detection
-undecidable (sticky band window [0.75×min(ttl/2,30s), 0.9×ttl) — e.g.
-ttl 24s / cap 10s / held 12s / ratio 0.833 forever, lease erodes to
-lapse) and immediate priming schedule-dependent under maximum-lead
-clamping. Adopted the reviewer's fix: spec v0.1.25.16 adds
-remaining_ttl_ms to create+extend responses (cycles-server v0.1.25.59
-emits it; extend replays recompute it fresh). When present, the SDK
-schedules from it directly — lead_floor = max(0, remaining − rtt), next
-beat at lead_floor − min(lead_floor/2, max(1s, 2×rtt_max)) from response
-receipt, recomputed per field-bearing response, lead_min skip bypassed,
-no primed first extension (create field drives the first delay), bounded
-same-key retry clamp(lead/4, 1s, 30s) on transient failures. Bookkeeping
-keeps running so the v2.3+band heuristic (now explicitly best-effort
-fallback) resumes seamlessly if the field disappears; fieldless servers
-see unchanged behavior. 543 tests pass at 100% coverage.
+undecidable (sticky band window [0.75×min(ttl/2,30s), 0.9×ttl)) and
+immediate priming schedule-dependent under maximum-lead clamping, so the
+protocol adopted remaining_ttl_ms on create+extend responses (spec
+v0.1.25.16; cycles-server v0.1.25.59 emits it, recomputed fresh on
+idempotent replays and excluded from evidence). The SDK implements the
+spec's hardened NORMATIVE algorithm when the field is present: per-attempt
+rtt, lead_floor = max(0, remaining − rtt), retry_reserve =
+2×max(request_timeout_budget, 1s, 2×rtt_max) + max(1s, 2×rtt_max) (the
+enforced httpx timeouts define the budget), next beat at lead_floor −
+retry_reserve from response receipt, recomputed per schema-valid 200
+(non-200 2xx is ambiguous → same-key recovery); recovery repeats while
+retry_window = lead_estimate − attempt_budget − safety_margin stays
+positive with a no-progress guard, 429 Retry-After honored only inside the
+window, other 4xx stop without key rotation; a lease that cannot hold the
+reserve gets one immediate fresh attempt then stop-and-surface; lead_min
+skip bypassed; no primed extension when the create carries the field.
+Bookkeeping keeps running so the v2.3+band heuristic (now explicitly
+best-effort fallback) resumes seamlessly if the field disappears;
+fieldless servers see unchanged behavior. 568 tests pass at 100% coverage.
 
 ## 2026-07-27 — Heartbeat conservative-lead redesign + actual_source marker (v0.5.1)
 

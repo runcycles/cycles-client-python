@@ -220,12 +220,89 @@ _PERMANENT_EXTEND_CODES = frozenset(
 _LEAD_TARGET_FACTOR = 1.5
 
 
-def _authoritative_delay_ms(lead_floor_ms: float, rtt_max_ms: float) -> float:
-    """Next-beat delay from a server-authoritative remaining lease
-    (remaining_ttl_ms, spec v0.1.25.16): schedule inside the lease while
-    keeping a retry reserve of min(lead/2, max(1s, 2x max observed rtt))."""
-    reserve = min(lead_floor_ms / 2, max(1000.0, 2.0 * rtt_max_ms))
-    return max(0.0, lead_floor_ms - reserve)
+def _timeout_budget_ms(config: Any) -> float:
+    """The client's enforced upper bound for one complete extend attempt in
+    ms (connect + read + the fixed 5s write timeout) — the spec's
+    request_timeout_budget. The SDK always enforces finite httpx timeouts,
+    so the unknown/unbounded-timeout arm of the spec never applies here."""
+    return (float(config.connect_timeout) + float(config.read_timeout) + 5.0) * 1000.0
+
+
+class _AuthoritativeScheduler:
+    """Field-mode heartbeat scheduling per the NORMATIVE algorithm in the
+    spec's HEARTBEAT GUIDANCE (v0.1.25.16). All methods return the next
+    delay in ms, or ``None`` when the spec requires the heartbeat to stop
+    and surface. State: max observed rtt, the lead floor established by the
+    last schema-valid response, a zero-delay streak (a success that cannot
+    hold the retry reserve permits ONE immediate fresh attempt, then stop),
+    and the last failure's retry window (recovery may repeat with the same
+    idempotency key only while the freshly recomputed window shrinks)."""
+
+    def __init__(self, timeout_budget_ms: float) -> None:
+        self._timeout_budget_ms = timeout_budget_ms
+        self._rtt_max_ms = 0.0
+        self._lead_floor_ms: float | None = None
+        self._lead_anchor_ms: float | None = None
+        self._zero_streak = 0
+        self._prev_fail_window: float | None = None
+
+    def _attempt_budget_ms(self) -> float:
+        return max(self._timeout_budget_ms, 1000.0, 2.0 * self._rtt_max_ms)
+
+    def _safety_margin_ms(self) -> float:
+        return max(1000.0, 2.0 * self._rtt_max_ms)
+
+    def on_valid_success(
+        self, remaining_ms: int, rtt_ms: float, now_ms: float,
+    ) -> float | None:
+        """Schema-valid HTTP 200 carrying remaining_ttl_ms. retry_reserve =
+        2×attempt_budget + safety_margin covers one failed attempt, one
+        same-key retry, and margin."""
+        self._rtt_max_ms = max(self._rtt_max_ms, rtt_ms)
+        self._prev_fail_window = None
+        self._lead_floor_ms = max(0.0, float(remaining_ms) - max(rtt_ms, 0.0))
+        self._lead_anchor_ms = now_ms
+        reserve = 2.0 * self._attempt_budget_ms() + self._safety_margin_ms()
+        delay = self._lead_floor_ms - reserve
+        if delay > 0:
+            self._zero_streak = 0
+            return delay
+        # The lease cannot hold the retry reserve: one immediate fresh
+        # attempt (new key) is permitted — an additive-delta server may
+        # establish positive lead — then the client must stop rather than
+        # burn a maximum-lead server's extension budget in a tight loop.
+        self._zero_streak += 1
+        if self._zero_streak >= 2:
+            return None
+        return 0.0
+
+    def lead_estimate_ms(self, now_ms: float) -> float:
+        if self._lead_floor_ms is None or self._lead_anchor_ms is None:
+            return 0.0
+        return max(0.0, self._lead_floor_ms - (now_ms - self._lead_anchor_ms))
+
+    def on_transient_failure(
+        self,
+        now_ms: float,
+        rate_limited: bool = False,
+        retry_after_ms: int | None = None,
+    ) -> float | None:
+        """Timeout / connection error / 5xx / 429 / ambiguous 2xx. The
+        retry_window is recomputed from the same last schema-valid response;
+        recovery repeats only while it shrinks (progress guard), and a 429
+        may only be honored inside the window — never re-invented earlier."""
+        lead_est = self.lead_estimate_ms(now_ms)
+        window = lead_est - self._attempt_budget_ms() - self._safety_margin_ms()
+        if window < 0:
+            return None
+        if self._prev_fail_window is not None and window >= self._prev_fail_window:
+            return None  # no progress between consecutive failures
+        self._prev_fail_window = window
+        if rate_limited:
+            if retry_after_ms is None or retry_after_ms < 0 or retry_after_ms > window:
+                return None
+            return float(retry_after_ms)
+        return min(30_000.0, lead_est / 4.0, window)
 
 
 def _build_extend_body(ttl_ms: int) -> dict[str, Any]:
@@ -324,7 +401,9 @@ class CyclesLifecycle:
         logger.debug("Creating reservation: body=%s", create_body)
 
         res_t1 = time.monotonic()
+        _create_sent_ms = _now_mono_ms()
         res_response = self._client.create_reservation(create_body)
+        _create_rtt_ms = _now_mono_ms() - _create_sent_ms
 
         if not res_response.is_success:
             logger.error("Reservation failed: response=%s", res_response)
@@ -385,7 +464,8 @@ class CyclesLifecycle:
         # Start heartbeat
         heartbeat_stop = threading.Event()
         heartbeat_thread = self._start_heartbeat(
-            reservation_id, cfg.ttl_ms, ctx, heartbeat_stop, res_result.remaining_ttl_ms,
+            reservation_id, cfg.ttl_ms, ctx, heartbeat_stop,
+            res_result.remaining_ttl_ms, _create_rtt_ms,
         )
 
         try:
@@ -508,6 +588,7 @@ class CyclesLifecycle:
         ctx: CyclesContext,
         stop_event: threading.Event,
         initial_remaining_ms: int | None = None,
+        initial_rtt_ms: float | None = None,
     ) -> threading.Thread | None:
         if ttl_ms <= 0:
             return None
@@ -536,18 +617,25 @@ class CyclesLifecycle:
             last_success_ms = anchor_ms
             held_delay_ms = min(ttl_ms / 2, 30_000.0)
             clamp_warned = False
-            rtt_max_ms = 0.0
-            # Authoritative scheduling (spec v0.1.25.16): a response carrying
-            # remaining_ttl_ms is the server's own statement of the live
-            # lease, so the beat is scheduled from it directly. When the
-            # create response carried it, the first beat derives from it and
-            # no primed extension is spent.
-            lead_floor_ms: float | None = None
-            lead_anchor_ms = anchor_ms
+            # Authoritative scheduling (spec v0.1.25.16 PRIMARY ALGORITHM):
+            # a schema-valid 200 carrying remaining_ttl_ms drives scheduling
+            # exactly; the measured-grant heuristic below is the
+            # NON-NORMATIVE fallback for servers that omit the field.
+            sched = _AuthoritativeScheduler(_timeout_budget_ms(self._client._config))
             authoritative = initial_remaining_ms is not None
             if initial_remaining_ms is not None:
-                lead_floor_ms = float(initial_remaining_ms)
-                delay_ms = _authoritative_delay_ms(lead_floor_ms, rtt_max_ms)
+                first_delay = sched.on_valid_success(
+                    initial_remaining_ms, initial_rtt_ms or 0.0, anchor_ms,
+                )
+                # Unreachable on the first scheduler call (the zero-delay
+                # streak cannot be exhausted yet); kept as a typed guard.
+                if first_delay is None:  # pragma: no cover
+                    logger.warning(
+                        "Heartbeat not started: lease shorter than the retry-safety budget: id=%s",
+                        reservation_id,
+                    )
+                    return
+                delay_ms = first_delay
             else:
                 # Immediate first extension (fallback): with lead_min starting
                 # at 0 and no lease signal on the wire, any bounded first
@@ -555,9 +643,12 @@ class CyclesLifecycle:
                 # extension; total protected runtime is unchanged.
                 delay_ms = 0.0
             while not stop_event.wait(timeout=delay_ms / 1000.0):
-                # After the primed (delay-0) first beat, the baseline cadence
-                # is the held delay — a transient failure must not hot-loop.
-                delay_ms = delay_ms or held_delay_ms
+                if not authoritative:
+                    # After the primed (delay-0) first beat, the baseline
+                    # cadence is the held delay — a transient failure must
+                    # not hot-loop. (Authoritative zero delays are meaningful:
+                    # the one-immediate-attempt guards bound them.)
+                    delay_ms = delay_ms or held_delay_ms
                 if not authoritative:
                     lead_min = grants_sum - (_now_mono_ms() - anchor_ms)
                     if last_grant is not None and lead_min >= _LEAD_TARGET_FACTOR * last_grant:
@@ -568,7 +659,22 @@ class CyclesLifecycle:
                     sent_ms = _now_mono_ms()
                     response = self._client.extend_reservation(reservation_id, body)
                     recv_ms = _now_mono_ms()
-                    if response.is_success:
+                    if response.is_success and authoritative and response.status != 200:
+                        # Ambiguous non-200 2xx in authoritative mode: NOT an
+                        # observed success (spec) — same-key recovery.
+                        logger.warning(
+                            "Heartbeat ambiguous 2xx (status=%d): id=%s",
+                            response.status, reservation_id,
+                        )
+                        nxt = sched.on_transient_failure(_now_mono_ms())
+                        if nxt is None:
+                            logger.warning(
+                                "Heartbeat stopping: no safe recovery window remains: id=%s",
+                                reservation_id,
+                            )
+                            return
+                        delay_ms = nxt
+                    elif response.is_success:
                         pending_body = None
                         new_expires = response.get_body_attribute("expires_at_ms")
                         if new_expires is not None:
@@ -591,16 +697,21 @@ class CyclesLifecycle:
                         grants_sum += grant
                         last_grant = grant
                         rtt_ms = recv_ms - sent_ms
-                        rtt_max_ms = max(rtt_max_ms, rtt_ms)
                         remaining = response.get_body_attribute("remaining_ttl_ms")
-                        if remaining is not None:
-                            # Server-authoritative lease (spec v0.1.25.16):
-                            # schedule from it directly; the heuristic arms
-                            # below only serve servers that omit the field.
+                        if response.status == 200 and remaining is not None:
+                            # Server-authoritative lease (spec v0.1.25.16
+                            # PRIMARY ALGORITHM): schedule from this response
+                            # alone; the heuristic arms below only serve
+                            # servers that omit the field.
                             authoritative = True
-                            lead_floor_ms = max(0.0, float(int(remaining)) - rtt_ms)
-                            lead_anchor_ms = recv_ms
-                            delay_ms = _authoritative_delay_ms(lead_floor_ms, rtt_max_ms)
+                            nxt = sched.on_valid_success(int(remaining), rtt_ms, recv_ms)
+                            if nxt is None:
+                                logger.warning(
+                                    "Heartbeat stopping: lease shorter than the retry-safety budget: id=%s",
+                                    reservation_id,
+                                )
+                                return
+                            delay_ms = nxt
                         elif grant <= 0 or (
                             grant < 0.9 * ttl_ms
                             and 0.75 * elapsed_since_success <= grant <= 1.25 * elapsed_since_success
@@ -635,22 +746,38 @@ class CyclesLifecycle:
                             )
                             return
                         logger.warning("Heartbeat extend failed: id=%s, status=%d", reservation_id, response.status)
-                        if authoritative and lead_floor_ms is not None:
-                            # Retry inside the known lease: the failed extend may
-                            # have been applied server-side, so the SAME body (same
-                            # idempotency key) is retried at a bounded fraction of
-                            # the remaining lead.
-                            lead_now = max(0.0, lead_floor_ms - (_now_mono_ms() - lead_anchor_ms))
-                            delay_ms = min(max(lead_now / 4, 1000.0), 30_000.0)
+                        if authoritative:
+                            rate_limited = response.status == 429 or code == "LIMIT_EXCEEDED"
+                            if not rate_limited and 400 <= response.status < 500:
+                                # Unrecoverable request/auth failure (spec): never
+                                # rotate the key on an unchanged request.
+                                logger.warning(
+                                    "Heartbeat stopping on client error (%s, status=%d): id=%s",
+                                    code, response.status, reservation_id,
+                                )
+                                return
+                            retry_after = response.retry_after_ms_header if rate_limited else None
+                            nxt = sched.on_transient_failure(
+                                _now_mono_ms(), rate_limited=rate_limited, retry_after_ms=retry_after,
+                            )
+                            if nxt is None:
+                                logger.warning(
+                                    "Heartbeat stopping: no safe recovery window remains: id=%s",
+                                    reservation_id,
+                                )
+                                return
+                            delay_ms = nxt
                 except Exception:
                     logger.warning("Heartbeat extend error: id=%s", reservation_id, exc_info=True)
-                    if authoritative and lead_floor_ms is not None:
-                        # Retry inside the known lease: the failed extend may
-                        # have been applied server-side, so the SAME body (same
-                        # idempotency key) is retried at a bounded fraction of
-                        # the remaining lead.
-                        lead_now = max(0.0, lead_floor_ms - (_now_mono_ms() - lead_anchor_ms))
-                        delay_ms = min(max(lead_now / 4, 1000.0), 30_000.0)
+                    if authoritative:
+                        nxt = sched.on_transient_failure(_now_mono_ms())
+                        if nxt is None:
+                            logger.warning(
+                                "Heartbeat stopping: no safe recovery window remains: id=%s",
+                                reservation_id,
+                            )
+                            return
+                        delay_ms = nxt
 
         t = threading.Thread(target=heartbeat_loop, daemon=True, name=f"cycles-heartbeat-{reservation_id[:12]}")
         t.start()
@@ -679,7 +806,9 @@ class AsyncCyclesLifecycle:
         logger.debug("Estimated usage: estimate=%d", estimate)
 
         create_body = _build_reservation_body(cfg, estimate, self._default_subject, args, kwargs)
+        _create_sent_ms = _now_mono_ms()
         res_response = await self._client.create_reservation(create_body)
+        _create_rtt_ms = _now_mono_ms() - _create_sent_ms
 
         if not res_response.is_success:
             raise _build_protocol_exception("Failed to create reservation", res_response)
@@ -727,7 +856,8 @@ class AsyncCyclesLifecycle:
         _set_context(ctx)
 
         heartbeat_task = self._start_heartbeat(
-            reservation_id, cfg.ttl_ms, ctx, res_result.remaining_ttl_ms,
+            reservation_id, cfg.ttl_ms, ctx,
+            res_result.remaining_ttl_ms, _create_rtt_ms,
         )
 
         try:
@@ -845,6 +975,7 @@ class AsyncCyclesLifecycle:
         ttl_ms: int,
         ctx: CyclesContext,
         initial_remaining_ms: int | None = None,
+        initial_rtt_ms: float | None = None,
     ) -> asyncio.Task[None] | None:
         if ttl_ms <= 0:
             return None
@@ -859,18 +990,25 @@ class AsyncCyclesLifecycle:
             last_success_ms = anchor_ms
             held_delay_ms = min(ttl_ms / 2, 30_000.0)
             clamp_warned = False
-            rtt_max_ms = 0.0
-            # Authoritative scheduling (spec v0.1.25.16): a response carrying
-            # remaining_ttl_ms is the server's own statement of the live
-            # lease, so the beat is scheduled from it directly. When the
-            # create response carried it, the first beat derives from it and
-            # no primed extension is spent.
-            lead_floor_ms: float | None = None
-            lead_anchor_ms = anchor_ms
+            # Authoritative scheduling (spec v0.1.25.16 PRIMARY ALGORITHM):
+            # a schema-valid 200 carrying remaining_ttl_ms drives scheduling
+            # exactly; the measured-grant heuristic below is the
+            # NON-NORMATIVE fallback for servers that omit the field.
+            sched = _AuthoritativeScheduler(_timeout_budget_ms(self._client._config))
             authoritative = initial_remaining_ms is not None
             if initial_remaining_ms is not None:
-                lead_floor_ms = float(initial_remaining_ms)
-                delay_ms = _authoritative_delay_ms(lead_floor_ms, rtt_max_ms)
+                first_delay = sched.on_valid_success(
+                    initial_remaining_ms, initial_rtt_ms or 0.0, anchor_ms,
+                )
+                # Unreachable on the first scheduler call (the zero-delay
+                # streak cannot be exhausted yet); kept as a typed guard.
+                if first_delay is None:  # pragma: no cover
+                    logger.warning(
+                        "Heartbeat not started: lease shorter than the retry-safety budget: id=%s",
+                        reservation_id,
+                    )
+                    return
+                delay_ms = first_delay
             else:
                 # Immediate first extension (fallback): with lead_min starting
                 # at 0 and no lease signal on the wire, any bounded first
@@ -880,10 +1018,13 @@ class AsyncCyclesLifecycle:
             try:
                 while True:
                     await asyncio.sleep(delay_ms / 1000.0)
-                    # After the primed (delay-0) first beat, the baseline
-                    # cadence is the held delay — a transient failure must
-                    # not hot-loop.
-                    delay_ms = delay_ms or held_delay_ms
+                    if not authoritative:
+                        # After the primed (delay-0) first beat, the baseline
+                        # cadence is the held delay — a transient failure must
+                        # not hot-loop. (Authoritative zero delays are
+                        # meaningful: the one-immediate-attempt guards bound
+                        # them.)
+                        delay_ms = delay_ms or held_delay_ms
                     if not authoritative:
                         lead_min = grants_sum - (_now_mono_ms() - anchor_ms)
                         if last_grant is not None and lead_min >= _LEAD_TARGET_FACTOR * last_grant:
@@ -894,7 +1035,22 @@ class AsyncCyclesLifecycle:
                         sent_ms = _now_mono_ms()
                         response = await self._client.extend_reservation(reservation_id, body)
                         recv_ms = _now_mono_ms()
-                        if response.is_success:
+                        if response.is_success and authoritative and response.status != 200:
+                            # Ambiguous non-200 2xx in authoritative mode: NOT an
+                            # observed success (spec) — same-key recovery.
+                            logger.warning(
+                                "Heartbeat ambiguous 2xx (status=%d): id=%s",
+                                response.status, reservation_id,
+                            )
+                            nxt = sched.on_transient_failure(_now_mono_ms())
+                            if nxt is None:
+                                logger.warning(
+                                    "Heartbeat stopping: no safe recovery window remains: id=%s",
+                                    reservation_id,
+                                )
+                                return
+                            delay_ms = nxt
+                        elif response.is_success:
                             pending_body = None
                             new_expires = response.get_body_attribute("expires_at_ms")
                             if new_expires is not None:
@@ -917,16 +1073,21 @@ class AsyncCyclesLifecycle:
                             grants_sum += grant
                             last_grant = grant
                             rtt_ms = recv_ms - sent_ms
-                            rtt_max_ms = max(rtt_max_ms, rtt_ms)
                             remaining = response.get_body_attribute("remaining_ttl_ms")
-                            if remaining is not None:
-                                # Server-authoritative lease (spec v0.1.25.16):
-                                # schedule from it directly; the heuristic arms
-                                # below only serve servers that omit the field.
+                            if response.status == 200 and remaining is not None:
+                                # Server-authoritative lease (spec v0.1.25.16
+                                # PRIMARY ALGORITHM): schedule from this response
+                                # alone; the heuristic arms below only serve
+                                # servers that omit the field.
                                 authoritative = True
-                                lead_floor_ms = max(0.0, float(int(remaining)) - rtt_ms)
-                                lead_anchor_ms = recv_ms
-                                delay_ms = _authoritative_delay_ms(lead_floor_ms, rtt_max_ms)
+                                nxt = sched.on_valid_success(int(remaining), rtt_ms, recv_ms)
+                                if nxt is None:
+                                    logger.warning(
+                                        "Heartbeat stopping: lease shorter than the retry-safety budget: id=%s",
+                                        reservation_id,
+                                    )
+                                    return
+                                delay_ms = nxt
                             elif grant <= 0 or (
                                 grant < 0.9 * ttl_ms
                                 and 0.75 * elapsed_since_success <= grant <= 1.25 * elapsed_since_success
@@ -960,22 +1121,38 @@ class AsyncCyclesLifecycle:
                                 )
                                 return
                             logger.warning("Heartbeat extend failed: id=%s", reservation_id)
-                            if authoritative and lead_floor_ms is not None:
-                                # Retry inside the known lease: the failed extend may
-                                # have been applied server-side, so the SAME body (same
-                                # idempotency key) is retried at a bounded fraction of
-                                # the remaining lead.
-                                lead_now = max(0.0, lead_floor_ms - (_now_mono_ms() - lead_anchor_ms))
-                                delay_ms = min(max(lead_now / 4, 1000.0), 30_000.0)
+                            if authoritative:
+                                rate_limited = response.status == 429 or code == "LIMIT_EXCEEDED"
+                                if not rate_limited and 400 <= response.status < 500:
+                                    # Unrecoverable request/auth failure (spec): never
+                                    # rotate the key on an unchanged request.
+                                    logger.warning(
+                                        "Heartbeat stopping on client error (%s, status=%d): id=%s",
+                                        code, response.status, reservation_id,
+                                    )
+                                    return
+                                retry_after = response.retry_after_ms_header if rate_limited else None
+                                nxt = sched.on_transient_failure(
+                                    _now_mono_ms(), rate_limited=rate_limited, retry_after_ms=retry_after,
+                                )
+                                if nxt is None:
+                                    logger.warning(
+                                        "Heartbeat stopping: no safe recovery window remains: id=%s",
+                                        reservation_id,
+                                    )
+                                    return
+                                delay_ms = nxt
                     except Exception:
                         logger.warning("Heartbeat extend error: id=%s", reservation_id, exc_info=True)
-                        if authoritative and lead_floor_ms is not None:
-                            # Retry inside the known lease: the failed extend may
-                            # have been applied server-side, so the SAME body (same
-                            # idempotency key) is retried at a bounded fraction of
-                            # the remaining lead.
-                            lead_now = max(0.0, lead_floor_ms - (_now_mono_ms() - lead_anchor_ms))
-                            delay_ms = min(max(lead_now / 4, 1000.0), 30_000.0)
+                        if authoritative:
+                            nxt = sched.on_transient_failure(_now_mono_ms())
+                            if nxt is None:
+                                logger.warning(
+                                    "Heartbeat stopping: no safe recovery window remains: id=%s",
+                                    reservation_id,
+                                )
+                                return
+                            delay_ms = nxt
             except asyncio.CancelledError:
                 return
 
