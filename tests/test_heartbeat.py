@@ -528,7 +528,7 @@ class TestAsyncHeartbeatLeadEstimate:
         monkeypatch.setattr(asyncio, "sleep", fake_sleep)
         task = lifecycle._start_heartbeat("rsv_1", TTL, ctx or _ctx())
         assert task is not None
-        await task
+        assert await task is None
 
     async def test_extends_only_when_lead_below_threshold(
         self,
@@ -736,7 +736,7 @@ class TestStreamingHeartbeatLeadEstimate:
         monkeypatch.setattr(asyncio, "sleep", fake_sleep)
         task = stream._start_heartbeat()
         assert task is not None
-        await task
+        assert await task is None
 
         assert client.extend_reservation.await_count == 4
         assert sleeps[0] == 35.0
@@ -774,7 +774,7 @@ class TestStreamingHeartbeatLeadEstimate:
         monkeypatch.setattr(asyncio, "sleep", fake_sleep)
         task = stream._start_heartbeat()
         assert task is not None
-        await task
+        assert await task is None
 
         assert client.extend_reservation.await_count == 4
 
@@ -815,7 +815,7 @@ class TestStreamingHeartbeatLeadEstimate:
         monkeypatch.setattr(asyncio, "sleep", fake_sleep)
         task = stream._start_heartbeat()
         assert task is not None
-        await task
+        assert await task is None
 
         assert client.extend_reservation.await_count == 5
 
@@ -1145,7 +1145,7 @@ class TestAuthoritativeScheduling:
         monkeypatch.setattr(asyncio, "sleep", fake_sleep)
         task = lifecycle._start_heartbeat("rsv_1", TTL, _ctx(), 60_000)
         assert task is not None
-        await task
+        assert await task is None
 
         assert client.extend_reservation.await_count == 4
         assert sleeps[0] == 35.0  # from the create field
@@ -1295,7 +1295,7 @@ class TestAuthoritativeStopMatrix:
         monkeypatch.setattr(asyncio, "sleep", fake_sleep)
         task = lifecycle._start_heartbeat("rsv_1", TTL, _ctx(), initial)
         assert task is not None
-        await task
+        assert await task is None
 
         assert client.extend_reservation.await_count == expected
 
@@ -1325,7 +1325,7 @@ class TestAuthoritativeStopMatrix:
         monkeypatch.setattr(asyncio, "sleep", fake_sleep)
         task = lifecycle._start_heartbeat("rsv_1", TTL, _ctx(), 60_000)
         assert task is not None
-        await task
+        assert await task is None
 
         assert client.extend_reservation.await_count == 2
         assert sleeps[1] == 3.0
@@ -1451,7 +1451,7 @@ class TestAuthoritativeStopMatrix:
         monkeypatch.setattr(asyncio, "sleep", fake_sleep)
         task = stream._start_heartbeat()
         assert task is not None
-        await task
+        assert await task is None
 
         assert client.extend_reservation.await_count == expected
 
@@ -1482,7 +1482,7 @@ class TestAuthoritativeStopMatrix:
         monkeypatch.setattr(asyncio, "sleep", fake_sleep)
         task = stream._start_heartbeat()
         assert task is not None
-        await task
+        assert await task is None
 
         assert client.extend_reservation.await_count == 2
         assert sleeps[1] == 3.0
