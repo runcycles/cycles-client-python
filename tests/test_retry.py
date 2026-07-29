@@ -9,7 +9,64 @@ import pytest
 
 from runcycles.config import CyclesConfig
 from runcycles.response import CyclesResponse
-from runcycles.retry import AsyncCommitRetryEngine, CommitRetryEngine
+from runcycles.retry import (
+    AsyncCommitRetryEngine,
+    CommitRetryEngine,
+    _is_recognized_rejection,
+    _is_schema_valid_commit_success,
+    _is_schema_valid_event_success,
+)
+
+
+class TestSettlementSuccessValidation:
+    def test_only_known_non_retryable_codes_are_terminal_rejections(self) -> None:
+        assert _is_recognized_rejection("INVALID_REQUEST")
+        assert not _is_recognized_rejection("INTERNAL_ERROR")
+        assert not _is_recognized_rejection("LIMIT_EXCEEDED")
+        assert not _is_recognized_rejection("FUTURE_CODE")
+
+    def test_commit_accepts_evidence_and_rejects_schema_invalid_optional_values(self) -> None:
+        body = {
+            "status": "COMMITTED",
+            "charged": {"unit": "USD_MICROCENTS", "amount": 1},
+            "cycles_evidence": {
+                "evidence_id": "a" * 64,
+                "cycles_evidence_url": "https://cycles.example/v1/evidence/id",
+            },
+        }
+        assert _is_schema_valid_commit_success(CyclesResponse.success(200, body))
+        assert not _is_schema_valid_commit_success(
+            CyclesResponse.success(200, {**body, "balances": None})
+        )
+        assert not _is_schema_valid_commit_success(
+            CyclesResponse.success(
+                200,
+                {
+                    **body,
+                    "charged": {"unit": "FUTURE_UNIT", "amount": 1},
+                },
+            )
+        )
+        assert not _is_schema_valid_commit_success(
+            CyclesResponse.success(
+                200,
+                {
+                    **body,
+                    "charged": {"unit": "USD_MICROCENTS", "amount": "1"},
+                },
+            )
+        )
+
+    def test_event_follows_exact_wire_schema(self) -> None:
+        assert _is_schema_valid_event_success(
+            CyclesResponse.success(201, {"status": "APPLIED", "event_id": ""})
+        )
+        assert not _is_schema_valid_event_success(
+            CyclesResponse.success(
+                201,
+                {"status": "APPLIED", "event_id": "event-1", "charged": None},
+            )
+        )
 
 
 @pytest.fixture
@@ -48,7 +105,10 @@ class TestCommitRetryEngine:
         # First call fails with 500, second succeeds
         mock_client.commit_reservation.side_effect = [
             CyclesResponse.http_error(500, "Server error"),
-            CyclesResponse.success(200, {"status": "COMMITTED"}),
+            CyclesResponse.success(200, {
+                "status": "COMMITTED",
+                "charged": {"unit": "USD_MICROCENTS", "amount": 1},
+            }),
         ]
         engine.set_client(mock_client)
 
@@ -91,7 +151,10 @@ class TestCommitRetryEngine:
         # First call throws, second succeeds
         mock_client.commit_reservation.side_effect = [
             ConnectionError("network down"),
-            CyclesResponse.success(200, {"status": "COMMITTED"}),
+            CyclesResponse.success(200, {
+                "status": "COMMITTED",
+                "charged": {"unit": "USD_MICROCENTS", "amount": 1},
+            }),
         ]
         engine.set_client(mock_client)
 
@@ -123,7 +186,10 @@ class TestAsyncCommitRetryEngine:
         mock_client = AsyncMock()
         mock_client.commit_reservation.side_effect = [
             CyclesResponse.http_error(500, "Server error"),
-            CyclesResponse.success(200, {"status": "COMMITTED"}),
+            CyclesResponse.success(200, {
+                "status": "COMMITTED",
+                "charged": {"unit": "USD_MICROCENTS", "amount": 1},
+            }),
         ]
         engine.set_client(mock_client)
 
@@ -162,7 +228,10 @@ class TestAsyncCommitRetryEngine:
         mock_client = AsyncMock()
         mock_client.commit_reservation.side_effect = [
             ConnectionError("network down"),
-            CyclesResponse.success(200, {"status": "COMMITTED"}),
+            CyclesResponse.success(200, {
+                "status": "COMMITTED",
+                "charged": {"unit": "USD_MICROCENTS", "amount": 1},
+            }),
         ]
         engine.set_client(mock_client)
 
@@ -195,7 +264,10 @@ class TestCommitRetryEngineSchedule:
         engine = CommitRetryEngine(config)
         mock_client = MagicMock()
         # Return success immediately so the thread finishes quickly
-        mock_client.commit_reservation.return_value = CyclesResponse.success(200, {"status": "COMMITTED"})
+        mock_client.commit_reservation.return_value = CyclesResponse.success(200, {
+            "status": "COMMITTED",
+            "charged": {"unit": "USD_MICROCENTS", "amount": 1},
+        })
         engine.set_client(mock_client)
 
         engine.schedule("rsv_1", {"idempotency_key": "k1"})

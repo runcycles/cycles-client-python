@@ -5,6 +5,26 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog 1.1.0](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.2] - 2026-07-29
+
+### Added
+
+- Bind all shared durable-recovery and guarantee-boundary scenarios from the
+  protocol repository into pull-request and release CI.
+- Expose `cycles_evidence` on `CommitResponse`.
+
+### Fixed
+
+- Persist known actual usage before the first commit request, recover expired
+  commits through `/v1/events`, and accept only exact HTTP 200/201
+  schema-valid commit/event responses as terminal success.
+- Use `v2-<sha256(exact UTF-8 reservation id)>.json` journal filenames, safely
+  migrate matching legacy records, and preserve collision-free cross-SDK
+  replay.
+- Retain durable settlement records for contradictory retryable 4xx envelopes,
+  and report heartbeat transport failures with their same-key retry or stop
+  disposition.
+
 ## [0.5.1] - 2026-07-27
 
 ### Fixed

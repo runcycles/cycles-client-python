@@ -89,9 +89,13 @@ def _restrict_permissions(path: Path, mode: int) -> None:
 
 
 def _safe_filename(reservation_id: str) -> str:
-    # ASCII-only, matching the TS/Java SDKs exactly: same-tenant clients in
-    # other languages settle records from this directory, and their discard()
-    # must compute the identical filename or the record replays forever.
+    """Cross-SDK, collision-resistant filename for an exact reservation id."""
+    digest = hashlib.sha256(reservation_id.encode("utf-8")).hexdigest()
+    return f"v2-{digest}{_SUFFIX}"
+
+
+def _legacy_filename(reservation_id: str) -> str:
+    """Filename written by SDK releases before the v2 digest scheme."""
     sanitized = re.sub(r"[^A-Za-z0-9_-]", "_", reservation_id)
     return f"{sanitized}{_SUFFIX}"
 
@@ -200,6 +204,15 @@ class CommitJournal:
         """Remove a journal entry after a terminal outcome. Never raises."""
         try:
             (self._dir / _safe_filename(reservation_id)).unlink(missing_ok=True)
+            legacy = self._dir / _legacy_filename(reservation_id)
+            if legacy.exists():
+                try:
+                    entry = PendingCommitRecord.from_json(legacy.read_text(encoding="utf-8"))
+                    if entry.reservation_id == reservation_id:
+                        legacy.unlink(missing_ok=True)
+                except (OSError, ValueError, KeyError, json.JSONDecodeError):
+                    # Never delete a colliding or malformed legacy record.
+                    pass
         except OSError:
             logger.warning("Failed to discard journal entry: id=%s", reservation_id, exc_info=True)
 
@@ -234,6 +247,38 @@ class CommitJournal:
                         path.replace(path.with_suffix(".corrupt"))
                     except OSError:
                         pass
+                    continue
+                standard_path = self._dir / _safe_filename(entry.reservation_id)
+                duplicate_of_standard = False
+                if path != standard_path:
+                    try:
+                        if not standard_path.exists():
+                            path.replace(standard_path)
+                            logger.info(
+                                "Migrated legacy journal filename: id=%s, path=%s",
+                                entry.reservation_id,
+                                standard_path,
+                            )
+                        else:
+                            existing = PendingCommitRecord.from_json(
+                                standard_path.read_text(encoding="utf-8")
+                            )
+                            if existing.reservation_id == entry.reservation_id:
+                                path.unlink(missing_ok=True)
+                                duplicate_of_standard = True
+                                logger.info(
+                                    "Removed duplicate legacy journal filename: id=%s, path=%s",
+                                    entry.reservation_id,
+                                    path,
+                                )
+                    except (OSError, ValueError, KeyError, json.JSONDecodeError):
+                        logger.warning(
+                            "Could not safely migrate legacy journal filename: id=%s, path=%s",
+                            entry.reservation_id,
+                            path,
+                            exc_info=True,
+                        )
+                if duplicate_of_standard:
                     continue
                 if entry.base_url == base_url:
                     entries.append(entry)

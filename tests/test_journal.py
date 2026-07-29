@@ -88,7 +88,13 @@ def _event_success() -> CyclesResponse:
 
 
 def _commit_success() -> CyclesResponse:
-    return CyclesResponse.success(200, {"status": "COMMITTED"})
+    return CyclesResponse.success(
+        200,
+        {
+            "status": "COMMITTED",
+            "charged": {"unit": "USD_MICROCENTS", "amount": 100},
+        },
+    )
 
 
 def _record(reservation_id: str = "rsv_1", **overrides: Any) -> PendingCommitRecord:
@@ -210,15 +216,37 @@ class TestCommitJournal:
         journal = CommitJournal(directory)
         assert journal.load_pending(BASE_URL) == []  # skipped, no raise
 
-    def test_safe_filename_sanitizes(self) -> None:
-        assert _safe_filename("rsv_abc-123") == "rsv_abc-123.json"
-        assert _safe_filename("rsv/../etc") == "rsv____etc.json"
+    def test_safe_filename_hashes_exact_utf8(self) -> None:
+        assert _safe_filename("rsv_abc-123") == (
+            "v2-fe159e4dab8f7a05b609a0810be4800a22f3b08fc55a2762d2cded54d1484ec9.json"
+        )
+        assert _safe_filename("rsv/../etc") == (
+            "v2-08bf4457fdfa1fb11d02fb7f030f05c745a38058462cd1d158c40e644310d1de.json"
+        )
 
-    def test_safe_filename_is_ascii_only(self) -> None:
-        # Cross-SDK invariant: TS/Java sanitize with [^A-Za-z0-9_-]; a
-        # Unicode-alphanumeric-preserving Python name would never be
-        # discardable by a sibling SDK sharing the identity directory.
-        assert _safe_filename("rsvé٣x") == "rsv__x.json"
+    def test_safe_filename_unicode_vector_is_cross_sdk_stable(self) -> None:
+        assert _safe_filename("r🚀") == (
+            "v2-34c5b33347a139e63c81ea72943cc15dd4c2087dc1eaa756a78f3c49974e0b87.json"
+        )
+
+    def test_colliding_legacy_ids_are_distinct_and_migrate_safely(
+        self, tmp_path: Path
+    ) -> None:
+        directory = tmp_path / "j"
+        journal = CommitJournal(directory)
+        journal.record(_record("rsv/a"))
+        journal.record(_record("rsv_a"))
+        assert _safe_filename("rsv/a") != _safe_filename("rsv_a")
+        assert len(list(directory.glob("*.json"))) == 2
+
+        legacy = directory / "rsv_a.json"
+        legacy.write_text(_record("rsv/a").to_json(), encoding="utf-8")
+        journal.discard("rsv_a")
+        assert legacy.exists()
+        loaded = journal.load_pending(BASE_URL)
+        assert not legacy.exists()
+        assert (directory / _safe_filename("rsv/a")).exists()
+        assert [entry.reservation_id for entry in loaded] == ["rsv/a"]
 
     def test_stale_temp_files_are_reaped_on_load(self, tmp_path: Path) -> None:
         import os
@@ -297,7 +325,7 @@ class TestCommitJournal:
 
         if os.name == "posix":
             assert directory.stat().st_mode & 0o777 == 0o700
-            assert (directory / "rsv_a.json").stat().st_mode & 0o777 == 0o600
+            assert (directory / _safe_filename("rsv_a")).stat().st_mode & 0o777 == 0o600
 
     def test_permission_tightening_failure_is_swallowed(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
@@ -910,7 +938,9 @@ class TestSyncReplay:
         engine_a.flush(timeout=5.0)
 
         client_a.commit_reservation.assert_called_once_with("rsv_a", _commit_body())
-        assert _journal_files(tmp_path) == [_identity_dir(tmp_path, api_key="other-key") / "rsv_b.json"]
+        assert _journal_files(tmp_path) == [
+            _identity_dir(tmp_path, api_key="other-key") / _safe_filename("rsv_b")
+        ]
 
         engine_b = CommitRetryEngine(_config(tmp_path, api_key="other-key"))
         client_b = MagicMock()
@@ -1184,6 +1214,40 @@ class TestLifecycleEventFallbackWiring:
         assert event_body["subject"] == {"tenant": "acme"}
         assert event_body["metadata"]["recovered_reservation_id"] == "rsv_test"
         mock_client.release_reservation.assert_not_called()
+
+    def test_journal_write_precedes_first_commit_and_success_discards(
+        self, tmp_path: Path
+    ) -> None:
+        lifecycle, mock_client, engine = self._make(tmp_path)
+        mock_client.create_reservation.return_value = _allow_response()
+        mock_client.commit_reservation.return_value = _commit_success()
+        calls = MagicMock()
+        calls.attach_mock(engine.persist_pending, "persist")
+        calls.attach_mock(mock_client.commit_reservation, "commit")
+
+        lifecycle.execute(lambda: "result", (), {}, _make_cfg())
+
+        names = [call[0] for call in calls.mock_calls]
+        assert names.index("persist") < names.index("commit")
+        engine.discard_pending.assert_called_once_with("rsv_test")
+
+    def test_protocol_invalid_2xx_is_ambiguous_and_keeps_same_key(
+        self, tmp_path: Path
+    ) -> None:
+        lifecycle, mock_client, engine = self._make(tmp_path)
+        mock_client.create_reservation.return_value = _allow_response()
+        mock_client.commit_reservation.return_value = CyclesResponse.success(
+            200, {"status": "COMMITTED"}
+        )
+
+        lifecycle.execute(lambda: "result", (), {}, _make_cfg())
+
+        engine.schedule.assert_called_once()
+        assert (
+            engine.schedule.call_args.args[1]["idempotency_key"]
+            == engine.persist_pending.call_args.args[1]["idempotency_key"]
+        )
+        engine.discard_pending.assert_not_called()
 
     def test_transient_commit_passes_event_fallback(self, tmp_path: Path) -> None:
         lifecycle, mock_client, engine = self._make(tmp_path)

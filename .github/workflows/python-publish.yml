@@ -20,6 +20,27 @@ permissions:
   contents: read
 
 jobs:
+  recovery-conformance:
+    name: Durable recovery conformance
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: runcycles/cycles-protocol
+          ref: 8a22803316d91b85e444f4fb40ff2b8426f11773
+          path: .cycles-protocol
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - run: python -m pip install -e ".[dev]"
+      - name: Run shared durable recovery scenarios
+        run: >-
+          python .cycles-protocol/scripts/run_client_recovery_conformance.py
+          --claim durable
+          --adapter python scripts/recovery_conformance_adapter.py
+
   build:
     name: Build distributions
     runs-on: ubuntu-latest
@@ -64,7 +85,7 @@ jobs:
 
   publish-to-testpypi:
     name: Publish to TestPyPI
-    needs: build
+    needs: [build, recovery-conformance]
     runs-on: ubuntu-latest
     if: github.event_name == 'workflow_dispatch' && inputs.target == 'testpypi'
     environment:
@@ -88,7 +109,7 @@ jobs:
 
   publish-to-pypi:
     name: Publish to PyPI
-    needs: build
+    needs: [build, recovery-conformance]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.target == 'pypi')
     environment:
