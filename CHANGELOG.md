@@ -24,6 +24,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Retain durable settlement records for contradictory retryable 4xx envelopes,
   and report heartbeat transport failures with their same-key retry or stop
   disposition.
+- Quarantine unsupported or structurally invalid journal records without
+  aborting replay, keep serialization failures best-effort, and report exact
+  native test evidence to the shared conformance runner.
 
 ## [0.5.1] - 2026-07-27
 

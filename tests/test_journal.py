@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -71,14 +72,16 @@ def _event_body() -> dict[str, Any]:
 
 def _expired_response() -> CyclesResponse:
     return CyclesResponse.http_error(
-        410, "Expired",
+        410,
+        "Expired",
         body={"error": "RESERVATION_EXPIRED", "message": "Expired", "request_id": "r1"},
     )
 
 
 def _finalized_response() -> CyclesResponse:
     return CyclesResponse.http_error(
-        409, "Finalized",
+        409,
+        "Finalized",
         body={"error": "RESERVATION_FINALIZED", "message": "Finalized", "request_id": "r2"},
     )
 
@@ -110,7 +113,10 @@ def _record(reservation_id: str = "rsv_1", **overrides: Any) -> PendingCommitRec
 
 
 def _identity_dir(
-    tmp_path: Path, api_key: str = "test-key", base_url: str = BASE_URL, tenant: str | None = None,
+    tmp_path: Path,
+    api_key: str = "test-key",
+    base_url: str = BASE_URL,
+    tenant: str | None = None,
 ) -> Path:
     """The per-identity subdirectory an engine with these credentials uses."""
     return tmp_path / "journal" / auth_fingerprint(base_url, api_key, tenant)
@@ -162,25 +168,39 @@ class TestCommitJournal:
         journal = CommitJournal(tmp_path / "does-not-exist")
         assert journal.load_pending(BASE_URL) == []
 
-    def test_corrupt_file_renamed_and_skipped(self, tmp_path: Path) -> None:
+    def test_corrupt_and_unsupported_records_are_quarantined_without_blocking_valid(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
         directory = tmp_path / "j"
         journal = CommitJournal(directory)
         journal.record(_record("rsv_good"))
         (directory / "rsv_bad.json").write_text("{not json", encoding="utf-8")
+        (directory / "rsv_future.json").write_text(
+            _record("rsv_future").to_json().replace('"version": 1', '"version": 2'),
+            encoding="utf-8",
+        )
+        (directory / "rsv_array.json").write_text("[]", encoding="utf-8")
 
         loaded = journal.load_pending(BASE_URL)
         assert [e.reservation_id for e in loaded] == ["rsv_good"]
-        assert (directory / "rsv_bad.corrupt").exists()
-        assert not (directory / "rsv_bad.json").exists()
+        for stem in ("rsv_bad", "rsv_future", "rsv_array"):
+            assert (directory / f"{stem}.corrupt").exists()
+            assert not (directory / f"{stem}.json").exists()
+        messages = [record.getMessage() for record in caplog.records]
+        assert sum("Skipping corrupt journal entry" in message for message in messages) == 3
+        assert any("rsv_future.json" in message for message in messages)
 
     def test_semantically_invalid_records_are_corrupt(self, tmp_path: Path) -> None:
         directory = tmp_path / "j"
         directory.mkdir(parents=True)
         cases = {
-            "no_rid.json": '{"reservation_id": "", "mode": "commit", "commit_body": {}}',
-            "bad_mode.json": '{"reservation_id": "r1", "mode": "sideways", "commit_body": {}}',
-            "commit_no_body.json": '{"reservation_id": "r2", "mode": "commit"}',
-            "event_no_body.json": '{"reservation_id": "r3", "mode": "event", "commit_body": {}}',
+            "no_rid.json": ('{"version": 1, "reservation_id": "", "mode": "commit", "commit_body": {}}'),
+            "bad_mode.json": ('{"version": 1, "reservation_id": "r1", "mode": "sideways", "commit_body": {}}'),
+            "commit_no_body.json": ('{"version": 1, "reservation_id": "r2", "mode": "commit"}'),
+            "event_no_body.json": ('{"version": 1, "reservation_id": "r3", "mode": "event", "commit_body": {}}'),
+            "bad_timestamp.json": (
+                '{"version": 1, "reservation_id": "r4", "mode": "commit", "commit_body": {}, "recorded_at_ms": "now"}'
+            ),
         }
         for name, content in cases.items():
             (directory / name).write_text(content, encoding="utf-8")
@@ -193,6 +213,16 @@ class TestCommitJournal:
         journal = CommitJournal(tmp_path / "j")
         monkeypatch.setattr(Path, "mkdir", MagicMock(side_effect=OSError("disk full")))
         journal.record(_record("rsv_a"))  # must not raise
+        assert journal.load_pending(BASE_URL) == []
+
+    def test_record_swallows_serialization_errors(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        journal = CommitJournal(tmp_path / "j")
+        monkeypatch.setattr(
+            PendingCommitRecord,
+            "to_json",
+            MagicMock(side_effect=TypeError("not JSON serializable")),
+        )
+        journal.record(_record("rsv_a"))  # must not raise or block settlement
         assert journal.load_pending(BASE_URL) == []
 
     def test_discard_swallows_os_errors(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -225,13 +255,9 @@ class TestCommitJournal:
         )
 
     def test_safe_filename_unicode_vector_is_cross_sdk_stable(self) -> None:
-        assert _safe_filename("r🚀") == (
-            "v2-34c5b33347a139e63c81ea72943cc15dd4c2087dc1eaa756a78f3c49974e0b87.json"
-        )
+        assert _safe_filename("r🚀") == ("v2-34c5b33347a139e63c81ea72943cc15dd4c2087dc1eaa756a78f3c49974e0b87.json")
 
-    def test_colliding_legacy_ids_are_distinct_and_migrate_safely(
-        self, tmp_path: Path
-    ) -> None:
+    def test_colliding_legacy_ids_are_distinct_and_migrate_safely(self, tmp_path: Path) -> None:
         directory = tmp_path / "j"
         journal = CommitJournal(directory)
         journal.record(_record("rsv/a"))
@@ -268,7 +294,9 @@ class TestCommitJournal:
         assert fresh.exists()  # a live writer's temp is left alone
 
     def test_temp_reap_failure_is_swallowed(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         import os
 
@@ -328,7 +356,9 @@ class TestCommitJournal:
             assert (directory / _safe_filename("rsv_a")).stat().st_mode & 0o777 == 0o600
 
     def test_permission_tightening_failure_is_swallowed(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         monkeypatch.setattr(Path, "chmod", MagicMock(side_effect=OSError("not supported")))
         journal = CommitJournal(tmp_path / "j")
@@ -336,7 +366,9 @@ class TestCommitJournal:
         assert [e.reservation_id for e in journal.load_pending(BASE_URL)] == ["rsv_a"]
 
     def test_failed_publish_cleans_up_temp_file(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         journal = CommitJournal(tmp_path / "j")
         monkeypatch.setattr(Path, "replace", MagicMock(side_effect=OSError("locked")))
@@ -345,7 +377,9 @@ class TestCommitJournal:
         assert list((tmp_path / "j").glob("*.json")) == []
 
     def test_failed_publish_and_cleanup_never_raise(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         journal = CommitJournal(tmp_path / "j")
         monkeypatch.setattr(Path, "replace", MagicMock(side_effect=OSError("locked")))
@@ -469,7 +503,9 @@ class TestSyncEngineDurability:
         engine = CommitRetryEngine(_config(tmp_path))
         mock_client = MagicMock()
         mock_client.create_event.return_value = CyclesResponse.http_error(
-            409, "Mismatch", body={"error": "IDEMPOTENCY_MISMATCH", "message": "m", "request_id": "r"},
+            409,
+            "Mismatch",
+            body={"error": "IDEMPOTENCY_MISMATCH", "message": "m", "request_id": "r"},
         )
         engine.set_client(mock_client)
 
@@ -498,10 +534,19 @@ class TestSyncEngineDurability:
         engine = CommitRetryEngine(_config(tmp_path))
         mock_client = MagicMock()
         mock_client.commit_reservation.return_value = _expired_response()
-        mock_client.create_event.side_effect = [
-            CyclesResponse.http_error(503, "unavailable"),
-            _event_success(),
-        ]
+
+        def event_response(_: dict[str, Any]) -> CyclesResponse:
+            persisted = CommitJournal(_identity_dir(tmp_path)).load_pending(BASE_URL)
+            assert len(persisted) == 1
+            assert persisted[0].mode == "event"
+            assert persisted[0].event_fallback_body == _event_body()
+            return (
+                CyclesResponse.http_error(503, "unavailable")
+                if mock_client.create_event.call_count == 1
+                else _event_success()
+            )
+
+        mock_client.create_event.side_effect = event_response
         engine.set_client(mock_client)
 
         pending = _PendingCommit("rsv_1", _commit_body(), _event_body())
@@ -510,6 +555,7 @@ class TestSyncEngineDurability:
         # One commit attempt, then immediate event attempt, then one retried event attempt.
         assert mock_client.commit_reservation.call_count == 1
         assert mock_client.create_event.call_count == 2
+        assert _journal_files(tmp_path) == []
 
     def test_disabled_with_journal_persists_entry(self, tmp_path: Path) -> None:
         engine = CommitRetryEngine(_config(tmp_path, retry_enabled=False))
@@ -620,7 +666,8 @@ class TestRateLimitedRetry:
         # keep retrying, waiting at least the server's Retry-After.
         engine = CommitRetryEngine(_config(tmp_path))
         response = CyclesResponse.http_error(
-            429, "Rate limited",
+            429,
+            "Rate limited",
             body={"error": "LIMIT_EXCEEDED", "message": "slow down", "request_id": "r9"},
             headers={"retry-after": "2"},
         )
@@ -668,7 +715,9 @@ class TestRateLimitedRetry:
         engine = CommitRetryEngine(_config(tmp_path))
         mock_client = MagicMock()
         mock_client.create_event.return_value = CyclesResponse.http_error(
-            429, "busy", body={"error": "LIMIT_EXCEEDED", "message": "m", "request_id": "r"},
+            429,
+            "busy",
+            body={"error": "LIMIT_EXCEEDED", "message": "m", "request_id": "r"},
         )
         engine.set_client(mock_client)
 
@@ -701,7 +750,9 @@ class TestRateLimitedRetry:
         assert now_ms + 55_000 < entry.not_before_ms <= now_ms + 60_500
 
     def test_replay_restores_future_retry_after_floor(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         future_ms = int(time.time() * 1000 + 5000)
         CommitJournal(_identity_dir(tmp_path)).record(_record("rsv_old", not_before_ms=future_ms))
@@ -715,7 +766,9 @@ class TestRateLimitedRetry:
         assert 3.0 < captured[0].retry_after_s <= 5.0
 
     def test_replay_ignores_past_retry_after_floor(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         past_ms = int(time.time() * 1000 - 1000)
         CommitJournal(_identity_dir(tmp_path)).record(_record("rsv_old", not_before_ms=past_ms))
@@ -776,7 +829,9 @@ class TestAuthFailureRetention:
 
         mock_client2 = MagicMock()
         mock_client2.commit_reservation.return_value = CyclesResponse.http_error(
-            422, "future", body={"error": "FUTURE_REJECTION_CODE", "message": "m", "request_id": "r"},
+            422,
+            "future",
+            body={"error": "FUTURE_REJECTION_CODE", "message": "m", "request_id": "r"},
         )
         engine2 = CommitRetryEngine(_config(tmp_path))
         engine2.set_client(mock_client2)
@@ -817,7 +872,8 @@ class TestAuthFailureRetention:
     def test_honored_retry_after_is_clamped(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         engine = CommitRetryEngine(_config(tmp_path))
         response = CyclesResponse.http_error(
-            429, "busy",
+            429,
+            "busy",
             body={"error": "LIMIT_EXCEEDED", "message": "m", "request_id": "r"},
             headers={"retry-after": "7200"},
         )
@@ -833,7 +889,9 @@ class TestAuthFailureRetention:
         assert captured[-1].retry_after_s == 3600.0
 
     def test_restored_replay_floor_is_clamped(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         far_future = int(time.time() * 1000 + 7_200_000)
         CommitJournal(_identity_dir(tmp_path)).record(_record("rsv_old", not_before_ms=far_future))
@@ -848,7 +906,11 @@ class TestAuthFailureRetention:
     def test_replay_survives_api_key_rotation_with_tenant(self, tmp_path: Path) -> None:
         # Records written under the old key are found by the rotated key
         # because the identity is the tenant, not the credential.
-        CommitJournal(_identity_dir(tmp_path, api_key="old-key", tenant="acme")).record(_record("rsv_old"))
+        identity_dir = _identity_dir(tmp_path, api_key="old-key", tenant="acme")
+        CommitJournal(identity_dir).record(_record("rsv_old"))
+        persisted = next(identity_dir.glob("*.json"))
+        assert "old-key" not in str(persisted)
+        assert "old-key" not in persisted.read_text(encoding="utf-8")
 
         engine = CommitRetryEngine(_config(tmp_path, api_key="rotated-key", tenant="acme"))
         mock_client = MagicMock()
@@ -879,9 +941,7 @@ class TestSyncReplay:
         assert _journal_files(tmp_path) == []
 
     def test_replays_event_mode_entry(self, tmp_path: Path) -> None:
-        CommitJournal(_identity_dir(tmp_path)).record(
-            _record("rsv_old", mode="event", commit_body=None)
-        )
+        CommitJournal(_identity_dir(tmp_path)).record(_record("rsv_old", mode="event", commit_body=None))
 
         engine = CommitRetryEngine(_config(tmp_path))
         mock_client = MagicMock()
@@ -892,23 +952,57 @@ class TestSyncReplay:
         mock_client.create_event.assert_called_once_with(_event_body())
         assert _journal_files(tmp_path) == []
 
-    def test_replay_happens_once_per_directory(self, tmp_path: Path) -> None:
-        CommitJournal(_identity_dir(tmp_path)).record(_record("rsv_old"))
+    def test_concurrent_replay_workers_reuse_one_key_and_remove_record(self, tmp_path: Path) -> None:
         config = _config(tmp_path)
-
         first = CommitRetryEngine(config)
-        client1 = MagicMock()
-        client1.commit_reservation.return_value = _commit_success()
-        first.set_client(client1)
-        first.flush(timeout=5.0)
-
         second = CommitRetryEngine(config)
-        client2 = MagicMock()
-        second.set_client(client2)
-        second.flush(timeout=5.0)
+        # Claim the initially empty directory before seeding the record so both
+        # independently constructed workers can be driven concurrently below.
+        first.set_client(MagicMock())
+        second.set_client(MagicMock())
+        journal = CommitJournal(_identity_dir(tmp_path))
+        journal.record(_record("rsv_old"))
+        loaded_a = journal.load_pending(BASE_URL)[0]
+        loaded_b = CommitJournal(_identity_dir(tmp_path)).load_pending(BASE_URL)[0]
 
-        assert client1.commit_reservation.call_count == 1
-        client2.commit_reservation.assert_not_called()
+        barrier = threading.Barrier(2)
+        seen_keys: list[str] = []
+        seen_lock = threading.Lock()
+
+        def settle(_: str, body: dict[str, Any]) -> CyclesResponse:
+            barrier.wait(timeout=2)
+            with seen_lock:
+                seen_keys.append(str(body["idempotency_key"]))
+            return _commit_success()
+
+        client = MagicMock()
+        client.commit_reservation.side_effect = settle
+        first._client = client
+        second._client = client
+        pending_a = _PendingCommit(
+            loaded_a.reservation_id,
+            loaded_a.commit_body,
+            loaded_a.event_fallback_body,
+        )
+        pending_b = _PendingCommit(
+            loaded_b.reservation_id,
+            loaded_b.commit_body,
+            loaded_b.event_fallback_body,
+        )
+
+        threads = [
+            threading.Thread(target=first._retry_loop, args=(pending_a,)),
+            threading.Thread(target=second._retry_loop, args=(pending_b,)),
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=5)
+
+        assert all(not thread.is_alive() for thread in threads)
+        assert seen_keys == ["ck-1", "ck-1"]
+        assert len(set(seen_keys)) == 1
+        assert _journal_files(tmp_path) == []
 
     def test_replay_skips_other_server_entries(self, tmp_path: Path) -> None:
         # Defense-in-depth: a mismatched-base_url record inside the identity
@@ -938,9 +1032,7 @@ class TestSyncReplay:
         engine_a.flush(timeout=5.0)
 
         client_a.commit_reservation.assert_called_once_with("rsv_a", _commit_body())
-        assert _journal_files(tmp_path) == [
-            _identity_dir(tmp_path, api_key="other-key") / _safe_filename("rsv_b")
-        ]
+        assert _journal_files(tmp_path) == [_identity_dir(tmp_path, api_key="other-key") / _safe_filename("rsv_b")]
 
         engine_b = CommitRetryEngine(_config(tmp_path, api_key="other-key"))
         client_b = MagicMock()
@@ -955,9 +1047,7 @@ class TestSyncReplay:
         # Finding 3: the replay claim is scoped to the identity subdirectory,
         # so server A's engine starting first cannot starve server B's entries.
         other_url = "http://other:9999"
-        CommitJournal(_identity_dir(tmp_path, base_url=other_url)).record(
-            _record("rsv_b", base_url=other_url)
-        )
+        CommitJournal(_identity_dir(tmp_path, base_url=other_url)).record(_record("rsv_b", base_url=other_url))
 
         engine_a = CommitRetryEngine(_config(tmp_path))
         client_a = MagicMock()
@@ -1090,7 +1180,9 @@ class TestAsyncEngineDurability:
         await engine.flush()  # must not raise or block
 
     async def test_schedule_seeds_retry_after(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         engine = AsyncCommitRetryEngine(_config(tmp_path))
         engine.set_client(AsyncMock())
@@ -1152,7 +1244,10 @@ class TestBuildEventFallbackBody:
             "metadata": {"run": "abc"},
         }
         body = _build_event_fallback_body(
-            "rsv_9", {"tenant": "acme"}, {"kind": "llm.completion", "name": "gpt"}, commit_body,
+            "rsv_9",
+            {"tenant": "acme"},
+            {"kind": "llm.completion", "name": "gpt"},
+            commit_body,
         )
 
         assert body["idempotency_key"] == "ck-9"
@@ -1167,7 +1262,10 @@ class TestBuildEventFallbackBody:
 
     def test_without_metrics_or_metadata(self) -> None:
         body = _build_event_fallback_body(
-            "rsv_9", {"tenant": "acme"}, {"kind": "k", "name": "n"}, _commit_body(),
+            "rsv_9",
+            {"tenant": "acme"},
+            {"kind": "k", "name": "n"},
+            _commit_body(),
         )
         assert "metrics" not in body
         assert set(body["metadata"]) == {"recovered_reservation_id", "recovery_reason"}
@@ -1179,14 +1277,17 @@ class TestBuildEventFallbackBody:
 
 
 def _allow_response() -> CyclesResponse:
-    return CyclesResponse.success(200, {
-        "decision": "ALLOW",
-        "reservation_id": "rsv_test",
-        "expires_at_ms": int(time.time() * 1000) + 600_000,
-        "affected_scopes": ["tenant:acme"],
-        "scope_path": "tenant:acme",
-        "reserved": {"unit": "USD_MICROCENTS", "amount": 1000},
-    })
+    return CyclesResponse.success(
+        200,
+        {
+            "decision": "ALLOW",
+            "reservation_id": "rsv_test",
+            "expires_at_ms": int(time.time() * 1000) + 600_000,
+            "affected_scopes": ["tenant:acme"],
+            "scope_path": "tenant:acme",
+            "reserved": {"unit": "USD_MICROCENTS", "amount": 1000},
+        },
+    )
 
 
 def _make_cfg() -> DecoratorConfig:
@@ -1212,12 +1313,14 @@ class TestLifecycleEventFallbackWiring:
         rid, event_body = engine.schedule_event.call_args.args
         assert rid == "rsv_test"
         assert event_body["subject"] == {"tenant": "acme"}
+        assert event_body["action"] == {"kind": "unknown", "name": "unknown"}
+        assert event_body["actual"] == {"unit": "USD_MICROCENTS", "amount": 1000}
         assert event_body["metadata"]["recovered_reservation_id"] == "rsv_test"
+        persisted_body = engine.persist_pending.call_args.args[1]
+        assert event_body["idempotency_key"] == persisted_body["idempotency_key"]
         mock_client.release_reservation.assert_not_called()
 
-    def test_journal_write_precedes_first_commit_and_success_discards(
-        self, tmp_path: Path
-    ) -> None:
+    def test_journal_write_precedes_first_commit_and_success_discards(self, tmp_path: Path) -> None:
         lifecycle, mock_client, engine = self._make(tmp_path)
         mock_client.create_reservation.return_value = _allow_response()
         mock_client.commit_reservation.return_value = _commit_success()
@@ -1231,14 +1334,10 @@ class TestLifecycleEventFallbackWiring:
         assert names.index("persist") < names.index("commit")
         engine.discard_pending.assert_called_once_with("rsv_test")
 
-    def test_protocol_invalid_2xx_is_ambiguous_and_keeps_same_key(
-        self, tmp_path: Path
-    ) -> None:
+    def test_protocol_invalid_2xx_is_ambiguous_and_keeps_same_key(self, tmp_path: Path) -> None:
         lifecycle, mock_client, engine = self._make(tmp_path)
         mock_client.create_reservation.return_value = _allow_response()
-        mock_client.commit_reservation.return_value = CyclesResponse.success(
-            200, {"status": "COMMITTED"}
-        )
+        mock_client.commit_reservation.return_value = CyclesResponse.success(200, {"status": "COMMITTED"})
 
         lifecycle.execute(lambda: "result", (), {}, _make_cfg())
 
@@ -1297,7 +1396,8 @@ class TestLifecycleEventFallbackWiring:
         lifecycle, mock_client, engine = self._make(tmp_path)
         mock_client.create_reservation.return_value = _allow_response()
         mock_client.commit_reservation.return_value = CyclesResponse.http_error(
-            429, "busy",
+            429,
+            "busy",
             body={"error": "LIMIT_EXCEEDED", "message": "slow down", "request_id": "r9"},
             headers={"retry-after": "3"},
         )
@@ -1364,7 +1464,8 @@ class TestAsyncLifecycleEventFallbackWiring:
         lifecycle, mock_client, engine = self._make(tmp_path)
         mock_client.create_reservation.return_value = _allow_response()
         mock_client.commit_reservation.return_value = CyclesResponse.http_error(
-            429, "busy",
+            429,
+            "busy",
             body={"error": "LIMIT_EXCEEDED", "message": "slow down", "request_id": "r9"},
             headers={"retry-after": "3"},
         )
@@ -1460,7 +1561,8 @@ class TestStreamingEventFallbackWiring:
         stream, mock_client, engine = self._make_stream(tmp_path)
         mock_client.create_reservation.return_value = _allow_response()
         mock_client.commit_reservation.return_value = CyclesResponse.http_error(
-            429, "busy",
+            429,
+            "busy",
             body={"error": "LIMIT_EXCEEDED", "message": "slow down", "request_id": "r9"},
             headers={"retry-after": "3"},
         )
@@ -1545,7 +1647,8 @@ class TestAsyncStreamingEventFallbackWiring:
         stream, mock_client, engine = await self._make_stream(tmp_path)
         mock_client.create_reservation.return_value = _allow_response()
         mock_client.commit_reservation.return_value = CyclesResponse.http_error(
-            429, "busy",
+            429,
+            "busy",
             body={"error": "LIMIT_EXCEEDED", "message": "slow down", "request_id": "r9"},
             headers={"retry-after": "3"},
         )

@@ -332,7 +332,8 @@ class TestBuildExtendBody:
 class TestBuildProtocolExceptionEdgeCases:
     def test_maps_overdraft_limit_exceeded(self) -> None:
         response = CyclesResponse.http_error(
-            409, "Over limit",
+            409,
+            "Over limit",
             body={"error": "OVERDRAFT_LIMIT_EXCEEDED", "message": "Over limit", "request_id": "r1"},
         )
         exc = _build_protocol_exception("Failed", response)
@@ -340,7 +341,8 @@ class TestBuildProtocolExceptionEdgeCases:
 
     def test_maps_debt_outstanding(self) -> None:
         response = CyclesResponse.http_error(
-            409, "Debt",
+            409,
+            "Debt",
             body={"error": "DEBT_OUTSTANDING", "message": "Debt", "request_id": "r2"},
         )
         exc = _build_protocol_exception("Failed", response)
@@ -351,7 +353,8 @@ class TestBuildProtocolExceptionEdgeCases:
         # the HTTP Retry-After header (seconds); surface it as retry_after_ms
         # when the body carries no retry_after_ms field.
         response = CyclesResponse.http_error(
-            429, "Rate limited",
+            429,
+            "Rate limited",
             body={"error": "LIMIT_EXCEEDED", "message": "Rate limited", "request_id": "r6"},
             headers={"retry-after": "3"},
         )
@@ -362,7 +365,8 @@ class TestBuildProtocolExceptionEdgeCases:
 
     def test_retry_after_body_wins_over_header(self) -> None:
         response = CyclesResponse.http_error(
-            429, "Rate limited",
+            429,
+            "Rate limited",
             body={
                 "error": "LIMIT_EXCEEDED",
                 "message": "Rate limited",
@@ -376,7 +380,8 @@ class TestBuildProtocolExceptionEdgeCases:
 
     def test_maps_tenant_closed(self) -> None:
         response = CyclesResponse.http_error(
-            409, "Tenant closed",
+            409,
+            "Tenant closed",
             body={"error": "TENANT_CLOSED", "message": "Tenant closed", "request_id": "r5"},
         )
         exc = _build_protocol_exception("Failed", response)
@@ -387,7 +392,8 @@ class TestBuildProtocolExceptionEdgeCases:
 
     def test_maps_reservation_expired(self) -> None:
         response = CyclesResponse.http_error(
-            410, "Expired",
+            410,
+            "Expired",
             body={"error": "RESERVATION_EXPIRED", "message": "Expired", "request_id": "r3"},
         )
         exc = _build_protocol_exception("Failed", response)
@@ -395,7 +401,8 @@ class TestBuildProtocolExceptionEdgeCases:
 
     def test_maps_reservation_finalized(self) -> None:
         response = CyclesResponse.http_error(
-            409, "Finalized",
+            409,
+            "Finalized",
             body={"error": "RESERVATION_FINALIZED", "message": "Finalized", "request_id": "r4"},
         )
         exc = _build_protocol_exception("Failed", response)
@@ -404,7 +411,8 @@ class TestBuildProtocolExceptionEdgeCases:
     def test_fallback_when_body_not_error_response(self) -> None:
         """When body has an error field but doesn't parse as ErrorResponse."""
         response = CyclesResponse.http_error(
-            500, "Something broke",
+            500,
+            "Something broke",
             body={"error": "INTERNAL_ERROR"},  # missing required 'message' and 'request_id'
         )
         exc = _build_protocol_exception("Call failed", response)
@@ -420,6 +428,7 @@ class TestBuildProtocolExceptionEdgeCases:
 
 # --- Helper to build a mock sync client ---
 
+
 def _make_config() -> CyclesConfig:
     return CyclesConfig(
         base_url="http://localhost:7878",
@@ -432,53 +441,71 @@ def _make_config() -> CyclesConfig:
 
 
 def _allow_response() -> CyclesResponse:
-    return CyclesResponse.success(200, {
-        "decision": "ALLOW",
-        "reservation_id": "rsv_test",
-        "expires_at_ms": int(time.time() * 1000) + 600_000,
-        "affected_scopes": ["tenant:acme"],
-        "scope_path": "tenant:acme",
-        "reserved": {"unit": "USD_MICROCENTS", "amount": 1000},
-    })
+    return CyclesResponse.success(
+        200,
+        {
+            "decision": "ALLOW",
+            "reservation_id": "rsv_test",
+            "expires_at_ms": int(time.time() * 1000) + 600_000,
+            "affected_scopes": ["tenant:acme"],
+            "scope_path": "tenant:acme",
+            "reserved": {"unit": "USD_MICROCENTS", "amount": 1000},
+        },
+    )
 
 
 def _deny_response() -> CyclesResponse:
-    return CyclesResponse.success(200, {
-        "decision": "DENY",
-        "affected_scopes": ["tenant:acme"],
-        "reason_code": "BUDGET_EXCEEDED",
-    })
+    return CyclesResponse.success(
+        200,
+        {
+            "decision": "DENY",
+            "affected_scopes": ["tenant:acme"],
+            "reason_code": "BUDGET_EXCEEDED",
+        },
+    )
 
 
 def _dry_run_allow_response() -> CyclesResponse:
-    return CyclesResponse.success(200, {
-        "decision": "ALLOW",
-        "affected_scopes": ["tenant:acme"],
-        "scope_path": "tenant:acme",
-        "reserved": {"unit": "USD_MICROCENTS", "amount": 1000},
-    })
+    return CyclesResponse.success(
+        200,
+        {
+            "decision": "ALLOW",
+            "affected_scopes": ["tenant:acme"],
+            "scope_path": "tenant:acme",
+            "reserved": {"unit": "USD_MICROCENTS", "amount": 1000},
+        },
+    )
 
 
 def _dry_run_deny_response() -> CyclesResponse:
-    return CyclesResponse.success(200, {
-        "decision": "DENY",
-        "affected_scopes": ["tenant:acme"],
-        "reason_code": "BUDGET_EXCEEDED",
-    })
+    return CyclesResponse.success(
+        200,
+        {
+            "decision": "DENY",
+            "affected_scopes": ["tenant:acme"],
+            "reason_code": "BUDGET_EXCEEDED",
+        },
+    )
 
 
 def _commit_success() -> CyclesResponse:
-    return CyclesResponse.success(200, {
-        "status": "COMMITTED",
-        "charged": {"unit": "USD_MICROCENTS", "amount": 1000},
-    })
+    return CyclesResponse.success(
+        200,
+        {
+            "status": "COMMITTED",
+            "charged": {"unit": "USD_MICROCENTS", "amount": 1000},
+        },
+    )
 
 
 def _release_success() -> CyclesResponse:
-    return CyclesResponse.success(200, {
-        "status": "RELEASED",
-        "released": {"unit": "USD_MICROCENTS", "amount": 1000},
-    })
+    return CyclesResponse.success(
+        200,
+        {
+            "status": "RELEASED",
+            "released": {"unit": "USD_MICROCENTS", "amount": 1000},
+        },
+    )
 
 
 def _make_cfg(**kwargs: object) -> DecoratorConfig:
@@ -514,9 +541,25 @@ class TestSyncLifecycleExecution:
         result = lifecycle.execute(lambda: "should not run", (), {}, cfg)
 
         from runcycles.models import DryRunResult
+
         assert isinstance(result, DryRunResult)
         assert result.is_allowed()
         mock_client.commit_reservation.assert_not_called()
+
+    def test_missing_actual_surfaces_without_settlement(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        lifecycle, mock_client = self._make_lifecycle()
+        mock_client.create_reservation.return_value = _allow_response()
+        mock_client.release_reservation.return_value = _release_success()
+        schedule_event = MagicMock()
+        monkeypatch.setattr(lifecycle._retry_engine, "schedule_event", schedule_event)
+
+        cfg = _make_cfg(use_estimate_if_actual_not_provided=False)
+        with pytest.raises(ValueError, match="actual expression is required"):
+            lifecycle.execute(lambda: "result", (), {}, cfg)
+
+        mock_client.commit_reservation.assert_not_called()
+        schedule_event.assert_not_called()
+        mock_client.release_reservation.assert_called_once()
 
     def test_deny_raises(self) -> None:
         lifecycle, mock_client = self._make_lifecycle()
@@ -529,11 +572,14 @@ class TestSyncLifecycleExecution:
 
     def test_missing_reservation_id_raises(self) -> None:
         lifecycle, mock_client = self._make_lifecycle()
-        mock_client.create_reservation.return_value = CyclesResponse.success(200, {
-            "decision": "ALLOW",
-            "affected_scopes": ["tenant:acme"],
-            # reservation_id intentionally missing
-        })
+        mock_client.create_reservation.return_value = CyclesResponse.success(
+            200,
+            {
+                "decision": "ALLOW",
+                "affected_scopes": ["tenant:acme"],
+                # reservation_id intentionally missing
+            },
+        )
 
         cfg = _make_cfg()
 
@@ -544,7 +590,8 @@ class TestSyncLifecycleExecution:
         lifecycle, mock_client = self._make_lifecycle()
         mock_client.create_reservation.return_value = _allow_response()
         mock_client.commit_reservation.return_value = CyclesResponse.http_error(
-            409, "Finalized",
+            409,
+            "Finalized",
             body={"error": "RESERVATION_FINALIZED", "message": "Already committed", "request_id": "r1"},
         )
 
@@ -557,7 +604,8 @@ class TestSyncLifecycleExecution:
         lifecycle, mock_client = self._make_lifecycle()
         mock_client.create_reservation.return_value = _allow_response()
         mock_client.commit_reservation.return_value = CyclesResponse.http_error(
-            410, "Expired",
+            410,
+            "Expired",
             body={"error": "RESERVATION_EXPIRED", "message": "Expired", "request_id": "r1"},
         )
 
@@ -570,7 +618,8 @@ class TestSyncLifecycleExecution:
         lifecycle, mock_client = self._make_lifecycle()
         mock_client.create_reservation.return_value = _allow_response()
         mock_client.commit_reservation.return_value = CyclesResponse.http_error(
-            409, "Mismatch",
+            409,
+            "Mismatch",
             body={"error": "IDEMPOTENCY_MISMATCH", "message": "Mismatch", "request_id": "r1"},
         )
 
@@ -583,7 +632,8 @@ class TestSyncLifecycleExecution:
         lifecycle, mock_client = self._make_lifecycle()
         mock_client.create_reservation.return_value = _allow_response()
         mock_client.commit_reservation.return_value = CyclesResponse.http_error(
-            400, "Bad request",
+            400,
+            "Bad request",
             body={"error": "UNIT_MISMATCH", "message": "Unit mismatch", "request_id": "r1"},
         )
         mock_client.release_reservation.return_value = _release_success()
@@ -603,9 +653,7 @@ class TestSyncLifecycleExecution:
         lifecycle = CyclesLifecycle(mock_client, retry_engine, {"tenant": "acme"})
 
         mock_client.create_reservation.return_value = _allow_response()
-        mock_client.commit_reservation.return_value = CyclesResponse.transport_error(
-            ConnectionError("network down")
-        )
+        mock_client.commit_reservation.return_value = CyclesResponse.transport_error(ConnectionError("network down"))
 
         cfg = _make_cfg()
         lifecycle.execute(lambda: "result", (), {}, cfg)
@@ -671,9 +719,13 @@ class TestSyncLifecycleExecution:
         lifecycle, mock_client = self._make_lifecycle()
         mock_client.create_reservation.return_value = _allow_response()
         mock_client.commit_reservation.return_value = _commit_success()
-        mock_client.extend_reservation.return_value = CyclesResponse.success(200, {
-            "status": "ACTIVE", "expires_at_ms": 9999999999,
-        })
+        mock_client.extend_reservation.return_value = CyclesResponse.success(
+            200,
+            {
+                "status": "ACTIVE",
+                "expires_at_ms": 9999999999,
+            },
+        )
 
         # Use a very short TTL so heartbeat fires during execution
         cfg = _make_cfg(ttl_ms=2000)
@@ -701,11 +753,14 @@ class TestSyncLifecycleExecution:
         result = lifecycle.execute(slow_fn, (), {}, cfg)
         assert result == "done"
 
-    def test_heartbeat_exception_does_not_crash(self) -> None:
+    def test_heartbeat_exception_does_not_crash(self, caplog: pytest.LogCaptureFixture) -> None:
         lifecycle, mock_client = self._make_lifecycle()
         mock_client.create_reservation.return_value = _allow_response()
         mock_client.commit_reservation.return_value = _commit_success()
-        mock_client.extend_reservation.side_effect = ConnectionError("network down")
+        mock_client.extend_reservation.side_effect = [
+            ConnectionError("network down"),
+            CyclesResponse.success(200, {"status": "ACTIVE", "expires_at_ms": 9999999999}),
+        ]
 
         cfg = _make_cfg(ttl_ms=2000)
 
@@ -715,6 +770,16 @@ class TestSyncLifecycleExecution:
 
         result = lifecycle.execute(slow_fn, (), {}, cfg)
         assert result == "done"
+        assert mock_client.extend_reservation.call_count >= 2
+        sent = [call.args[1]["idempotency_key"] for call in mock_client.extend_reservation.call_args_list[:2]]
+        assert sent[0] == sent[1]
+        mock_client.commit_reservation.assert_called_once()
+        heartbeat_messages = [
+            record.getMessage()
+            for record in caplog.records
+            if "Heartbeat extend transport error" in record.getMessage()
+        ]
+        assert any("rsv_test" in message and "same idempotency key" in message for message in heartbeat_messages)
 
     def test_commit_unrecognized_response_logged(self) -> None:
         lifecycle, mock_client = self._make_lifecycle()
@@ -727,7 +792,8 @@ class TestSyncLifecycleExecution:
     def test_reservation_creation_failure_raises(self) -> None:
         lifecycle, mock_client = self._make_lifecycle()
         mock_client.create_reservation.return_value = CyclesResponse.http_error(
-            500, "Internal error",
+            500,
+            "Internal error",
             body={"error": "INTERNAL_ERROR", "message": "Server down", "request_id": "r1"},
         )
 
@@ -744,6 +810,7 @@ class TestSyncLifecycleExecution:
         # We can't easily set ttl_ms=0 since validation rejects it, but we can test
         # the heartbeat path by calling _start_heartbeat directly
         import threading
+
         stop = threading.Event()
         result = lifecycle._start_heartbeat("rsv_1", 0, MagicMock(), stop)
         assert result is None
@@ -809,15 +876,21 @@ class TestAsyncLifecycleExecution:
             return "should not run"
 
         from runcycles.models import DryRunResult
+
         result = await lifecycle.execute(my_func, (), {}, cfg)
         assert isinstance(result, DryRunResult)
 
     async def test_missing_reservation_id_raises(self) -> None:
         lifecycle, mock_client = self._make_lifecycle()
-        mock_client.create_reservation = AsyncMock(return_value=CyclesResponse.success(200, {
-            "decision": "ALLOW",
-            "affected_scopes": ["tenant:acme"],
-        }))
+        mock_client.create_reservation = AsyncMock(
+            return_value=CyclesResponse.success(
+                200,
+                {
+                    "decision": "ALLOW",
+                    "affected_scopes": ["tenant:acme"],
+                },
+            )
+        )
 
         cfg = _make_cfg()
 
@@ -845,10 +918,13 @@ class TestAsyncLifecycleExecution:
     async def test_commit_finalized_does_not_release(self) -> None:
         lifecycle, mock_client = self._make_lifecycle()
         mock_client.create_reservation = AsyncMock(return_value=_allow_response())
-        mock_client.commit_reservation = AsyncMock(return_value=CyclesResponse.http_error(
-            409, "Finalized",
-            body={"error": "RESERVATION_FINALIZED", "message": "Done", "request_id": "r1"},
-        ))
+        mock_client.commit_reservation = AsyncMock(
+            return_value=CyclesResponse.http_error(
+                409,
+                "Finalized",
+                body={"error": "RESERVATION_FINALIZED", "message": "Done", "request_id": "r1"},
+            )
+        )
 
         cfg = _make_cfg()
 
@@ -861,10 +937,13 @@ class TestAsyncLifecycleExecution:
     async def test_commit_idempotency_mismatch_does_not_release(self) -> None:
         lifecycle, mock_client = self._make_lifecycle()
         mock_client.create_reservation = AsyncMock(return_value=_allow_response())
-        mock_client.commit_reservation = AsyncMock(return_value=CyclesResponse.http_error(
-            409, "Mismatch",
-            body={"error": "IDEMPOTENCY_MISMATCH", "message": "Mismatch", "request_id": "r1"},
-        ))
+        mock_client.commit_reservation = AsyncMock(
+            return_value=CyclesResponse.http_error(
+                409,
+                "Mismatch",
+                body={"error": "IDEMPOTENCY_MISMATCH", "message": "Mismatch", "request_id": "r1"},
+            )
+        )
 
         cfg = _make_cfg()
 
@@ -877,10 +956,13 @@ class TestAsyncLifecycleExecution:
     async def test_commit_client_error_triggers_release(self) -> None:
         lifecycle, mock_client = self._make_lifecycle()
         mock_client.create_reservation = AsyncMock(return_value=_allow_response())
-        mock_client.commit_reservation = AsyncMock(return_value=CyclesResponse.http_error(
-            400, "Bad",
-            body={"error": "UNIT_MISMATCH", "message": "Wrong unit", "request_id": "r1"},
-        ))
+        mock_client.commit_reservation = AsyncMock(
+            return_value=CyclesResponse.http_error(
+                400,
+                "Bad",
+                body={"error": "UNIT_MISMATCH", "message": "Wrong unit", "request_id": "r1"},
+            )
+        )
         mock_client.release_reservation = AsyncMock(return_value=_release_success())
 
         cfg = _make_cfg()
@@ -901,9 +983,7 @@ class TestAsyncLifecycleExecution:
         lifecycle = AsyncCyclesLifecycle(mock_client, retry_engine, {"tenant": "acme"})
 
         mock_client.create_reservation = AsyncMock(return_value=_allow_response())
-        mock_client.commit_reservation = AsyncMock(
-            return_value=CyclesResponse.transport_error(ConnectionError("down"))
-        )
+        mock_client.commit_reservation = AsyncMock(return_value=CyclesResponse.transport_error(ConnectionError("down")))
 
         cfg = _make_cfg()
 
@@ -934,9 +1014,7 @@ class TestAsyncLifecycleExecution:
     async def test_release_failure_does_not_raise(self) -> None:
         lifecycle, mock_client = self._make_lifecycle()
         mock_client.create_reservation = AsyncMock(return_value=_allow_response())
-        mock_client.release_reservation = AsyncMock(
-            return_value=CyclesResponse.http_error(500, "Release failed")
-        )
+        mock_client.release_reservation = AsyncMock(return_value=CyclesResponse.http_error(500, "Release failed"))
 
         cfg = _make_cfg()
 
@@ -963,9 +1041,15 @@ class TestAsyncLifecycleExecution:
         lifecycle, mock_client = self._make_lifecycle()
         mock_client.create_reservation = AsyncMock(return_value=_allow_response())
         mock_client.commit_reservation = AsyncMock(return_value=_commit_success())
-        mock_client.extend_reservation = AsyncMock(return_value=CyclesResponse.success(200, {
-            "status": "ACTIVE", "expires_at_ms": 9999999999,
-        }))
+        mock_client.extend_reservation = AsyncMock(
+            return_value=CyclesResponse.success(
+                200,
+                {
+                    "status": "ACTIVE",
+                    "expires_at_ms": 9999999999,
+                },
+            )
+        )
 
         cfg = _make_cfg(ttl_ms=2000)
 
@@ -981,9 +1065,7 @@ class TestAsyncLifecycleExecution:
         lifecycle, mock_client = self._make_lifecycle()
         mock_client.create_reservation = AsyncMock(return_value=_allow_response())
         mock_client.commit_reservation = AsyncMock(return_value=_commit_success())
-        mock_client.extend_reservation = AsyncMock(
-            return_value=CyclesResponse.http_error(500, "Extend failed")
-        )
+        mock_client.extend_reservation = AsyncMock(return_value=CyclesResponse.http_error(500, "Extend failed"))
 
         cfg = _make_cfg(ttl_ms=2000)
 
@@ -1023,10 +1105,13 @@ class TestAsyncLifecycleExecution:
 
     async def test_reservation_creation_failure_raises(self) -> None:
         lifecycle, mock_client = self._make_lifecycle()
-        mock_client.create_reservation = AsyncMock(return_value=CyclesResponse.http_error(
-            500, "Internal error",
-            body={"error": "INTERNAL_ERROR", "message": "Server down", "request_id": "r1"},
-        ))
+        mock_client.create_reservation = AsyncMock(
+            return_value=CyclesResponse.http_error(
+                500,
+                "Internal error",
+                body={"error": "INTERNAL_ERROR", "message": "Server down", "request_id": "r1"},
+            )
+        )
 
         cfg = _make_cfg()
 

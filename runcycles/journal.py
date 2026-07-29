@@ -131,7 +131,12 @@ class PendingCommitRecord:
     @classmethod
     def from_json(cls, raw: str) -> PendingCommitRecord:
         data = json.loads(raw)
-        reservation_id = data["reservation_id"]
+        if not isinstance(data, dict):
+            raise ValueError("journal record must be a JSON object")
+        version = data.get("version")
+        if not isinstance(version, int) or isinstance(version, bool) or version != _RECORD_VERSION:
+            raise ValueError(f"unsupported journal version: {version!r}")
+        reservation_id = data.get("reservation_id")
         mode = data.get("mode", "commit")
         if not isinstance(reservation_id, str) or not reservation_id:
             raise ValueError("journal record missing reservation_id")
@@ -141,15 +146,27 @@ class PendingCommitRecord:
             raise ValueError("commit-mode journal record missing commit_body")
         if mode == "event" and not isinstance(data.get("event_fallback_body"), dict):
             raise ValueError("event-mode journal record missing event_fallback_body")
+        for body_key in ("commit_body", "event_fallback_body"):
+            if data.get(body_key) is not None and not isinstance(data[body_key], dict):
+                raise ValueError(f"journal record has invalid {body_key}")
+        if "base_url" in data and not isinstance(data["base_url"], str):
+            raise ValueError("journal record has invalid base_url")
+        recorded_at_raw = data.get("recorded_at_ms", 0)
+        if not isinstance(recorded_at_raw, int) or isinstance(recorded_at_raw, bool) or recorded_at_raw < 0:
+            raise ValueError("journal record has invalid recorded_at_ms")
         not_before_raw = data.get("not_before_ms")
+        if not_before_raw is not None and (
+            not isinstance(not_before_raw, int) or isinstance(not_before_raw, bool) or not_before_raw < 0
+        ):
+            raise ValueError("journal record has invalid not_before_ms")
         return cls(
             reservation_id=reservation_id,
             base_url=data.get("base_url", ""),
             mode=mode,
             commit_body=data.get("commit_body"),
             event_fallback_body=data.get("event_fallback_body"),
-            recorded_at_ms=int(data.get("recorded_at_ms", 0)),
-            not_before_ms=int(not_before_raw) if not_before_raw is not None else None,
+            recorded_at_ms=recorded_at_raw,
+            not_before_ms=not_before_raw,
         )
 
 
@@ -186,14 +203,14 @@ class CommitJournal:
                 tmp.write_text(entry.to_json(), encoding="utf-8")
                 _restrict_permissions(tmp, 0o600)
                 tmp.replace(target)
-            except OSError:
+            except Exception:
                 try:
                     tmp.unlink(missing_ok=True)
                 except OSError:
                     pass
                 raise
             logger.debug("Journaled pending commit: id=%s, path=%s", entry.reservation_id, target)
-        except OSError:
+        except Exception:
             logger.warning(
                 "Failed to journal pending commit (continuing without durability): id=%s",
                 entry.reservation_id,
@@ -260,9 +277,7 @@ class CommitJournal:
                                 standard_path,
                             )
                         else:
-                            existing = PendingCommitRecord.from_json(
-                                standard_path.read_text(encoding="utf-8")
-                            )
+                            existing = PendingCommitRecord.from_json(standard_path.read_text(encoding="utf-8"))
                             if existing.reservation_id == entry.reservation_id:
                                 path.unlink(missing_ok=True)
                                 duplicate_of_standard = True

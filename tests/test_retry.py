@@ -35,9 +35,7 @@ class TestSettlementSuccessValidation:
             },
         }
         assert _is_schema_valid_commit_success(CyclesResponse.success(200, body))
-        assert not _is_schema_valid_commit_success(
-            CyclesResponse.success(200, {**body, "balances": None})
-        )
+        assert not _is_schema_valid_commit_success(CyclesResponse.success(200, {**body, "balances": None}))
         assert not _is_schema_valid_commit_success(
             CyclesResponse.success(
                 200,
@@ -58,9 +56,7 @@ class TestSettlementSuccessValidation:
         )
 
     def test_event_follows_exact_wire_schema(self) -> None:
-        assert _is_schema_valid_event_success(
-            CyclesResponse.success(201, {"status": "APPLIED", "event_id": ""})
-        )
+        assert _is_schema_valid_event_success(CyclesResponse.success(201, {"status": "APPLIED", "event_id": ""}))
         assert not _is_schema_valid_event_success(
             CyclesResponse.success(
                 201,
@@ -102,22 +98,29 @@ class TestCommitRetryEngine:
     def test_retries_until_success(self, config: CyclesConfig) -> None:
         engine = CommitRetryEngine(config)
         mock_client = MagicMock()
-        # First call fails with 500, second succeeds
+        # The first response is lost after the request leaves the client. The
+        # recovery attempt must use the exact same settlement key.
         mock_client.commit_reservation.side_effect = [
-            CyclesResponse.http_error(500, "Server error"),
-            CyclesResponse.success(200, {
-                "status": "COMMITTED",
-                "charged": {"unit": "USD_MICROCENTS", "amount": 1},
-            }),
+            ConnectionError("response lost"),
+            CyclesResponse.success(
+                200,
+                {
+                    "status": "COMMITTED",
+                    "charged": {"unit": "USD_MICROCENTS", "amount": 1},
+                },
+            ),
         ]
         engine.set_client(mock_client)
 
         # Run _retry_loop directly (synchronous, avoids thread timing issues)
         from runcycles.retry import _PendingCommit
+
         pending = _PendingCommit(reservation_id="rsv_1", commit_body={"idempotency_key": "k1"})
         engine._retry_loop(pending)
 
         assert mock_client.commit_reservation.call_count == 2
+        sent = [call.args[1] for call in mock_client.commit_reservation.call_args_list]
+        assert [body["idempotency_key"] for body in sent] == ["k1", "k1"]
 
     def test_stops_on_client_error(self, config: CyclesConfig) -> None:
         engine = CommitRetryEngine(config)
@@ -127,6 +130,7 @@ class TestCommitRetryEngine:
         engine.set_client(mock_client)
 
         from runcycles.retry import _PendingCommit
+
         pending = _PendingCommit(reservation_id="rsv_1", commit_body={"idempotency_key": "k1"})
         engine._retry_loop(pending)
 
@@ -140,6 +144,7 @@ class TestCommitRetryEngine:
         engine.set_client(mock_client)
 
         from runcycles.retry import _PendingCommit
+
         pending = _PendingCommit(reservation_id="rsv_1", commit_body={"idempotency_key": "k1"})
         engine._retry_loop(pending)
 
@@ -151,14 +156,18 @@ class TestCommitRetryEngine:
         # First call throws, second succeeds
         mock_client.commit_reservation.side_effect = [
             ConnectionError("network down"),
-            CyclesResponse.success(200, {
-                "status": "COMMITTED",
-                "charged": {"unit": "USD_MICROCENTS", "amount": 1},
-            }),
+            CyclesResponse.success(
+                200,
+                {
+                    "status": "COMMITTED",
+                    "charged": {"unit": "USD_MICROCENTS", "amount": 1},
+                },
+            ),
         ]
         engine.set_client(mock_client)
 
         from runcycles.retry import _PendingCommit
+
         pending = _PendingCommit(reservation_id="rsv_1", commit_body={"idempotency_key": "k1"})
         engine._retry_loop(pending)
 
@@ -168,6 +177,7 @@ class TestCommitRetryEngine:
         engine = CommitRetryEngine(config)
         # Don't set client — should bail out
         from runcycles.retry import _PendingCommit
+
         pending = _PendingCommit(reservation_id="rsv_1", commit_body={"idempotency_key": "k1"})
         engine._retry_loop(pending)  # should not raise
 
@@ -186,14 +196,18 @@ class TestAsyncCommitRetryEngine:
         mock_client = AsyncMock()
         mock_client.commit_reservation.side_effect = [
             CyclesResponse.http_error(500, "Server error"),
-            CyclesResponse.success(200, {
-                "status": "COMMITTED",
-                "charged": {"unit": "USD_MICROCENTS", "amount": 1},
-            }),
+            CyclesResponse.success(
+                200,
+                {
+                    "status": "COMMITTED",
+                    "charged": {"unit": "USD_MICROCENTS", "amount": 1},
+                },
+            ),
         ]
         engine.set_client(mock_client)
 
         from runcycles.retry import _PendingCommit
+
         pending = _PendingCommit(reservation_id="rsv_1", commit_body={"idempotency_key": "k1"})
         await engine._retry_loop(pending)
 
@@ -206,6 +220,7 @@ class TestAsyncCommitRetryEngine:
         engine.set_client(mock_client)
 
         from runcycles.retry import _PendingCommit
+
         pending = _PendingCommit(reservation_id="rsv_1", commit_body={"idempotency_key": "k1"})
         await engine._retry_loop(pending)
 
@@ -218,6 +233,7 @@ class TestAsyncCommitRetryEngine:
         engine.set_client(mock_client)
 
         from runcycles.retry import _PendingCommit
+
         pending = _PendingCommit(reservation_id="rsv_1", commit_body={"idempotency_key": "k1"})
         await engine._retry_loop(pending)
 
@@ -228,14 +244,18 @@ class TestAsyncCommitRetryEngine:
         mock_client = AsyncMock()
         mock_client.commit_reservation.side_effect = [
             ConnectionError("network down"),
-            CyclesResponse.success(200, {
-                "status": "COMMITTED",
-                "charged": {"unit": "USD_MICROCENTS", "amount": 1},
-            }),
+            CyclesResponse.success(
+                200,
+                {
+                    "status": "COMMITTED",
+                    "charged": {"unit": "USD_MICROCENTS", "amount": 1},
+                },
+            ),
         ]
         engine.set_client(mock_client)
 
         from runcycles.retry import _PendingCommit
+
         pending = _PendingCommit(reservation_id="rsv_1", commit_body={"idempotency_key": "k1"})
         await engine._retry_loop(pending)
 
@@ -244,6 +264,7 @@ class TestAsyncCommitRetryEngine:
     async def test_no_client_set(self, config: CyclesConfig) -> None:
         engine = AsyncCommitRetryEngine(config)
         from runcycles.retry import _PendingCommit
+
         pending = _PendingCommit(reservation_id="rsv_1", commit_body={"idempotency_key": "k1"})
         await engine._retry_loop(pending)  # should not raise
 
@@ -264,15 +285,19 @@ class TestCommitRetryEngineSchedule:
         engine = CommitRetryEngine(config)
         mock_client = MagicMock()
         # Return success immediately so the thread finishes quickly
-        mock_client.commit_reservation.return_value = CyclesResponse.success(200, {
-            "status": "COMMITTED",
-            "charged": {"unit": "USD_MICROCENTS", "amount": 1},
-        })
+        mock_client.commit_reservation.return_value = CyclesResponse.success(
+            200,
+            {
+                "status": "COMMITTED",
+                "charged": {"unit": "USD_MICROCENTS", "amount": 1},
+            },
+        )
         engine.set_client(mock_client)
 
         engine.schedule("rsv_1", {"idempotency_key": "k1"})
         # Give the thread time to run
         import time
+
         time.sleep(0.1)
         assert mock_client.commit_reservation.call_count >= 1
 
