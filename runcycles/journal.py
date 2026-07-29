@@ -89,9 +89,13 @@ def _restrict_permissions(path: Path, mode: int) -> None:
 
 
 def _safe_filename(reservation_id: str) -> str:
-    # ASCII-only, matching the TS/Java SDKs exactly: same-tenant clients in
-    # other languages settle records from this directory, and their discard()
-    # must compute the identical filename or the record replays forever.
+    """Cross-SDK, collision-resistant filename for an exact reservation id."""
+    digest = hashlib.sha256(reservation_id.encode("utf-8")).hexdigest()
+    return f"v2-{digest}{_SUFFIX}"
+
+
+def _legacy_filename(reservation_id: str) -> str:
+    """Filename written by SDK releases before the v2 digest scheme."""
     sanitized = re.sub(r"[^A-Za-z0-9_-]", "_", reservation_id)
     return f"{sanitized}{_SUFFIX}"
 
@@ -127,7 +131,12 @@ class PendingCommitRecord:
     @classmethod
     def from_json(cls, raw: str) -> PendingCommitRecord:
         data = json.loads(raw)
-        reservation_id = data["reservation_id"]
+        if not isinstance(data, dict):
+            raise ValueError("journal record must be a JSON object")
+        version = data.get("version")
+        if not isinstance(version, int) or isinstance(version, bool) or version != _RECORD_VERSION:
+            raise ValueError(f"unsupported journal version: {version!r}")
+        reservation_id = data.get("reservation_id")
         mode = data.get("mode", "commit")
         if not isinstance(reservation_id, str) or not reservation_id:
             raise ValueError("journal record missing reservation_id")
@@ -137,15 +146,27 @@ class PendingCommitRecord:
             raise ValueError("commit-mode journal record missing commit_body")
         if mode == "event" and not isinstance(data.get("event_fallback_body"), dict):
             raise ValueError("event-mode journal record missing event_fallback_body")
+        for body_key in ("commit_body", "event_fallback_body"):
+            if data.get(body_key) is not None and not isinstance(data[body_key], dict):
+                raise ValueError(f"journal record has invalid {body_key}")
+        if "base_url" in data and not isinstance(data["base_url"], str):
+            raise ValueError("journal record has invalid base_url")
+        recorded_at_raw = data.get("recorded_at_ms", 0)
+        if not isinstance(recorded_at_raw, int) or isinstance(recorded_at_raw, bool) or recorded_at_raw < 0:
+            raise ValueError("journal record has invalid recorded_at_ms")
         not_before_raw = data.get("not_before_ms")
+        if not_before_raw is not None and (
+            not isinstance(not_before_raw, int) or isinstance(not_before_raw, bool) or not_before_raw < 0
+        ):
+            raise ValueError("journal record has invalid not_before_ms")
         return cls(
             reservation_id=reservation_id,
             base_url=data.get("base_url", ""),
             mode=mode,
             commit_body=data.get("commit_body"),
             event_fallback_body=data.get("event_fallback_body"),
-            recorded_at_ms=int(data.get("recorded_at_ms", 0)),
-            not_before_ms=int(not_before_raw) if not_before_raw is not None else None,
+            recorded_at_ms=recorded_at_raw,
+            not_before_ms=not_before_raw,
         )
 
 
@@ -182,14 +203,14 @@ class CommitJournal:
                 tmp.write_text(entry.to_json(), encoding="utf-8")
                 _restrict_permissions(tmp, 0o600)
                 tmp.replace(target)
-            except OSError:
+            except Exception:
                 try:
                     tmp.unlink(missing_ok=True)
                 except OSError:
                     pass
                 raise
             logger.debug("Journaled pending commit: id=%s, path=%s", entry.reservation_id, target)
-        except OSError:
+        except Exception:
             logger.warning(
                 "Failed to journal pending commit (continuing without durability): id=%s",
                 entry.reservation_id,
@@ -200,6 +221,15 @@ class CommitJournal:
         """Remove a journal entry after a terminal outcome. Never raises."""
         try:
             (self._dir / _safe_filename(reservation_id)).unlink(missing_ok=True)
+            legacy = self._dir / _legacy_filename(reservation_id)
+            if legacy.exists():
+                try:
+                    entry = PendingCommitRecord.from_json(legacy.read_text(encoding="utf-8"))
+                    if entry.reservation_id == reservation_id:
+                        legacy.unlink(missing_ok=True)
+                except (OSError, ValueError, KeyError, json.JSONDecodeError):
+                    # Never delete a colliding or malformed legacy record.
+                    pass
         except OSError:
             logger.warning("Failed to discard journal entry: id=%s", reservation_id, exc_info=True)
 
@@ -234,6 +264,36 @@ class CommitJournal:
                         path.replace(path.with_suffix(".corrupt"))
                     except OSError:
                         pass
+                    continue
+                standard_path = self._dir / _safe_filename(entry.reservation_id)
+                duplicate_of_standard = False
+                if path != standard_path:
+                    try:
+                        if not standard_path.exists():
+                            path.replace(standard_path)
+                            logger.info(
+                                "Migrated legacy journal filename: id=%s, path=%s",
+                                entry.reservation_id,
+                                standard_path,
+                            )
+                        else:
+                            existing = PendingCommitRecord.from_json(standard_path.read_text(encoding="utf-8"))
+                            if existing.reservation_id == entry.reservation_id:
+                                path.unlink(missing_ok=True)
+                                duplicate_of_standard = True
+                                logger.info(
+                                    "Removed duplicate legacy journal filename: id=%s, path=%s",
+                                    entry.reservation_id,
+                                    path,
+                                )
+                    except (OSError, ValueError, KeyError, json.JSONDecodeError):
+                        logger.warning(
+                            "Could not safely migrate legacy journal filename: id=%s, path=%s",
+                            entry.reservation_id,
+                            path,
+                            exc_info=True,
+                        )
+                if duplicate_of_standard:
                     continue
                 if entry.base_url == base_url:
                     entries.append(entry)

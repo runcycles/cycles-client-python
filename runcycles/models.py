@@ -309,6 +309,7 @@ class CommitResponse(BaseModel):
     charged: Amount
     released: Amount | None = None
     balances: list[Balance] | None = None
+    cycles_evidence: CyclesEvidenceRef | None = None
 
 
 class ReleaseResponse(BaseModel):

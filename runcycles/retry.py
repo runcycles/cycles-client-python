@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import atexit
+import json
 import logging
 import threading
 import time
@@ -25,7 +26,7 @@ from typing import Any
 from runcycles import journal as _journal
 from runcycles.config import CyclesConfig
 from runcycles.journal import CommitJournal, PendingCommitRecord
-from runcycles.models import ErrorCode
+from runcycles.models import CommitResponse, ErrorCode, EventCreateResponse
 from runcycles.response import CyclesResponse
 
 logger = logging.getLogger(__name__)
@@ -37,13 +38,50 @@ _MAX_HONORED_DELAY_S = 3600.0
 
 
 def _is_recognized_rejection(code: str | None) -> bool:
-    """True when the error code is a known protocol code (not forward-compat).
+    """True when the error code proves a known, non-retryable rejection.
 
     Only a recognized rejection justifies destroying a durable spend record
-    or releasing a reservation; a codeless or unknown-future-code 4xx (a
-    proxy error page, a newer server) is retained instead.
+    or releasing a reservation; a codeless, retryable, or unknown-future-code
+    4xx (a proxy error page, a newer server) is retained instead.
     """
-    return code is not None and ErrorCode.from_string(code) is not ErrorCode.UNKNOWN
+    parsed = ErrorCode.from_string(code)
+    return (
+        parsed is not None
+        and parsed is not ErrorCode.UNKNOWN
+        and not parsed.is_retryable
+    )
+
+
+def _is_schema_valid_commit_success(response: CyclesResponse) -> bool:
+    """Only the protocol's exact commit success is terminal."""
+    if response.status != 200 or not isinstance(response.body, dict):
+        return False
+    if any(
+        key in response.body and response.body[key] is None
+        for key in ("released", "balances", "cycles_evidence")
+    ):
+        return False
+    try:
+        CommitResponse.model_validate_json(json.dumps(response.body), strict=True)
+    except Exception:
+        return False
+    return True
+
+
+def _is_schema_valid_event_success(response: CyclesResponse) -> bool:
+    """Only the protocol's exact event success is terminal."""
+    if response.status != 201 or not isinstance(response.body, dict):
+        return False
+    if any(
+        key in response.body and response.body[key] is None
+        for key in ("charged", "balances")
+    ):
+        return False
+    try:
+        EventCreateResponse.model_validate_json(json.dumps(response.body), strict=True)
+    except Exception:
+        return False
+    return True
 
 
 @dataclass
@@ -160,6 +198,21 @@ class _RetryEngineBase:
         if self._journal is not None:
             self._journal.discard(reservation_id)
 
+    def persist_pending(
+        self,
+        reservation_id: str,
+        commit_body: dict[str, Any],
+        event_fallback_body: dict[str, Any] | None = None,
+    ) -> None:
+        """Journal known actual spend before the first settlement request."""
+        self._journal_record(
+            _PendingCommit(reservation_id, commit_body, event_fallback_body, mode="commit")
+        )
+
+    def discard_pending(self, reservation_id: str) -> None:
+        """Remove a pre-journaled settlement after a terminal outcome."""
+        self._journal_discard(reservation_id)
+
     def _load_replay_entries(self) -> list[_PendingCommit]:
         """Claim and load journaled entries for this engine's server, if eligible."""
         if not self._enabled or self._journal is None or self._client is None:
@@ -233,7 +286,7 @@ class _RetryEngineBase:
         May flip ``pending`` into event mode; the caller then delivers the
         event fallback immediately (no extra backoff) via ``_attempt_event``.
         """
-        if response.is_success:
+        if _is_schema_valid_commit_success(response):
             logger.info(
                 "Commit retry succeeded: reservation_id=%s, attempt=%d",
                 pending.reservation_id, pending.attempt,
@@ -291,7 +344,7 @@ class _RetryEngineBase:
 
     def _classify_event_response(self, pending: _PendingCommit, response: CyclesResponse) -> bool:
         """Handle an event-fallback attempt's response. Returns True when terminal."""
-        if response.is_success:
+        if _is_schema_valid_event_success(response):
             logger.info(
                 "Recovered expired-commit spend via /v1/events: reservation_id=%s, event_id=%s",
                 pending.reservation_id, response.get_body_attribute("event_id"),

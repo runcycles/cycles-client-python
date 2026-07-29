@@ -46,6 +46,7 @@ from runcycles.retry import (
     CommitRetryEngine,
     _extract_error_code,
     _is_recognized_rejection,
+    _is_schema_valid_commit_success,
 )
 
 logger = logging.getLogger(__name__)
@@ -763,11 +764,23 @@ class CyclesLifecycle:
         commit_body: dict[str, Any],
         event_fallback_body: dict[str, Any],
     ) -> None:
+        self._retry_engine.persist_pending(
+            reservation_id, commit_body, event_fallback_body
+        )
         try:
             logger.debug("Committing: id=%s", reservation_id)
             response = self._client.commit_reservation(reservation_id, commit_body)
-            if response.is_success:
+            if _is_schema_valid_commit_success(response):
+                self._retry_engine.discard_pending(reservation_id)
                 logger.info("Commit successful: id=%s", reservation_id)
+            elif response.is_success:
+                logger.warning(
+                    "Commit returned ambiguous protocol-invalid 2xx; scheduling same-key retry: "
+                    "id=%s, status=%d",
+                    reservation_id,
+                    response.status,
+                )
+                self._retry_engine.schedule(reservation_id, commit_body, event_fallback_body)
             elif response.is_transport_error or response.is_server_error:
                 logger.warning("Commit failed (retryable): id=%s, status=%d", reservation_id, response.status)
                 self._retry_engine.schedule(reservation_id, commit_body, event_fallback_body)
@@ -804,10 +817,13 @@ class CyclesLifecycle:
                     )
                     self._retry_engine.schedule_event(reservation_id, event_fallback_body)
                 elif error_code == "RESERVATION_FINALIZED":
+                    self._retry_engine.discard_pending(reservation_id)
                     logger.warning("Reservation already finalized: id=%s", reservation_id)
                 elif error_code == "IDEMPOTENCY_MISMATCH":
+                    self._retry_engine.discard_pending(reservation_id)
                     logger.warning("Commit idempotency mismatch (not releasing): id=%s", reservation_id)
                 elif response.is_client_error and _is_recognized_rejection(error_code):
+                    self._retry_engine.discard_pending(reservation_id)
                     self._handle_release(reservation_id, f"commit_rejected_{error_code}")
                 elif response.is_client_error:
                     # Codeless or forward-compat-unknown 4xx: neither release
@@ -820,7 +836,12 @@ class CyclesLifecycle:
                     )
                     self._retry_engine.schedule(reservation_id, commit_body, event_fallback_body)
                 else:
-                    logger.warning("Unrecognized commit response: id=%s, response=%s", reservation_id, response)
+                    logger.warning(
+                        "Unrecognized commit response; scheduling same-key retry: id=%s, response=%s",
+                        reservation_id,
+                        response,
+                    )
+                    self._retry_engine.schedule(reservation_id, commit_body, event_fallback_body)
         except Exception:
             logger.exception("Failed to commit: id=%s", reservation_id)
             self._retry_engine.schedule(reservation_id, commit_body, event_fallback_body)
@@ -1047,16 +1068,24 @@ class CyclesLifecycle:
                                 return
                             delay_ms = nxt
                 except Exception:
-                    logger.warning("Heartbeat extend error: id=%s", reservation_id, exc_info=True)
                     if authoritative:
                         nxt = sched.on_transient_failure(_now_mono_ms())
                         if nxt is None:
                             logger.warning(
-                                "Heartbeat stopping: no safe recovery window remains: id=%s",
+                                "Heartbeat extend transport error; stopping because no safe recovery "
+                                "window remains: id=%s",
                                 reservation_id,
+                                exc_info=True,
                             )
                             return
                         delay_ms = nxt
+                    logger.warning(
+                        "Heartbeat extend transport error; retrying with the same idempotency key "
+                        "in %.0fms: id=%s",
+                        delay_ms,
+                        reservation_id,
+                        exc_info=True,
+                    )
 
         t = threading.Thread(target=heartbeat_loop, daemon=True, name=f"cycles-heartbeat-{reservation_id[:12]}")
         t.start()
@@ -1189,10 +1218,22 @@ class AsyncCyclesLifecycle:
         commit_body: dict[str, Any],
         event_fallback_body: dict[str, Any],
     ) -> None:
+        self._retry_engine.persist_pending(
+            reservation_id, commit_body, event_fallback_body
+        )
         try:
             response = await self._client.commit_reservation(reservation_id, commit_body)
-            if response.is_success:
+            if _is_schema_valid_commit_success(response):
+                self._retry_engine.discard_pending(reservation_id)
                 logger.info("Commit successful: id=%s", reservation_id)
+            elif response.is_success:
+                logger.warning(
+                    "Commit returned ambiguous protocol-invalid 2xx; scheduling same-key retry: "
+                    "id=%s, status=%d",
+                    reservation_id,
+                    response.status,
+                )
+                self._retry_engine.schedule(reservation_id, commit_body, event_fallback_body)
             elif response.is_transport_error or response.is_server_error:
                 self._retry_engine.schedule(reservation_id, commit_body, event_fallback_body)
             else:
@@ -1228,10 +1269,13 @@ class AsyncCyclesLifecycle:
                     )
                     self._retry_engine.schedule_event(reservation_id, event_fallback_body)
                 elif error_code == "RESERVATION_FINALIZED":
+                    self._retry_engine.discard_pending(reservation_id)
                     logger.warning("Reservation already finalized: id=%s", reservation_id)
                 elif error_code == "IDEMPOTENCY_MISMATCH":
+                    self._retry_engine.discard_pending(reservation_id)
                     logger.warning("Commit idempotency mismatch (not releasing): id=%s", reservation_id)
                 elif response.is_client_error and _is_recognized_rejection(error_code):
+                    self._retry_engine.discard_pending(reservation_id)
                     await self._handle_release(reservation_id, f"commit_rejected_{error_code}")
                 elif response.is_client_error:
                     # Codeless or forward-compat-unknown 4xx: neither release
@@ -1244,7 +1288,12 @@ class AsyncCyclesLifecycle:
                     )
                     self._retry_engine.schedule(reservation_id, commit_body, event_fallback_body)
                 else:
-                    logger.warning("Unrecognized commit response: id=%s, response=%s", reservation_id, response)
+                    logger.warning(
+                        "Unrecognized commit response; scheduling same-key retry: id=%s, response=%s",
+                        reservation_id,
+                        response,
+                    )
+                    self._retry_engine.schedule(reservation_id, commit_body, event_fallback_body)
         except Exception:
             logger.exception("Failed to commit: id=%s", reservation_id)
             self._retry_engine.schedule(reservation_id, commit_body, event_fallback_body)
@@ -1457,16 +1506,24 @@ class AsyncCyclesLifecycle:
                                     return
                                 delay_ms = nxt
                     except Exception:
-                        logger.warning("Heartbeat extend error: id=%s", reservation_id, exc_info=True)
                         if authoritative:
                             nxt = sched.on_transient_failure(_now_mono_ms())
                             if nxt is None:
                                 logger.warning(
-                                    "Heartbeat stopping: no safe recovery window remains: id=%s",
+                                    "Heartbeat extend transport error; stopping because no safe "
+                                    "recovery window remains: id=%s",
                                     reservation_id,
+                                    exc_info=True,
                                 )
                                 return
                             delay_ms = nxt
+                        logger.warning(
+                            "Heartbeat extend transport error; retrying with the same idempotency "
+                            "key in %.0fms: id=%s",
+                            delay_ms,
+                            reservation_id,
+                            exc_info=True,
+                        )
             except asyncio.CancelledError:
                 return
 

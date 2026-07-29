@@ -46,6 +46,7 @@ from runcycles.retry import (
     CommitRetryEngine,
     _extract_error_code,
     _is_recognized_rejection,
+    _is_schema_valid_commit_success,
 )
 
 logger = logging.getLogger(__name__)
@@ -310,10 +311,22 @@ class StreamReservation:
             self._action.model_dump(exclude_none=True),
             commit_body,
         )
+        self._retry_engine.persist_pending(
+            self._reservation_id, commit_body, event_fallback
+        )
         try:
             response = self._client.commit_reservation(self._reservation_id, commit_body)
-            if response.is_success:
+            if _is_schema_valid_commit_success(response):
+                self._retry_engine.discard_pending(self._reservation_id)
                 logger.info("Stream commit successful: id=%s", self._reservation_id)
+            elif response.is_success:
+                logger.warning(
+                    "Stream commit returned ambiguous protocol-invalid 2xx; "
+                    "scheduling same-key retry: id=%s, status=%d",
+                    self._reservation_id,
+                    response.status,
+                )
+                self._retry_engine.schedule(self._reservation_id, commit_body, event_fallback)
             elif response.is_transport_error or response.is_server_error:
                 logger.warning("Stream commit failed (retryable): id=%s", self._reservation_id)
                 self._retry_engine.schedule(self._reservation_id, commit_body, event_fallback)
@@ -350,10 +363,13 @@ class StreamReservation:
                     )
                     self._retry_engine.schedule_event(self._reservation_id, event_fallback)
                 elif error_code == "RESERVATION_FINALIZED":
+                    self._retry_engine.discard_pending(self._reservation_id)
                     logger.warning("Reservation already finalized: id=%s", self._reservation_id)
                 elif error_code == "IDEMPOTENCY_MISMATCH":
+                    self._retry_engine.discard_pending(self._reservation_id)
                     logger.warning("Commit idempotency mismatch (not releasing): id=%s", self._reservation_id)
                 elif response.is_client_error and _is_recognized_rejection(error_code):
+                    self._retry_engine.discard_pending(self._reservation_id)
                     self._handle_release(f"commit_rejected_{error_code}")
                 elif response.is_client_error:
                     # Codeless or forward-compat-unknown 4xx: neither release
@@ -367,7 +383,11 @@ class StreamReservation:
                     )
                     self._retry_engine.schedule(self._reservation_id, commit_body, event_fallback)
                 else:
-                    logger.warning("Unrecognized commit response: id=%s", self._reservation_id)
+                    logger.warning(
+                        "Unrecognized commit response; scheduling same-key retry: id=%s",
+                        self._reservation_id,
+                    )
+                    self._retry_engine.schedule(self._reservation_id, commit_body, event_fallback)
         except Exception:
             logger.exception("Failed to commit stream: id=%s", self._reservation_id)
             self._retry_engine.schedule(self._reservation_id, commit_body, event_fallback)
@@ -576,16 +596,24 @@ class StreamReservation:
                                 return
                             delay_ms = nxt
                 except Exception:
-                    logger.warning("Stream heartbeat error: id=%s", reservation_id, exc_info=True)
                     if authoritative:
                         nxt = sched.on_transient_failure(_lifecycle._now_mono_ms())
                         if nxt is None:
                             logger.warning(
-                                "Heartbeat stopping: no safe recovery window remains: id=%s",
+                                "Stream heartbeat transport error; stopping because no safe recovery "
+                                "window remains: id=%s",
                                 reservation_id,
+                                exc_info=True,
                             )
                             return
                         delay_ms = nxt
+                    logger.warning(
+                        "Stream heartbeat transport error; retrying with the same idempotency key "
+                        "in %.0fms: id=%s",
+                        delay_ms,
+                        reservation_id,
+                        exc_info=True,
+                    )
 
         t = threading.Thread(
             target=heartbeat_loop,
@@ -764,10 +792,22 @@ class AsyncStreamReservation:
             self._action.model_dump(exclude_none=True),
             commit_body,
         )
+        self._retry_engine.persist_pending(
+            self._reservation_id, commit_body, event_fallback
+        )
         try:
             response = await self._client.commit_reservation(self._reservation_id, commit_body)
-            if response.is_success:
+            if _is_schema_valid_commit_success(response):
+                self._retry_engine.discard_pending(self._reservation_id)
                 logger.info("Async stream commit successful: id=%s", self._reservation_id)
+            elif response.is_success:
+                logger.warning(
+                    "Async stream commit returned ambiguous protocol-invalid 2xx; "
+                    "scheduling same-key retry: id=%s, status=%d",
+                    self._reservation_id,
+                    response.status,
+                )
+                self._retry_engine.schedule(self._reservation_id, commit_body, event_fallback)
             elif response.is_transport_error or response.is_server_error:
                 logger.warning("Async stream commit failed (retryable): id=%s", self._reservation_id)
                 self._retry_engine.schedule(self._reservation_id, commit_body, event_fallback)
@@ -804,10 +844,13 @@ class AsyncStreamReservation:
                     )
                     self._retry_engine.schedule_event(self._reservation_id, event_fallback)
                 elif error_code == "RESERVATION_FINALIZED":
+                    self._retry_engine.discard_pending(self._reservation_id)
                     logger.warning("Reservation already finalized: id=%s", self._reservation_id)
                 elif error_code == "IDEMPOTENCY_MISMATCH":
+                    self._retry_engine.discard_pending(self._reservation_id)
                     logger.warning("Commit idempotency mismatch (not releasing): id=%s", self._reservation_id)
                 elif response.is_client_error and _is_recognized_rejection(error_code):
+                    self._retry_engine.discard_pending(self._reservation_id)
                     await self._handle_release(f"commit_rejected_{error_code}")
                 elif response.is_client_error:
                     # Codeless or forward-compat-unknown 4xx: neither release
@@ -821,7 +864,11 @@ class AsyncStreamReservation:
                     )
                     self._retry_engine.schedule(self._reservation_id, commit_body, event_fallback)
                 else:
-                    logger.warning("Unrecognized commit response: id=%s", self._reservation_id)
+                    logger.warning(
+                        "Unrecognized commit response; scheduling same-key retry: id=%s",
+                        self._reservation_id,
+                    )
+                    self._retry_engine.schedule(self._reservation_id, commit_body, event_fallback)
         except Exception:
             logger.exception("Failed to commit async stream: id=%s", self._reservation_id)
             self._retry_engine.schedule(self._reservation_id, commit_body, event_fallback)
@@ -1034,16 +1081,24 @@ class AsyncStreamReservation:
                                     return
                                 delay_ms = nxt
                     except Exception:
-                        logger.warning("Async stream heartbeat error: id=%s", reservation_id, exc_info=True)
                         if authoritative:
                             nxt = sched.on_transient_failure(_lifecycle._now_mono_ms())
                             if nxt is None:
                                 logger.warning(
-                                    "Heartbeat stopping: no safe recovery window remains: id=%s",
+                                    "Async stream heartbeat transport error; stopping because no safe "
+                                    "recovery window remains: id=%s",
                                     reservation_id,
+                                    exc_info=True,
                                 )
                                 return
                             delay_ms = nxt
+                        logger.warning(
+                            "Async stream heartbeat transport error; retrying with the same "
+                            "idempotency key in %.0fms: id=%s",
+                            delay_ms,
+                            reservation_id,
+                            exc_info=True,
+                        )
             except asyncio.CancelledError:
                 return
 
