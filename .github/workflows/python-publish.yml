@@ -28,7 +28,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: runcycles/cycles-protocol
-          ref: 594631c14710da08ad5e00125d899d642213c296
+          ref: b27d7cb38a8f2bd915dea64e4369a2b91f31008c
           path: .cycles-protocol
           persist-credentials: false
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
@@ -39,7 +39,19 @@ jobs:
         run: >-
           python .cycles-protocol/scripts/run_client_recovery_conformance.py
           --claim durable
+          --report-json recovery-conformance.json
+          --implementation runcycles/cycles-client-python
+          --implementation-commit ${{ github.sha }}
+          --evidence-url https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
           --adapter python scripts/recovery_conformance_adapter.py
+      - name: Upload recovery conformance evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: recovery-conformance-${{ github.sha }}
+          path: recovery-conformance.json
+          if-no-files-found: error
+          retention-days: 90
 
   build:
     name: Build distributions
