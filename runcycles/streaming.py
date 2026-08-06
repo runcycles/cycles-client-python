@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import threading
 import time
@@ -12,7 +13,12 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from runcycles import lifecycle as _lifecycle
-from runcycles._validation import validate_grace_period_ms, validate_subject, validate_ttl_ms
+from runcycles._validation import (
+    validate_grace_period_ms,
+    validate_non_negative,
+    validate_subject,
+    validate_ttl_ms,
+)
 from runcycles.client import AsyncCyclesClient, CyclesClient
 from runcycles.context import CyclesContext, _clear_context, _set_context
 from runcycles.exceptions import CyclesProtocolError
@@ -37,10 +43,14 @@ from runcycles.models import (
     Action,
     Amount,
     Caps,
+    CommitRequest,
     CyclesMetrics,
     Decision,
+    ReleaseRequest,
+    ReservationCreateRequest,
     Subject,
 )
+from runcycles.response import CyclesResponse
 from runcycles.retry import (
     AsyncCommitRetryEngine,
     CommitRetryEngine,
@@ -82,13 +92,17 @@ def _build_streaming_reservation_body(
     ttl_ms: int,
     overage_policy: str,
     grace_period_ms: int | None,
+    idempotency_key: str | None = None,
 ) -> dict[str, Any]:
     validate_subject(subject)
     validate_ttl_ms(ttl_ms)
     validate_grace_period_ms(grace_period_ms)
 
+    if idempotency_key is not None and not 1 <= len(idempotency_key) <= 256:
+        raise ValueError("idempotency_key must be between 1 and 256 characters")
+
     body: dict[str, Any] = {
-        "idempotency_key": str(uuid.uuid4()),
+        "idempotency_key": idempotency_key or str(uuid.uuid4()),
         "subject": subject.model_dump(exclude_none=True),
         "action": action.model_dump(exclude_none=True),
         "estimate": estimate.model_dump(exclude_none=True),
@@ -112,14 +126,32 @@ def _resolve_actual_cost(
     ``actual_source`` marker for audit honesty.
     """
     if usage.actual_cost is not None:
-        return usage.actual_cost, False
+        try:
+            validate_non_negative(usage.actual_cost, "actual_cost")
+            return usage.actual_cost, False
+        except (TypeError, ValueError):
+            logger.warning("actual_cost is invalid, falling back to estimate", exc_info=True)
+            return estimate_amount, True
     if cost_fn is not None:
         try:
-            return cost_fn(usage), False
+            actual = cost_fn(usage)
+            validate_non_negative(actual, "cost_fn result")
+            return actual, False
         except Exception:
-            logger.warning("cost_fn raised, falling back to estimate", exc_info=True)
+            logger.warning("cost_fn raised or returned an invalid amount, falling back to estimate", exc_info=True)
             return estimate_amount, True
     return estimate_amount, True
+
+
+def _derived_stream_key(prefix: str, reservation_key: str | None) -> str | None:
+    """Derive a bounded operation key from a caller-supplied reservation key."""
+    if reservation_key is None:
+        return None
+    candidate = f"{prefix}-{reservation_key}"
+    if len(candidate) <= 256:
+        return candidate
+    digest = hashlib.sha256(reservation_key.encode("utf-8")).hexdigest()
+    return f"{prefix}-sha256-{digest}"
 
 
 def _build_stream_metrics(
@@ -172,6 +204,8 @@ class StreamReservation:
         overage_policy: str = "ALLOW_IF_AVAILABLE",
         cost_fn: Callable[[StreamUsage], int] | None = None,
         metadata: dict[str, Any] | None = None,
+        idempotency_key: str | None = None,
+        raise_on_commit_failure: bool = False,
     ) -> None:
         self._client = client
         self._subject = subject
@@ -182,6 +216,8 @@ class StreamReservation:
         self._overage_policy = overage_policy
         self._cost_fn = cost_fn
         self._metadata = metadata
+        self._idempotency_key = idempotency_key
+        self._raise_on_commit_failure = raise_on_commit_failure
 
         self._usage = StreamUsage()
         self._reservation_id: str | None = None
@@ -192,6 +228,8 @@ class StreamReservation:
         self._decision: Decision = Decision.ALLOW
         self._ctx: CyclesContext | None = None
         self._start_time: float = 0.0
+        self._settlement_error: CyclesProtocolError | None = None
+        self._release_error: CyclesProtocolError | None = None
 
         self._heartbeat_stop = threading.Event()
         self._heartbeat_thread: threading.Thread | None = None
@@ -217,6 +255,16 @@ class StreamReservation:
     def decision(self) -> Decision:
         return self._decision
 
+    @property
+    def settlement_error(self) -> CyclesProtocolError | None:
+        """The last synchronous commit failure, after recovery was queued."""
+        return self._settlement_error
+
+    @property
+    def release_error(self) -> CyclesProtocolError | None:
+        """The last best-effort release failure, if any."""
+        return self._release_error
+
     def __enter__(self) -> StreamReservation:
         body = _build_streaming_reservation_body(
             self._subject,
@@ -225,15 +273,21 @@ class StreamReservation:
             self._ttl_ms,
             self._overage_policy,
             self._grace_period_ms,
+            self._idempotency_key,
         )
 
         response, result, _create_rtt_ms, _create_received_ms = _create_reservation_with_recovery(
             self._client,
-            body,
+            ReservationCreateRequest.model_validate(body),
         )
 
         if result.decision == Decision.DENY:
-            raise _build_protocol_exception("Reservation denied", response)
+            exc = _build_protocol_exception("Reservation denied", response)
+            if exc.reason_code is None:
+                exc.reason_code = result.reason_code
+            if exc.retry_after_ms is None:
+                exc.retry_after_ms = result.retry_after_ms
+            raise exc
 
         if result.reservation_id is None:
             raise CyclesProtocolError(
@@ -302,7 +356,8 @@ class StreamReservation:
         if actual_from_estimate:
             # Estimate recorded as actual — mark the evidence (audit honesty).
             commit_metadata = {**(commit_metadata or {}), "actual_source": "estimate"}
-        commit_body = _build_commit_body(actual, unit, metrics, commit_metadata)
+        commit_key = _derived_stream_key("commit", self._idempotency_key)
+        commit_body = _build_commit_body(actual, unit, metrics, commit_metadata, commit_key)
 
         assert self._reservation_id is not None
         event_fallback = _build_event_fallback_body(
@@ -311,15 +366,18 @@ class StreamReservation:
             self._action.model_dump(exclude_none=True),
             commit_body,
         )
-        self._retry_engine.persist_pending(
-            self._reservation_id, commit_body, event_fallback
-        )
+        self._retry_engine.persist_pending(self._reservation_id, commit_body, event_fallback)
+        failure_response = None
         try:
-            response = self._client.commit_reservation(self._reservation_id, commit_body)
+            response = self._client.commit_reservation(
+                self._reservation_id,
+                CommitRequest.model_validate(commit_body),
+            )
             if _is_schema_valid_commit_success(response):
                 self._retry_engine.discard_pending(self._reservation_id)
                 logger.info("Stream commit successful: id=%s", self._reservation_id)
             elif response.is_success:
+                failure_response = response
                 logger.warning(
                     "Stream commit returned ambiguous protocol-invalid 2xx; "
                     "scheduling same-key retry: id=%s, status=%d",
@@ -328,9 +386,11 @@ class StreamReservation:
                 )
                 self._retry_engine.schedule(self._reservation_id, commit_body, event_fallback)
             elif response.is_transport_error or response.is_server_error:
+                failure_response = response
                 logger.warning("Stream commit failed (retryable): id=%s", self._reservation_id)
                 self._retry_engine.schedule(self._reservation_id, commit_body, event_fallback)
             else:
+                failure_response = response
                 error_code = None
                 error_resp = response.get_error_response()
                 if error_resp and error_resp.error_code:
@@ -370,7 +430,12 @@ class StreamReservation:
                     logger.warning("Commit idempotency mismatch (not releasing): id=%s", self._reservation_id)
                 elif response.is_client_error and _is_recognized_rejection(error_code):
                     self._retry_engine.discard_pending(self._reservation_id)
-                    self._handle_release(f"commit_rejected_{error_code}")
+                    logger.error(
+                        "Stream commit was rejected after spend was recorded locally "
+                        "(error=%s); not releasing known spend: id=%s",
+                        error_code,
+                        self._reservation_id,
+                    )
                 elif response.is_client_error:
                     # Codeless or forward-compat-unknown 4xx: neither release
                     # nor drop — retain the spend record.
@@ -388,20 +453,38 @@ class StreamReservation:
                         self._reservation_id,
                     )
                     self._retry_engine.schedule(self._reservation_id, commit_body, event_fallback)
-        except Exception:
+        except Exception as exc:
             logger.exception("Failed to commit stream: id=%s", self._reservation_id)
             self._retry_engine.schedule(self._reservation_id, commit_body, event_fallback)
+            failure_response = CyclesResponse.transport_error(exc)
+
+        if failure_response is not None:
+            self._settlement_error = _build_protocol_exception(
+                "Stream commit did not settle synchronously; known spend was not released",
+                failure_response,
+            )
+            if self._raise_on_commit_failure:
+                raise self._settlement_error
 
     def _handle_release(self, reason: str) -> None:
         assert self._reservation_id is not None
         try:
-            body = _build_release_body(reason)
-            response = self._client.release_reservation(self._reservation_id, body)
+            release_key = _derived_stream_key("release", self._idempotency_key)
+            body = _build_release_body(reason, release_key)
+            response = self._client.release_reservation(
+                self._reservation_id,
+                ReleaseRequest.model_validate(body),
+            )
             if response.is_success:
                 logger.info("Stream released: id=%s", self._reservation_id)
             else:
+                self._release_error = _build_protocol_exception("Stream release failed", response)
                 logger.warning("Stream release failed: id=%s, status=%d", self._reservation_id, response.status)
-        except Exception:
+        except Exception as exc:
+            self._release_error = _build_protocol_exception(
+                "Stream release failed",
+                CyclesResponse.transport_error(exc),
+            )
             logger.exception("Failed to release stream: id=%s", self._reservation_id)
 
     def _start_heartbeat(self) -> threading.Thread | None:
@@ -608,8 +691,7 @@ class StreamReservation:
                             return
                         delay_ms = nxt
                     logger.warning(
-                        "Stream heartbeat transport error; retrying with the same idempotency key "
-                        "in %.0fms: id=%s",
+                        "Stream heartbeat transport error; retrying with the same idempotency key in %.0fms: id=%s",
                         delay_ms,
                         reservation_id,
                         exc_info=True,
@@ -652,6 +734,8 @@ class AsyncStreamReservation:
         overage_policy: str = "ALLOW_IF_AVAILABLE",
         cost_fn: Callable[[StreamUsage], int] | None = None,
         metadata: dict[str, Any] | None = None,
+        idempotency_key: str | None = None,
+        raise_on_commit_failure: bool = False,
     ) -> None:
         self._client = client
         self._subject = subject
@@ -662,6 +746,8 @@ class AsyncStreamReservation:
         self._overage_policy = overage_policy
         self._cost_fn = cost_fn
         self._metadata = metadata
+        self._idempotency_key = idempotency_key
+        self._raise_on_commit_failure = raise_on_commit_failure
 
         self._usage = StreamUsage()
         self._reservation_id: str | None = None
@@ -672,6 +758,8 @@ class AsyncStreamReservation:
         self._decision: Decision = Decision.ALLOW
         self._ctx: CyclesContext | None = None
         self._start_time: float = 0.0
+        self._settlement_error: CyclesProtocolError | None = None
+        self._release_error: CyclesProtocolError | None = None
 
         self._heartbeat_task: asyncio.Task[None] | None = None
 
@@ -696,6 +784,16 @@ class AsyncStreamReservation:
     def decision(self) -> Decision:
         return self._decision
 
+    @property
+    def settlement_error(self) -> CyclesProtocolError | None:
+        """The last synchronous commit failure, after recovery was queued."""
+        return self._settlement_error
+
+    @property
+    def release_error(self) -> CyclesProtocolError | None:
+        """The last best-effort release failure, if any."""
+        return self._release_error
+
     async def __aenter__(self) -> AsyncStreamReservation:
         body = _build_streaming_reservation_body(
             self._subject,
@@ -704,14 +802,20 @@ class AsyncStreamReservation:
             self._ttl_ms,
             self._overage_policy,
             self._grace_period_ms,
+            self._idempotency_key,
         )
 
         response, result, _create_rtt_ms, _create_received_ms = await _create_reservation_with_recovery_async(
-            self._client, body
+            self._client, ReservationCreateRequest.model_validate(body)
         )
 
         if result.decision == Decision.DENY:
-            raise _build_protocol_exception("Reservation denied", response)
+            exc = _build_protocol_exception("Reservation denied", response)
+            if exc.reason_code is None:
+                exc.reason_code = result.reason_code
+            if exc.retry_after_ms is None:
+                exc.retry_after_ms = result.retry_after_ms
+            raise exc
 
         if result.reservation_id is None:
             raise CyclesProtocolError(
@@ -783,7 +887,8 @@ class AsyncStreamReservation:
         if actual_from_estimate:
             # Estimate recorded as actual — mark the evidence (audit honesty).
             commit_metadata = {**(commit_metadata or {}), "actual_source": "estimate"}
-        commit_body = _build_commit_body(actual, unit, metrics, commit_metadata)
+        commit_key = _derived_stream_key("commit", self._idempotency_key)
+        commit_body = _build_commit_body(actual, unit, metrics, commit_metadata, commit_key)
 
         assert self._reservation_id is not None
         event_fallback = _build_event_fallback_body(
@@ -792,15 +897,18 @@ class AsyncStreamReservation:
             self._action.model_dump(exclude_none=True),
             commit_body,
         )
-        self._retry_engine.persist_pending(
-            self._reservation_id, commit_body, event_fallback
-        )
+        self._retry_engine.persist_pending(self._reservation_id, commit_body, event_fallback)
+        failure_response = None
         try:
-            response = await self._client.commit_reservation(self._reservation_id, commit_body)
+            response = await self._client.commit_reservation(
+                self._reservation_id,
+                CommitRequest.model_validate(commit_body),
+            )
             if _is_schema_valid_commit_success(response):
                 self._retry_engine.discard_pending(self._reservation_id)
                 logger.info("Async stream commit successful: id=%s", self._reservation_id)
             elif response.is_success:
+                failure_response = response
                 logger.warning(
                     "Async stream commit returned ambiguous protocol-invalid 2xx; "
                     "scheduling same-key retry: id=%s, status=%d",
@@ -809,9 +917,11 @@ class AsyncStreamReservation:
                 )
                 self._retry_engine.schedule(self._reservation_id, commit_body, event_fallback)
             elif response.is_transport_error or response.is_server_error:
+                failure_response = response
                 logger.warning("Async stream commit failed (retryable): id=%s", self._reservation_id)
                 self._retry_engine.schedule(self._reservation_id, commit_body, event_fallback)
             else:
+                failure_response = response
                 error_code = None
                 error_resp = response.get_error_response()
                 if error_resp and error_resp.error_code:
@@ -851,7 +961,12 @@ class AsyncStreamReservation:
                     logger.warning("Commit idempotency mismatch (not releasing): id=%s", self._reservation_id)
                 elif response.is_client_error and _is_recognized_rejection(error_code):
                     self._retry_engine.discard_pending(self._reservation_id)
-                    await self._handle_release(f"commit_rejected_{error_code}")
+                    logger.error(
+                        "Async stream commit was rejected after spend was recorded locally "
+                        "(error=%s); not releasing known spend: id=%s",
+                        error_code,
+                        self._reservation_id,
+                    )
                 elif response.is_client_error:
                     # Codeless or forward-compat-unknown 4xx: neither release
                     # nor drop — retain the spend record.
@@ -869,20 +984,38 @@ class AsyncStreamReservation:
                         self._reservation_id,
                     )
                     self._retry_engine.schedule(self._reservation_id, commit_body, event_fallback)
-        except Exception:
+        except Exception as exc:
             logger.exception("Failed to commit async stream: id=%s", self._reservation_id)
             self._retry_engine.schedule(self._reservation_id, commit_body, event_fallback)
+            failure_response = CyclesResponse.transport_error(exc)
+
+        if failure_response is not None:
+            self._settlement_error = _build_protocol_exception(
+                "Async stream commit did not settle synchronously; known spend was not released",
+                failure_response,
+            )
+            if self._raise_on_commit_failure:
+                raise self._settlement_error
 
     async def _handle_release(self, reason: str) -> None:
         assert self._reservation_id is not None
         try:
-            body = _build_release_body(reason)
-            response = await self._client.release_reservation(self._reservation_id, body)
+            release_key = _derived_stream_key("release", self._idempotency_key)
+            body = _build_release_body(reason, release_key)
+            response = await self._client.release_reservation(
+                self._reservation_id,
+                ReleaseRequest.model_validate(body),
+            )
             if response.is_success:
                 logger.info("Async stream released: id=%s", self._reservation_id)
             else:
+                self._release_error = _build_protocol_exception("Async stream release failed", response)
                 logger.warning("Async stream release failed: id=%s, status=%d", self._reservation_id, response.status)
-        except Exception:
+        except Exception as exc:
+            self._release_error = _build_protocol_exception(
+                "Async stream release failed",
+                CyclesResponse.transport_error(exc),
+            )
             logger.exception("Failed to release async stream: id=%s", self._reservation_id)
 
     def _start_heartbeat(self) -> asyncio.Task[None] | None:

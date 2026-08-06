@@ -30,7 +30,7 @@ pip install runcycles
 | [anthropic_integration.py](anthropic_integration.py) | Guard Anthropic messages with per-tool budget tracking | `anthropic` |
 | [streaming_usage.py](streaming_usage.py) | `stream_reservation()` context manager with auto-commit | `openai` |
 | [fastapi_integration.py](fastapi_integration.py) | FastAPI middleware, dependency injection, per-tenant budgets | `fastapi`, `uvicorn` |
-| [langchain_integration.py](langchain_integration.py) | LangChain callback handler for budget-aware agents | `langchain`, `langchain-openai` |
+| [langchain_integration.py](langchain_integration.py) | Concurrent-safe LangChain callback using heartbeat and durable settlement | `langchain`, `langchain-openai` |
 
 ## Running
 

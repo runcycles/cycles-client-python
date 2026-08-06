@@ -40,8 +40,9 @@ _MAX_HONORED_DELAY_S = 3600.0
 def _is_recognized_rejection(code: str | None) -> bool:
     """True when the error code proves a known, non-retryable rejection.
 
-    Only a recognized rejection justifies destroying a durable spend record
-    or releasing a reservation; a codeless, retryable, or unknown-future-code
+    Only a recognized rejection justifies destroying a durable spend record.
+    It never justifies releasing a reservation after the guarded action has
+    already spent the resource. A codeless, retryable, or unknown-future-code
     4xx (a proxy error page, a newer server) is retained instead.
     """
     parsed = ErrorCode.from_string(code)

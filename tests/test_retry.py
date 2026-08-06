@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -268,16 +267,22 @@ class TestAsyncCommitRetryEngine:
         pending = _PendingCommit(reservation_id="rsv_1", commit_body={"idempotency_key": "k1"})
         await engine._retry_loop(pending)  # should not raise
 
-    async def test_schedule_no_event_loop(self, config: CyclesConfig) -> None:
-        """Schedule outside an event loop should log error, not crash."""
+    async def test_schedule_inside_event_loop(self, config: CyclesConfig) -> None:
+        """Schedule creates and completes a retry task inside an event loop."""
         engine = AsyncCommitRetryEngine(config)
         mock_client = AsyncMock()
+        mock_client.commit_reservation.return_value = CyclesResponse.success(
+            200,
+            {
+                "status": "COMMITTED",
+                "charged": {"unit": "USD_MICROCENTS", "amount": 1},
+            },
+        )
         engine.set_client(mock_client)
-        # Can't easily test outside event loop from within async test,
-        # but we can verify schedule works inside one
         engine.schedule("rsv_1", {"idempotency_key": "k1"})
-        # Let the scheduled task actually run
-        await asyncio.sleep(0.1)
+        await engine.flush(timeout=1.0)
+
+        mock_client.commit_reservation.assert_awaited_once()
 
 
 class TestCommitRetryEngineSchedule:

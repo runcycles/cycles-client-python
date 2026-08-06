@@ -1629,7 +1629,7 @@ class TestActualSourceMarker:
         with stream:
             pass  # no actual cost recorded → estimate fallback
         body = client.commit_reservation.call_args.args[1]
-        assert body["metadata"]["actual_source"] == "estimate"
+        assert body.metadata["actual_source"] == "estimate"
 
         client2 = MagicMock()
         client2._config = _config()
@@ -1645,7 +1645,7 @@ class TestActualSourceMarker:
         with stream2:
             stream2.usage.set_actual_cost(700)
         body2 = client2.commit_reservation.call_args.args[1]
-        assert "metadata" not in body2 or "actual_source" not in body2.get("metadata", {})
+        assert body2.metadata is None or "actual_source" not in body2.metadata
 
     @pytest.mark.asyncio
     async def test_async_stream_fallback_carries_marker(self) -> None:
@@ -1663,4 +1663,4 @@ class TestActualSourceMarker:
         async with stream:
             pass
         body = client.commit_reservation.call_args.args[1]
-        assert body["metadata"]["actual_source"] == "estimate"
+        assert body.metadata["actual_source"] == "estimate"

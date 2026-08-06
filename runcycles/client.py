@@ -128,6 +128,8 @@ class CyclesClient:
         overage_policy: str = "ALLOW_IF_AVAILABLE",
         cost_fn: Callable[[StreamUsage], int] | None = None,
         metadata: dict[str, Any] | None = None,
+        idempotency_key: str | None = None,
+        raise_on_commit_failure: bool = False,
     ) -> StreamReservation:
         """Return a context manager that reserves budget on enter and commits/releases on exit."""
         from runcycles.models import Subject as _Subject
@@ -152,6 +154,8 @@ class CyclesClient:
             overage_policy=overage_policy,
             cost_fn=cost_fn,
             metadata=metadata,
+            idempotency_key=idempotency_key,
+            raise_on_commit_failure=raise_on_commit_failure,
         )
 
     def close(self) -> None:
@@ -264,6 +268,8 @@ class AsyncCyclesClient:
         overage_policy: str = "ALLOW_IF_AVAILABLE",
         cost_fn: Callable[[StreamUsage], int] | None = None,
         metadata: dict[str, Any] | None = None,
+        idempotency_key: str | None = None,
+        raise_on_commit_failure: bool = False,
     ) -> AsyncStreamReservation:
         """Return an async context manager that reserves budget on enter and commits/releases on exit."""
         from runcycles.models import Subject as _Subject
@@ -288,6 +294,8 @@ class AsyncCyclesClient:
             overage_policy=overage_policy,
             cost_fn=cost_fn,
             metadata=metadata,
+            idempotency_key=idempotency_key,
+            raise_on_commit_failure=raise_on_commit_failure,
         )
 
     async def aclose(self) -> None:

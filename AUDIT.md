@@ -1,5 +1,16 @@
 # Cycles Protocol v0.1.25 — Client (Python) Audit
 
+**Date:** 2026-08-06 (v0.5.3 — managed streams accept caller-scoped
+idempotency keys and an opt-in post-journal settlement error surface;
+recognized commit rejections never release known spend in sync/async lifecycle
+or streaming paths; decorator post-action failures are separated from guarded
+function failures; and actual-evaluation failure safely commits an
+estimate-marked fallback. The LangChain example now uses the managed heartbeat
+and durable journal with normalized cached-token usage. Final verification:
+630 tests pass, 5 live-server tests skip, coverage is 98.47%, and the shared
+recovery profile passes 12/12 scenarios; Ruff, mypy, and the sdist/wheel build
+are clean. Full evidence is recorded in the
+2026-08-06 section below.),
 **Date:** 2026-07-30 (no runtime change — durable recovery conformance now
 emits the profile 0.3 machine-readable evidence report, uploads it from both
 CI and release workflows even on failure, and links the public SDK matrix from
@@ -17,6 +28,30 @@ tests to the SDK commit, protocol commit, catalog digest, and Actions run.),
 **Server audit:** See `cycles-server/AUDIT.md` (all passing)
 
 ---
+
+## 2026-08-06 — Framework-safe managed settlement (v0.5.3)
+
+Framework integrations can pass a stable `idempotency_key` into sync or async
+`stream_reservation()`. The create request keeps that identity and commit /
+release keys derive from it, while the journal keeps the exact commit body for
+same-key replay and `/v1/events` fallback. `raise_on_commit_failure=True`
+raises only after `persist_pending` and the appropriate recovery scheduling;
+the default remains non-raising and exposes `settlement_error` for adapters
+that want their own policy/logging surface.
+
+Self-review found a separate known-spend violation in both lifecycle classes
+and both stream managers: a recognized non-retryable commit 4xx discarded the
+journal and then released the reservation even though the guarded action had
+already completed. All four paths now discard only the unrecoverable journal
+record, log the rejection, and never return the reservation's budget. Handler
+exceptions before an actual is recorded still take the normal release path.
+
+The LangChain callback example now holds managed reservation objects per
+LangChain `run_id`, uses a lock for concurrent callbacks, reads provider-neutral
+`AIMessage.usage_metadata`, prices cached GPT-4o input separately, and settles
+through the heartbeat/journal/event-recovery path. It also sets LangChain's
+`raise_error` handler flag so a reserve denial cannot be logged and ignored
+while the model call proceeds.
 
 ## 2026-07-28 — Server-authoritative heartbeat via remaining_ttl_ms (v0.5.1, same PR)
 

@@ -47,7 +47,7 @@ TESTS = {
         "tests/test_journal.py::TestCommitJournal::test_colliding_legacy_ids_are_distinct_and_migrate_safely",
     ),
     "CR-BOUNDARY-001": (
-        "tests/test_lifecycle.py::TestSyncLifecycleExecution::test_missing_actual_surfaces_without_settlement",
+        "tests/test_lifecycle.py::TestSyncLifecycleExecution::test_missing_actual_fails_before_reservation_or_action",
     ),
 }
 

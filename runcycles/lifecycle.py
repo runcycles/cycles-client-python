@@ -14,6 +14,8 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
 
+from pydantic import BaseModel
+
 from runcycles._validation import (
     validate_extend_by_ms,
     validate_grace_period_ms,
@@ -80,7 +82,7 @@ def _evaluate_amount(expr: int | Callable[..., int], args: tuple[Any, ...], kwar
     """Evaluate an estimate/actual expression, which may be a constant or a callable."""
     if callable(expr):
         return expr(*args, **kwargs)
-    return int(expr)
+    return expr
 
 
 def _resolve_value(val: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> Any:
@@ -100,7 +102,7 @@ def _evaluate_actual(
     if expr is not None:
         if callable(expr):
             return expr(result)
-        return int(expr)
+        return expr
     if use_estimate_fallback:
         return estimate
     raise ValueError("actual expression is required when use_estimate_if_actual_not_provided is False")
@@ -164,9 +166,10 @@ def _build_commit_body(
     unit: str,
     metrics: CyclesMetrics | None,
     metadata: dict[str, Any] | None,
+    idempotency_key: str | None = None,
 ) -> dict[str, Any]:
     body: dict[str, Any] = {
-        "idempotency_key": str(uuid.uuid4()),
+        "idempotency_key": idempotency_key or str(uuid.uuid4()),
         "actual": {"unit": unit, "amount": actual},
     }
     if metrics and not metrics.is_empty():
@@ -206,8 +209,8 @@ def _build_event_fallback_body(
     return body
 
 
-def _build_release_body(reason: str) -> dict[str, Any]:
-    return {"idempotency_key": str(uuid.uuid4()), "reason": reason}
+def _build_release_body(reason: str, idempotency_key: str | None = None) -> dict[str, Any]:
+    return {"idempotency_key": idempotency_key or str(uuid.uuid4()), "reason": reason}
 
 
 def _now_mono_ms() -> float:
@@ -389,7 +392,7 @@ def _ambiguous_create_error(response: CyclesResponse) -> CyclesProtocolError:
 
 def _create_reservation_with_recovery(
     client: CyclesClient,
-    body: dict[str, Any],
+    body: BaseModel | dict[str, Any],
 ) -> tuple[CyclesResponse, ReservationCreateResponse, float, float]:
     """Create with at most one immediate same-key ambiguity recovery."""
     timeout_budget_ms = _timeout_budget_ms(client._config)
@@ -422,7 +425,7 @@ def _create_reservation_with_recovery(
 
 async def _create_reservation_with_recovery_async(
     client: AsyncCyclesClient,
-    body: dict[str, Any],
+    body: BaseModel | dict[str, Any],
 ) -> tuple[CyclesResponse, ReservationCreateResponse, float, float]:
     """Async create with at most one immediate same-key ambiguity recovery."""
     timeout_budget_ms = _timeout_budget_ms(client._config)
@@ -641,6 +644,14 @@ class CyclesLifecycle:
         estimate = _evaluate_amount(cfg.estimate, args, kwargs)
         logger.debug("Estimated usage: estimate=%d", estimate)
 
+        # Configuration errors must fail before a reservation exists. Otherwise
+        # completed work could be followed by a missing-actual error and enter a
+        # release path that returns budget for known spend.
+        if not cfg.dry_run and cfg.actual is None and not cfg.use_estimate_if_actual_not_provided:
+            raise ValueError("actual expression is required when use_estimate_if_actual_not_provided is False")
+        if not cfg.dry_run and cfg.actual is not None and not callable(cfg.actual):
+            validate_non_negative(cfg.actual, "actual")
+
         # Create reservation
         create_body = _build_reservation_body(cfg, estimate, self._default_subject, args, kwargs)
         logger.debug("Creating reservation: body=%s", create_body)
@@ -715,13 +726,32 @@ class CyclesLifecycle:
             _create_received_ms,
         )
 
+        guarded_action_completed = False
         try:
             result = fn(*args, **kwargs)
+            guarded_action_completed = True
             method_elapsed = int((time.monotonic() - res_t2) * 1000)
             logger.debug("Guarded action finished: id=%s, elapsed=%dms", reservation_id, method_elapsed)
 
             # Resolve actual
-            actual_amount = _evaluate_actual(cfg.actual, result, estimate, cfg.use_estimate_if_actual_not_provided)
+            actual_from_estimate = cfg.actual is None
+            try:
+                actual_amount = _evaluate_actual(
+                    cfg.actual,
+                    result,
+                    estimate,
+                    cfg.use_estimate_if_actual_not_provided,
+                )
+                validate_non_negative(actual_amount, "actual")
+            except Exception:
+                logger.error(
+                    "Actual evaluation failed after guarded work completed; "
+                    "committing estimate instead: id=%s",
+                    reservation_id,
+                    exc_info=True,
+                )
+                actual_amount = estimate
+                actual_from_estimate = True
 
             # Build commit
             metrics = ctx.metrics
@@ -731,7 +761,7 @@ class CyclesLifecycle:
                 metrics.latency_ms = method_elapsed
 
             commit_metadata = ctx.commit_metadata
-            if cfg.actual is None:
+            if actual_from_estimate:
                 # The estimate is being recorded as the actual (documented
                 # fallback). Mark the evidence so auditors can distinguish
                 # measured spend from assumed spend.
@@ -748,9 +778,16 @@ class CyclesLifecycle:
 
             return result
 
-        except Exception:
-            logger.error("Guarded action failed, releasing: id=%s", reservation_id, exc_info=True)
-            self._handle_release(reservation_id, "guarded_method_failed")
+        except BaseException:
+            if not guarded_action_completed:
+                logger.error("Guarded action failed, releasing: id=%s", reservation_id, exc_info=True)
+                self._handle_release(reservation_id, "guarded_method_failed")
+            else:
+                logger.error(
+                    "Post-action settlement failed; not releasing known spend: id=%s",
+                    reservation_id,
+                    exc_info=True,
+                )
             raise
         finally:
             heartbeat_stop.set()
@@ -764,9 +801,7 @@ class CyclesLifecycle:
         commit_body: dict[str, Any],
         event_fallback_body: dict[str, Any],
     ) -> None:
-        self._retry_engine.persist_pending(
-            reservation_id, commit_body, event_fallback_body
-        )
+        self._retry_engine.persist_pending(reservation_id, commit_body, event_fallback_body)
         try:
             logger.debug("Committing: id=%s", reservation_id)
             response = self._client.commit_reservation(reservation_id, commit_body)
@@ -775,8 +810,7 @@ class CyclesLifecycle:
                 logger.info("Commit successful: id=%s", reservation_id)
             elif response.is_success:
                 logger.warning(
-                    "Commit returned ambiguous protocol-invalid 2xx; scheduling same-key retry: "
-                    "id=%s, status=%d",
+                    "Commit returned ambiguous protocol-invalid 2xx; scheduling same-key retry: id=%s, status=%d",
                     reservation_id,
                     response.status,
                 )
@@ -824,7 +858,12 @@ class CyclesLifecycle:
                     logger.warning("Commit idempotency mismatch (not releasing): id=%s", reservation_id)
                 elif response.is_client_error and _is_recognized_rejection(error_code):
                     self._retry_engine.discard_pending(reservation_id)
-                    self._handle_release(reservation_id, f"commit_rejected_{error_code}")
+                    logger.error(
+                        "Commit was rejected after spend was recorded locally "
+                        "(error=%s); not releasing known spend: id=%s",
+                        error_code,
+                        reservation_id,
+                    )
                 elif response.is_client_error:
                     # Codeless or forward-compat-unknown 4xx: neither release
                     # nor drop — retain the spend record.
@@ -1080,8 +1119,7 @@ class CyclesLifecycle:
                             return
                         delay_ms = nxt
                     logger.warning(
-                        "Heartbeat extend transport error; retrying with the same idempotency key "
-                        "in %.0fms: id=%s",
+                        "Heartbeat extend transport error; retrying with the same idempotency key in %.0fms: id=%s",
                         delay_ms,
                         reservation_id,
                         exc_info=True,
@@ -1115,6 +1153,11 @@ class AsyncCyclesLifecycle:
     ) -> Any:
         estimate = _evaluate_amount(cfg.estimate, args, kwargs)
         logger.debug("Estimated usage: estimate=%d", estimate)
+
+        if not cfg.dry_run and cfg.actual is None and not cfg.use_estimate_if_actual_not_provided:
+            raise ValueError("actual expression is required when use_estimate_if_actual_not_provided is False")
+        if not cfg.dry_run and cfg.actual is not None and not callable(cfg.actual):
+            validate_non_negative(cfg.actual, "actual")
 
         create_body = _build_reservation_body(cfg, estimate, self._default_subject, args, kwargs)
         res_response, res_result, _create_rtt_ms, _create_received_ms = await _create_reservation_with_recovery_async(
@@ -1170,11 +1213,30 @@ class AsyncCyclesLifecycle:
             _create_received_ms,
         )
 
+        guarded_action_completed = False
         try:
             result = await fn(*args, **kwargs)
+            guarded_action_completed = True
             method_elapsed = int((time.monotonic() - res_t2) * 1000)
 
-            actual_amount = _evaluate_actual(cfg.actual, result, estimate, cfg.use_estimate_if_actual_not_provided)
+            actual_from_estimate = cfg.actual is None
+            try:
+                actual_amount = _evaluate_actual(
+                    cfg.actual,
+                    result,
+                    estimate,
+                    cfg.use_estimate_if_actual_not_provided,
+                )
+                validate_non_negative(actual_amount, "actual")
+            except Exception:
+                logger.error(
+                    "Actual evaluation failed after guarded work completed; "
+                    "committing estimate instead: id=%s",
+                    reservation_id,
+                    exc_info=True,
+                )
+                actual_amount = estimate
+                actual_from_estimate = True
 
             metrics = ctx.metrics
             if metrics is None:
@@ -1183,7 +1245,7 @@ class AsyncCyclesLifecycle:
                 metrics.latency_ms = method_elapsed
 
             commit_metadata = ctx.commit_metadata
-            if cfg.actual is None:
+            if actual_from_estimate:
                 # See the sync lifecycle: estimate recorded as actual is
                 # marked so the evidence stays honest.
                 logger.debug("No actual expression; committing estimate as actual: id=%s", reservation_id)
@@ -1199,9 +1261,16 @@ class AsyncCyclesLifecycle:
 
             return result
 
-        except Exception:
-            logger.error("Guarded action failed, releasing: id=%s", reservation_id, exc_info=True)
-            await self._handle_release(reservation_id, "guarded_method_failed")
+        except BaseException:
+            if not guarded_action_completed:
+                logger.error("Guarded action failed, releasing: id=%s", reservation_id, exc_info=True)
+                await self._handle_release(reservation_id, "guarded_method_failed")
+            else:
+                logger.error(
+                    "Post-action settlement failed; not releasing known spend: id=%s",
+                    reservation_id,
+                    exc_info=True,
+                )
             raise
         finally:
             if heartbeat_task:
@@ -1218,9 +1287,7 @@ class AsyncCyclesLifecycle:
         commit_body: dict[str, Any],
         event_fallback_body: dict[str, Any],
     ) -> None:
-        self._retry_engine.persist_pending(
-            reservation_id, commit_body, event_fallback_body
-        )
+        self._retry_engine.persist_pending(reservation_id, commit_body, event_fallback_body)
         try:
             response = await self._client.commit_reservation(reservation_id, commit_body)
             if _is_schema_valid_commit_success(response):
@@ -1228,8 +1295,7 @@ class AsyncCyclesLifecycle:
                 logger.info("Commit successful: id=%s", reservation_id)
             elif response.is_success:
                 logger.warning(
-                    "Commit returned ambiguous protocol-invalid 2xx; scheduling same-key retry: "
-                    "id=%s, status=%d",
+                    "Commit returned ambiguous protocol-invalid 2xx; scheduling same-key retry: id=%s, status=%d",
                     reservation_id,
                     response.status,
                 )
@@ -1276,7 +1342,12 @@ class AsyncCyclesLifecycle:
                     logger.warning("Commit idempotency mismatch (not releasing): id=%s", reservation_id)
                 elif response.is_client_error and _is_recognized_rejection(error_code):
                     self._retry_engine.discard_pending(reservation_id)
-                    await self._handle_release(reservation_id, f"commit_rejected_{error_code}")
+                    logger.error(
+                        "Commit was rejected after spend was recorded locally "
+                        "(error=%s); not releasing known spend: id=%s",
+                        error_code,
+                        reservation_id,
+                    )
                 elif response.is_client_error:
                     # Codeless or forward-compat-unknown 4xx: neither release
                     # nor drop — retain the spend record.
@@ -1518,8 +1589,7 @@ class AsyncCyclesLifecycle:
                                 return
                             delay_ms = nxt
                         logger.warning(
-                            "Heartbeat extend transport error; retrying with the same idempotency "
-                            "key in %.0fms: id=%s",
+                            "Heartbeat extend transport error; retrying with the same idempotency key in %.0fms: id=%s",
                             delay_ms,
                             reservation_id,
                             exc_info=True,
