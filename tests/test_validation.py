@@ -55,6 +55,11 @@ class TestValidateNonNegative:
         with pytest.raises(ValueError, match="estimate"):
             validate_non_negative(-1, "estimate")
 
+    @pytest.mark.parametrize("value", [True, 1.5, "1", 9_223_372_036_854_775_808])
+    def test_non_int64_rejected(self, value: object) -> None:
+        with pytest.raises(ValueError, match="int64"):
+            validate_non_negative(value, "amount")  # type: ignore[arg-type]
+
 
 class TestValidateTtlMs:
     def test_valid_range(self) -> None:

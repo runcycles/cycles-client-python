@@ -17,6 +17,7 @@ from runcycles.streaming import (
     StreamReservation,
     StreamUsage,
     _build_streaming_reservation_body,
+    _derived_stream_key,
     _resolve_actual_cost,
 )
 
@@ -176,6 +177,31 @@ class TestBuildStreamingReservationBody:
         )
         assert body["grace_period_ms"] == 5000
 
+    def test_with_caller_idempotency_key(self) -> None:
+        body = _build_streaming_reservation_body(
+            _default_subject(),
+            _default_action(),
+            _default_estimate(),
+            ttl_ms=120_000,
+            overage_policy="ALLOW_IF_AVAILABLE",
+            grace_period_ms=None,
+            idempotency_key="langchain-run-123",
+        )
+        assert body["idempotency_key"] == "langchain-run-123"
+
+    @pytest.mark.parametrize("key", ["", "x" * 257])
+    def test_invalid_caller_idempotency_key_raises(self, key: str) -> None:
+        with pytest.raises(ValueError, match="idempotency_key"):
+            _build_streaming_reservation_body(
+                _default_subject(),
+                _default_action(),
+                _default_estimate(),
+                ttl_ms=120_000,
+                overage_policy="ALLOW_IF_AVAILABLE",
+                grace_period_ms=None,
+                idempotency_key=key,
+            )
+
     def test_ttl_below_minimum_raises(self) -> None:
         with pytest.raises(ValueError, match="ttl_ms"):
             _build_streaming_reservation_body(
@@ -247,9 +273,32 @@ class TestResolveActualCost:
 
         assert _resolve_actual_cost(u, bad_fn, 1000) == (1000, True)
 
+    @pytest.mark.parametrize("actual", [-1, 1.5, True])
+    def test_invalid_explicit_actual_falls_back_to_estimate(self, actual: object) -> None:
+        u = StreamUsage(actual_cost=actual)  # type: ignore[arg-type]
+        assert _resolve_actual_cost(u, None, 1000) == (1000, True)
+
+    @pytest.mark.parametrize("actual", [-1, 1.5, True])
+    def test_invalid_cost_fn_result_falls_back_to_estimate(self, actual: object) -> None:
+        u = StreamUsage()
+        assert _resolve_actual_cost(u, lambda _: actual, 1000) == (1000, True)  # type: ignore[arg-type,return-value]
+
     def test_fallback_to_estimate(self) -> None:
         u = StreamUsage()
         assert _resolve_actual_cost(u, None, 500) == (500, True)
+
+
+class TestDerivedStreamKey:
+    def test_short_key_keeps_readable_shape(self) -> None:
+        assert _derived_stream_key("commit", "run-123") == "commit-run-123"
+
+    def test_max_length_reservation_key_is_hashed_for_derived_operations(self) -> None:
+        key = "x" * 256
+        commit_key = _derived_stream_key("commit", key)
+        release_key = _derived_stream_key("release", key)
+        assert commit_key is not None and len(commit_key) <= 256
+        assert release_key is not None and len(release_key) <= 256
+        assert commit_key == _derived_stream_key("commit", key)
 
 
 # ---------------------------------------------------------------------------
@@ -383,7 +432,7 @@ class TestStreamReservation:
         # Check the commit body had actual = 100*10 + 50*20 = 2000
         commit_call = mock.commit_reservation.call_args
         commit_body = commit_call[0][1]
-        assert commit_body["actual"]["amount"] == 2000
+        assert commit_body.actual.amount == 2000
 
     def test_actual_cost_overrides_cost_fn(self) -> None:
         mock = _make_mock_client()
@@ -403,7 +452,7 @@ class TestStreamReservation:
             reservation.usage.set_actual_cost(42)
 
         commit_body = mock.commit_reservation.call_args[0][1]
-        assert commit_body["actual"]["amount"] == 42
+        assert commit_body.actual.amount == 42
 
     def test_fallback_to_estimate_when_no_cost_fn(self) -> None:
         mock = _make_mock_client()
@@ -422,7 +471,7 @@ class TestStreamReservation:
             pass
 
         commit_body = mock.commit_reservation.call_args[0][1]
-        assert commit_body["actual"]["amount"] == 1000  # estimate amount
+        assert commit_body.actual.amount == 1000  # estimate amount
 
     def test_caps_propagated(self) -> None:
         mock = _make_mock_client()
@@ -562,7 +611,7 @@ class TestStreamReservation:
 
         mock.release_reservation.assert_not_called()
 
-    def test_commit_client_error_triggers_release(self) -> None:
+    def test_commit_client_error_does_not_release_known_spend(self) -> None:
         mock = _make_mock_client()
         mock.create_reservation.return_value = _allow_response()
         mock.commit_reservation.return_value = CyclesResponse.http_error(
@@ -570,7 +619,6 @@ class TestStreamReservation:
             "Bad request",
             body={"error": "INVALID_REQUEST", "message": "Bad", "request_id": "r1"},
         )
-        mock.release_reservation.return_value = _release_success()
 
         sr = StreamReservation(
             mock,
@@ -583,7 +631,36 @@ class TestStreamReservation:
         with sr:
             pass
 
-        mock.release_reservation.assert_called_once()
+        mock.release_reservation.assert_not_called()
+
+    def test_raise_on_commit_failure_surfaces_after_journaling(self) -> None:
+        mock = _make_mock_client()
+        mock.create_reservation.return_value = _allow_response()
+        mock.commit_reservation.return_value = CyclesResponse.http_error(
+            503,
+            "Unavailable",
+            body={"error": "INTERNAL_ERROR", "message": "Try again", "request_id": "r1"},
+        )
+
+        sr = StreamReservation(
+            mock,
+            subject=_default_subject(),
+            action=_default_action(),
+            estimate=_default_estimate(),
+            ttl_ms=1000,
+            raise_on_commit_failure=True,
+        )
+        sr._retry_engine.persist_pending = MagicMock()
+        sr._retry_engine.schedule = MagicMock()
+
+        with pytest.raises(CyclesProtocolError) as exc_info:
+            with sr:
+                pass
+
+        assert exc_info.value.status == 503
+        sr._retry_engine.persist_pending.assert_called_once()
+        sr._retry_engine.schedule.assert_called_once()
+        mock.release_reservation.assert_not_called()
 
     def test_commit_exception_schedules_retry(self) -> None:
         mock = _make_mock_client()
@@ -621,7 +698,7 @@ class TestStreamReservation:
 
         commit_body = mock.commit_reservation.call_args[0][1]
         # actual_source marker added because no actual cost was recorded
-        assert commit_body["metadata"] == {"source": "test", "actual_source": "estimate"}
+        assert commit_body.metadata == {"source": "test", "actual_source": "estimate"}
 
     def test_metrics_include_tokens(self) -> None:
         mock = _make_mock_client()
@@ -642,9 +719,9 @@ class TestStreamReservation:
             reservation.usage.model_version = "gpt-4o-2024"
 
         commit_body = mock.commit_reservation.call_args[0][1]
-        assert commit_body["metrics"]["tokens_input"] == 100
-        assert commit_body["metrics"]["tokens_output"] == 50
-        assert commit_body["metrics"]["model_version"] == "gpt-4o-2024"
+        assert commit_body.metrics.tokens_input == 100
+        assert commit_body.metrics.tokens_output == 50
+        assert commit_body.metrics.model_version == "gpt-4o-2024"
 
     def test_heartbeat_starts_and_stops(self) -> None:
         mock = _make_mock_client()
@@ -688,7 +765,9 @@ class TestStreamReservation:
         mock.create_reservation.return_value = _allow_response()
         mock.commit_reservation.return_value = _commit_success()
         mock.extend_reservation.return_value = CyclesResponse.http_error(
-            500, "Server error", body={"error": "INTERNAL"},
+            500,
+            "Server error",
+            body={"error": "INTERNAL"},
         )
 
         sr = StreamReservation(
@@ -810,7 +889,7 @@ class TestAsyncStreamReservation:
 
         commit_body = mock.commit_reservation.call_args[0][1]
         # 300 * 5 = 1500, distinct from estimate (1000)
-        assert commit_body["actual"]["amount"] == 1500
+        assert commit_body.actual.amount == 1500
 
     @pytest.mark.asyncio
     async def test_context_set_and_cleared(self) -> None:
@@ -871,7 +950,7 @@ class TestAsyncStreamReservation:
         mock.commit_reservation.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_commit_client_error_triggers_release(self) -> None:
+    async def test_commit_client_error_does_not_release_known_spend(self) -> None:
         mock = _make_async_mock_client()
         mock.create_reservation.return_value = _allow_response()
         mock.commit_reservation.return_value = CyclesResponse.http_error(
@@ -879,7 +958,6 @@ class TestAsyncStreamReservation:
             "Bad request",
             body={"error": "INVALID_REQUEST", "message": "Bad", "request_id": "r1"},
         )
-        mock.release_reservation.return_value = _release_success()
 
         asr = AsyncStreamReservation(
             mock,
@@ -892,7 +970,37 @@ class TestAsyncStreamReservation:
         async with asr:
             pass
 
-        mock.release_reservation.assert_called_once()
+        mock.release_reservation.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_raise_on_commit_failure_surfaces_after_journaling(self) -> None:
+        mock = _make_async_mock_client()
+        mock.create_reservation.return_value = _allow_response()
+        mock.commit_reservation.return_value = CyclesResponse.http_error(
+            503,
+            "Unavailable",
+            body={"error": "INTERNAL_ERROR", "message": "Try again", "request_id": "r1"},
+        )
+
+        asr = AsyncStreamReservation(
+            mock,
+            subject=_default_subject(),
+            action=_default_action(),
+            estimate=_default_estimate(),
+            ttl_ms=1000,
+            raise_on_commit_failure=True,
+        )
+        asr._retry_engine.persist_pending = MagicMock()
+        asr._retry_engine.schedule = MagicMock()
+
+        with pytest.raises(CyclesProtocolError) as exc_info:
+            async with asr:
+                pass
+
+        assert exc_info.value.status == 503
+        asr._retry_engine.persist_pending.assert_called_once()
+        asr._retry_engine.schedule.assert_called_once()
+        mock.release_reservation.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_missing_reservation_id_raises(self) -> None:
@@ -956,6 +1064,20 @@ class TestClientStreamReservation:
             )
             assert isinstance(sr, StreamReservation)
 
+    def test_sync_client_forwards_recovery_options(self) -> None:
+        config = _make_config()
+        mock_http = MagicMock()
+        with patch("runcycles.client.httpx.Client", return_value=mock_http):
+            client = CyclesClient(config)
+            sr = client.stream_reservation(
+                action=_default_action(),
+                estimate=_default_estimate(),
+                idempotency_key="run-123",
+                raise_on_commit_failure=True,
+            )
+            assert sr._idempotency_key == "run-123"
+            assert sr._raise_on_commit_failure is True
+
     def test_sync_client_uses_config_subject(self) -> None:
         config = CyclesConfig(
             base_url="http://localhost:7878",
@@ -996,6 +1118,7 @@ class TestClientStreamReservation:
                 estimate=_default_estimate(),
             )
             assert isinstance(asr, AsyncStreamReservation)
+            assert asr._raise_on_commit_failure is False
 
 
 # ---------------------------------------------------------------------------
@@ -1111,9 +1234,9 @@ class TestStreamReservationEdgeCases:
             ctx.metrics = CyclesMetrics(tokens_input=999, tokens_output=888, model_version="custom")
 
         commit_body = mock.commit_reservation.call_args[0][1]
-        assert commit_body["metrics"]["tokens_input"] == 999
-        assert commit_body["metrics"]["tokens_output"] == 888
-        assert commit_body["metrics"]["model_version"] == "custom"
+        assert commit_body.metrics.tokens_input == 999
+        assert commit_body.metrics.tokens_output == 888
+        assert commit_body.metrics.model_version == "custom"
 
 
 class TestAsyncStreamReservationEdgeCases:
@@ -1312,7 +1435,7 @@ class TestAsyncStreamReservationEdgeCases:
 
         commit_body = mock.commit_reservation.call_args[0][1]
         # actual_source marker added because no actual cost was recorded
-        assert commit_body["metadata"] == {"key": "val", "actual_source": "estimate"}
+        assert commit_body.metadata == {"key": "val", "actual_source": "estimate"}
 
     @pytest.mark.asyncio
     async def test_caps_propagated(self) -> None:
@@ -1369,7 +1492,9 @@ class TestAsyncStreamReservationEdgeCases:
         mock.create_reservation.return_value = _allow_response()
         mock.commit_reservation.return_value = _commit_success()
         mock.extend_reservation.return_value = CyclesResponse.http_error(
-            500, "Server error", body={"error": "INTERNAL"},
+            500,
+            "Server error",
+            body={"error": "INTERNAL"},
         )
 
         asr = AsyncStreamReservation(

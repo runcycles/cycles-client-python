@@ -21,9 +21,9 @@ def validate_reservation_id(reservation_id: str | None) -> None:
 
 
 def validate_non_negative(value: int, name: str) -> None:
-    """Validate that a value is non-negative (>= 0), per spec Amount minimum: 0."""
-    if value < 0:
-        raise ValueError(f"{name} must be non-negative, got {value}")
+    """Validate a protocol Amount integer in its non-negative int64 range."""
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0 or value > 9_223_372_036_854_775_807:
+        raise ValueError(f"{name} must be a non-negative int64, got {value!r}")
 
 
 def validate_ttl_ms(ttl_ms: int) -> None:

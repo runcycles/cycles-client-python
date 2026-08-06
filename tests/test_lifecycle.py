@@ -546,20 +546,68 @@ class TestSyncLifecycleExecution:
         assert result.is_allowed()
         mock_client.commit_reservation.assert_not_called()
 
-    def test_missing_actual_surfaces_without_settlement(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_missing_actual_fails_before_reservation_or_action(self, monkeypatch: pytest.MonkeyPatch) -> None:
         lifecycle, mock_client = self._make_lifecycle()
-        mock_client.create_reservation.return_value = _allow_response()
-        mock_client.release_reservation.return_value = _release_success()
         schedule_event = MagicMock()
         monkeypatch.setattr(lifecycle._retry_engine, "schedule_event", schedule_event)
+        action = MagicMock(return_value="result")
 
         cfg = _make_cfg(use_estimate_if_actual_not_provided=False)
         with pytest.raises(ValueError, match="actual expression is required"):
-            lifecycle.execute(lambda: "result", (), {}, cfg)
+            lifecycle.execute(action, (), {}, cfg)
 
+        action.assert_not_called()
+        mock_client.create_reservation.assert_not_called()
         mock_client.commit_reservation.assert_not_called()
         schedule_event.assert_not_called()
-        mock_client.release_reservation.assert_called_once()
+        mock_client.release_reservation.assert_not_called()
+
+    def test_actual_callback_failure_commits_estimate_without_release(self) -> None:
+        lifecycle, mock_client = self._make_lifecycle()
+        mock_client.create_reservation.return_value = _allow_response()
+        mock_client.commit_reservation.return_value = _commit_success()
+
+        def failing_actual(_result: object) -> int:
+            raise ValueError("usage parser failed")
+
+        result = lifecycle.execute(
+            lambda: "spent",
+            (),
+            {},
+            _make_cfg(actual=failing_actual),
+        )
+
+        assert result == "spent"
+        commit_body = mock_client.commit_reservation.call_args.args[1]
+        assert commit_body["actual"] == {"unit": "USD_MICROCENTS", "amount": 1000}
+        assert commit_body["metadata"] == {"actual_source": "estimate"}
+        mock_client.release_reservation.assert_not_called()
+
+    def test_invalid_static_actual_fails_before_reservation_or_action(self) -> None:
+        lifecycle, mock_client = self._make_lifecycle()
+        action = MagicMock(return_value="result")
+
+        with pytest.raises(ValueError, match="int64"):
+            lifecycle.execute(action, (), {}, _make_cfg(actual=-1))
+
+        action.assert_not_called()
+        mock_client.create_reservation.assert_not_called()
+        mock_client.release_reservation.assert_not_called()
+
+    def test_post_action_journal_failure_never_releases_known_spend(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        lifecycle, mock_client = self._make_lifecycle()
+        mock_client.create_reservation.return_value = _allow_response()
+        persist_pending = MagicMock(side_effect=OSError("journal unavailable"))
+        monkeypatch.setattr(lifecycle._retry_engine, "persist_pending", persist_pending)
+
+        with pytest.raises(OSError, match="journal unavailable"):
+            lifecycle.execute(lambda: "spent", (), {}, _make_cfg())
+
+        persist_pending.assert_called_once()
+        mock_client.commit_reservation.assert_not_called()
+        mock_client.release_reservation.assert_not_called()
 
     def test_deny_raises(self) -> None:
         lifecycle, mock_client = self._make_lifecycle()
@@ -628,7 +676,7 @@ class TestSyncLifecycleExecution:
 
         mock_client.release_reservation.assert_not_called()
 
-    def test_commit_other_client_error_triggers_release(self) -> None:
+    def test_commit_other_client_error_does_not_release_known_spend(self) -> None:
         lifecycle, mock_client = self._make_lifecycle()
         mock_client.create_reservation.return_value = _allow_response()
         mock_client.commit_reservation.return_value = CyclesResponse.http_error(
@@ -636,12 +684,10 @@ class TestSyncLifecycleExecution:
             "Bad request",
             body={"error": "UNIT_MISMATCH", "message": "Unit mismatch", "request_id": "r1"},
         )
-        mock_client.release_reservation.return_value = _release_success()
-
         cfg = _make_cfg()
         lifecycle.execute(lambda: "result", (), {}, cfg)
 
-        mock_client.release_reservation.assert_called_once()
+        mock_client.release_reservation.assert_not_called()
 
     def test_commit_transport_error_schedules_retry(self) -> None:
         lifecycle, mock_client = self._make_lifecycle()
@@ -842,6 +888,78 @@ class TestAsyncLifecycleExecution:
         assert result == "async result"
         mock_client.commit_reservation.assert_awaited_once()
 
+    async def test_missing_actual_fails_before_reservation_or_action(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        lifecycle, mock_client = self._make_lifecycle()
+        schedule_event = MagicMock()
+        monkeypatch.setattr(lifecycle._retry_engine, "schedule_event", schedule_event)
+        action = AsyncMock(return_value="result")
+
+        with pytest.raises(ValueError, match="actual expression is required"):
+            await lifecycle.execute(
+                action,
+                (),
+                {},
+                _make_cfg(use_estimate_if_actual_not_provided=False),
+            )
+
+        action.assert_not_awaited()
+        mock_client.create_reservation.assert_not_called()
+        mock_client.commit_reservation.assert_not_called()
+        schedule_event.assert_not_called()
+        mock_client.release_reservation.assert_not_called()
+
+    async def test_actual_callback_failure_commits_estimate_without_release(self) -> None:
+        lifecycle, mock_client = self._make_lifecycle()
+        mock_client.create_reservation = AsyncMock(return_value=_allow_response())
+        mock_client.commit_reservation = AsyncMock(return_value=_commit_success())
+
+        def failing_actual(_result: object) -> int:
+            raise ValueError("usage parser failed")
+
+        async def action() -> str:
+            return "spent"
+
+        result = await lifecycle.execute(action, (), {}, _make_cfg(actual=failing_actual))
+
+        assert result == "spent"
+        commit_body = mock_client.commit_reservation.await_args.args[1]
+        assert commit_body["actual"] == {"unit": "USD_MICROCENTS", "amount": 1000}
+        assert commit_body["metadata"] == {"actual_source": "estimate"}
+        mock_client.release_reservation.assert_not_called()
+
+    async def test_post_action_journal_failure_never_releases_known_spend(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        lifecycle, mock_client = self._make_lifecycle()
+        mock_client.create_reservation = AsyncMock(return_value=_allow_response())
+        persist_pending = MagicMock(side_effect=OSError("journal unavailable"))
+        monkeypatch.setattr(lifecycle._retry_engine, "persist_pending", persist_pending)
+
+        async def action() -> str:
+            return "spent"
+
+        with pytest.raises(OSError, match="journal unavailable"):
+            await lifecycle.execute(action, (), {}, _make_cfg())
+
+        persist_pending.assert_called_once()
+        mock_client.commit_reservation.assert_not_called()
+        mock_client.release_reservation.assert_not_called()
+
+    async def test_cancellation_during_action_releases_reservation(self) -> None:
+        lifecycle, mock_client = self._make_lifecycle()
+        mock_client.create_reservation = AsyncMock(return_value=_allow_response())
+        mock_client.release_reservation = AsyncMock(return_value=_release_success())
+
+        async def cancelled_action() -> str:
+            raise asyncio.CancelledError
+
+        with pytest.raises(asyncio.CancelledError):
+            await lifecycle.execute(cancelled_action, (), {}, _make_cfg())
+
+        mock_client.release_reservation.assert_awaited_once()
+
     async def test_deny_raises(self) -> None:
         lifecycle, mock_client = self._make_lifecycle()
         mock_client.create_reservation = AsyncMock(return_value=_deny_response())
@@ -953,7 +1071,7 @@ class TestAsyncLifecycleExecution:
         await lifecycle.execute(my_func, (), {}, cfg)
         mock_client.release_reservation.assert_not_called()
 
-    async def test_commit_client_error_triggers_release(self) -> None:
+    async def test_commit_client_error_does_not_release_known_spend(self) -> None:
         lifecycle, mock_client = self._make_lifecycle()
         mock_client.create_reservation = AsyncMock(return_value=_allow_response())
         mock_client.commit_reservation = AsyncMock(
@@ -963,7 +1081,6 @@ class TestAsyncLifecycleExecution:
                 body={"error": "UNIT_MISMATCH", "message": "Wrong unit", "request_id": "r1"},
             )
         )
-        mock_client.release_reservation = AsyncMock(return_value=_release_success())
 
         cfg = _make_cfg()
 
@@ -971,7 +1088,7 @@ class TestAsyncLifecycleExecution:
             return "result"
 
         await lifecycle.execute(my_func, (), {}, cfg)
-        mock_client.release_reservation.assert_awaited_once()
+        mock_client.release_reservation.assert_not_called()
 
     async def test_commit_transport_error_schedules_retry(self) -> None:
         config = _make_config()

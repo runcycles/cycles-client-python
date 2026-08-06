@@ -5,6 +5,40 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog 1.1.0](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.3] - 2026-08-06
+
+### Added
+
+- `stream_reservation()` accepts an optional caller-supplied
+  `idempotency_key`, enabling framework adapters to preserve stable upstream
+  call identities. Commit and release keys are derived from it.
+- `raise_on_commit_failure=True` surfaces a `CyclesProtocolError` only after
+  known spend has been persisted and recovery queued. `settlement_error` and
+  `release_error` expose the corresponding best-effort outcome when callers
+  keep the default non-raising behavior.
+
+### Fixed
+
+- Lifecycle and streaming paths no longer release a reservation after a
+  recognized commit rejection. The guarded action already spent the resource;
+  releasing at that point returned budget for known spend.
+- Sync and async decorator lifecycles now release only when the guarded
+  function itself fails. Missing required `actual` configuration fails before
+  reservation, post-action settlement/setup errors never release known spend,
+  and a failing or invalid `actual` callback commits the estimate with
+  `metadata.actual_source="estimate"`.
+- Async cancellation while the guarded function is running now follows the
+  same best-effort release path as ordinary function exceptions.
+- The shared `CR-BOUNDARY-001` conformance binding follows the strengthened
+  missing-actual preflight regression, keeping the 12-scenario durable profile
+  executable after the test was renamed.
+- Stream first-attempt requests use the typed SDK request models while durable
+  retries retain their schema-equivalent journal dictionaries.
+- The LangChain callback example now uses the managed reservation lifecycle,
+  normalized `AIMessage.usage_metadata`, cached-input pricing, a stable run key,
+  and concurrent run tracking. It enables callback error propagation so reserve
+  denial cannot be swallowed, and it no longer drops failed commit responses.
+
 ## [0.5.2] - 2026-07-29
 
 ### Added

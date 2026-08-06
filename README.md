@@ -3,7 +3,7 @@
 [![CI](https://github.com/runcycles/cycles-client-python/actions/workflows/ci.yml/badge.svg)](https://github.com/runcycles/cycles-client-python/actions)
 [![Recovery conformance](https://img.shields.io/github/actions/workflow/status/runcycles/cycles-client-python/ci.yml?branch=main&label=recovery%20conformance)](https://runcycles.io/protocol/sdk-recovery-conformance)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue)](LICENSE)
-[![Coverage](https://img.shields.io/badge/coverage-100%25-brightgreen)](https://github.com/runcycles/cycles-client-python/actions)
+[![Coverage](https://img.shields.io/badge/coverage-98.47%25-brightgreen)](https://github.com/runcycles/cycles-client-python/actions)
 
 # Cycles Python Client — AI agent budget and action authority SDK
 
@@ -97,14 +97,20 @@ The `@cycles` decorator wraps your function in a reserve → execute → commit/
 | Reservation denied | **Neither** | `BudgetExceededError`, `OverdraftLimitExceededError`, or `DebtOutstandingError` raised; function never executes |
 | `dry_run=True`, any decision | **Neither** | Returns `DryRunResult` or raises; no real reservation created |
 | Function returns successfully | **Commit** | Actual amount charged; unused remainder auto-released |
-| Function raises any exception | **Release** | Full reserved amount returned to budget; exception re-raised |
+| Guarded function raises | **Release** | Full reserved amount returned to budget; exception re-raised |
+| `actual` callback raises or returns a non-int64 amount | **Commit estimate** | Commit carries `metadata.actual_source="estimate"` |
+| Post-action settlement setup raises | **Neither** | Error surfaces, but known spend is never released |
 | Commit fails (5xx / network) | **Retry** | Exponential backoff with configurable attempts |
-| Commit fails (non-retryable 4xx) | **Release** | Reservation released after non-retryable client error |
-| Commit gets RESERVATION_EXPIRED | **Neither** | Server already reclaimed budget on TTL expiry |
+| Commit fails (recognized non-retryable 4xx) | **Neither** | Retry stops and the journal entry is discarded, but known spend is never released |
+| Commit gets RESERVATION_EXPIRED | **Recover** | Server reclaimed the hold; known spend is recorded through `POST /v1/events` |
 | Commit gets RESERVATION_FINALIZED | **Neither** | Already committed or released (idempotent replay) |
 | Commit gets IDEMPOTENCY_MISMATCH | **Neither** | Previous commit already processed; no release attempted |
 
-All raised exceptions from the guarded function trigger release. See [How Reserve-Commit Works](https://runcycles.io/protocol/how-reserve-commit-works-in-cycles) for the full protocol-level explanation.
+All raised exceptions from the guarded function trigger release. Failures after
+it returns never release known spend. If estimate fallback is disabled without
+an `actual`, configuration is rejected before reservation or execution. See
+[How Reserve-Commit Works](https://runcycles.io/protocol/how-reserve-commit-works-in-cycles)
+for the full protocol-level explanation.
 
 ### Programmatic client
 
@@ -157,7 +163,7 @@ result = await call_llm("Hello")
 
 ### Streaming
 
-For streaming LLM responses, use the `stream_reservation()` context manager. It reserves budget on enter, auto-commits on successful exit, and auto-releases on exception:
+For streaming LLM responses, use the `stream_reservation()` context manager. It reserves budget on enter, heartbeats while work runs, journals known spend before committing on successful exit, and releases on handler exception:
 
 ```python
 from openai import OpenAI
@@ -172,6 +178,8 @@ with cycles_client.stream_reservation(
     action=Action(kind="llm.completion", name="gpt-4o"),
     estimate=Amount(unit=Unit.USD_MICROCENTS, amount=max_tokens * 1000),
     cost_fn=lambda u: u.tokens_input * 250 + u.tokens_output * 1000,
+    idempotency_key="chat-run-123",       # optional stable upstream identity
+    raise_on_commit_failure=True,          # recovery is queued before this surfaces
 ) as reservation:
     # Caps available immediately after entering the context
     if reservation.caps and reservation.caps.max_tokens:
@@ -194,7 +202,7 @@ with cycles_client.stream_reservation(
 # Committed automatically with actual cost computed by cost_fn
 ```
 
-Also available as `async with client.stream_reservation(...)` for async clients. See [streaming_usage.py](examples/streaming_usage.py) for a complete example.
+Also available as `async with client.stream_reservation(...)` for async clients. With the default `raise_on_commit_failure=False`, synchronous settlement failures are logged and exposed as `reservation.settlement_error` while durable recovery continues. Known spend is never released because its commit failed. See [streaming_usage.py](examples/streaming_usage.py) for a complete example.
 
 ## Configuration
 
@@ -355,7 +363,7 @@ Exception hierarchy:
 
 When the HTTP request itself fails (DNS resolution, connection refused, timeout), the SDK never raises `CyclesTransportError` — the class is exported for use in your own code (e.g. wrapping transport-level failures in higher-level integrations). Instead:
 
-- **Lifecycle-managed surfaces (`@cycles` and `stream_reservation()`):** a transport failure at reserve time raises `CyclesProtocolError` with `status == -1` and `error_code=None`. Transport failures at commit time are retried in the background by the commit retry engine, not raised.
+- **Lifecycle-managed surfaces (`@cycles` and `stream_reservation()`):** a transport failure at reserve time raises `CyclesProtocolError` with `status == -1` and `error_code=None`. Commit transport failures are durably queued; `stream_reservation(..., raise_on_commit_failure=True)` also surfaces one as `CyclesProtocolError` after queuing it.
 - **Programmatic client:** calls never raise for transport failures — they return a `CyclesResponse` with `is_transport_error == True` and `status == -1` (shown above).
 
 ```python
@@ -530,7 +538,7 @@ ruff check .
 # Type check (strict mode)
 mypy runcycles
 
-# Run tests with coverage (85% threshold enforced in CI)
+# Run tests with coverage (95% threshold enforced in CI)
 pytest --cov runcycles --cov-fail-under=85
 ```
 

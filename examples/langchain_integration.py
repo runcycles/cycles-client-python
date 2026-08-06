@@ -12,10 +12,9 @@ For LangChain **agents** built with ``langchain.agents.create_agent`` (the
     pip install langchain-runcycles
     # https://github.com/runcycles/langchain-runcycles
 
-That package exposes ``CyclesToolGate`` (pre-tool-call authorization) and
-``CyclesFanOutGate`` (turn-cap / fan-out halts) — both work with sync and
-async agents and offer features the callback handler cannot, such as denying
-a tool call before it runs and halting an agent loop on remote policy.
+That package exposes ``CyclesModelGate``, ``CyclesToolGate``, and
+``CyclesFanOutGate``. They work with sync and async agents and can deny model
+or tool execution before it starts or halt an agent loop on remote policy.
 
 Requirements:
     pip install runcycles langchain langchain-openai
@@ -30,6 +29,7 @@ Environment variables:
 from __future__ import annotations
 
 import os
+import threading
 import uuid
 from typing import Any
 
@@ -42,20 +42,38 @@ from runcycles import (
     Action,
     Amount,
     BudgetExceededError,
-    CommitRequest,
     CyclesClient,
     CyclesConfig,
-    CyclesMetrics,
-    CyclesProtocolError,
-    ReleaseRequest,
-    ReservationCreateRequest,
+    StreamReservation,
     Subject,
     Unit,
 )
 
 # Pricing in USD microcents
 PRICE_PER_INPUT_TOKEN = 250
+PRICE_PER_CACHED_INPUT_TOKEN = 125
 PRICE_PER_OUTPUT_TOKEN = 1_000
+
+
+def _normalized_usage(response: LLMResult) -> tuple[int, int, int, str | None]:
+    """Aggregate LangChain's provider-neutral ``AIMessage.usage_metadata``."""
+    input_tokens = 0
+    output_tokens = 0
+    cached_input_tokens = 0
+    model_version = None
+
+    for generation_list in response.generations:
+        for generation in generation_list:
+            message = getattr(generation, "message", None)
+            usage = getattr(message, "usage_metadata", None) or {}
+            input_tokens += int(usage.get("input_tokens", 0))
+            output_tokens += int(usage.get("output_tokens", 0))
+            details = usage.get("input_token_details") or {}
+            cached_input_tokens += int(details.get("cache_read", 0))
+            response_metadata = getattr(message, "response_metadata", None) or {}
+            model_version = model_version or response_metadata.get("model_name")
+
+    return input_tokens, output_tokens, cached_input_tokens, model_version
 
 
 # ---------------------------------------------------------------------------
@@ -68,6 +86,11 @@ class CyclesBudgetHandler(BaseCallbackHandler):
         handler = CyclesBudgetHandler(client, subject=Subject(tenant="acme"))
         llm = ChatOpenAI(callbacks=[handler])
     """
+
+    # LangChain's default is False, which logs callback exceptions and lets the
+    # model run. Budget denial and strict post-journal settlement errors must
+    # reach the caller instead.
+    raise_error = True
 
     def __init__(
         self,
@@ -83,9 +106,9 @@ class CyclesBudgetHandler(BaseCallbackHandler):
         self.estimate_amount = estimate_amount
         self.action_kind = action_kind
         self.action_name = action_name
-        # Track active reservations by run_id
-        self._reservations: dict[str, str] = {}
-        self._idempotency_keys: dict[str, str] = {}
+        # A handler instance may receive concurrent callback runs.
+        self._reservations: dict[str, StreamReservation] = {}
+        self._lock = threading.Lock()
 
     def on_llm_start(
         self,
@@ -96,40 +119,18 @@ class CyclesBudgetHandler(BaseCallbackHandler):
         **kwargs: Any,
     ) -> None:
         """Create a budget reservation before each LLM call."""
-        key = str(uuid.uuid4())
-        self._idempotency_keys[str(run_id)] = key
-
-        response = self.client.create_reservation(
-            ReservationCreateRequest(
-                idempotency_key=key,
-                subject=self.subject,
-                action=Action(kind=self.action_kind, name=self.action_name),
-                estimate=Amount(unit=Unit.USD_MICROCENTS, amount=self.estimate_amount),
-                ttl_ms=60_000,
-            )
+        run_key = str(run_id)
+        reservation = self.client.stream_reservation(
+            subject=self.subject,
+            action=Action(kind=self.action_kind, name=self.action_name),
+            estimate=Amount(unit=Unit.USD_MICROCENTS, amount=self.estimate_amount),
+            ttl_ms=120_000,
+            idempotency_key=f"langchain-llm-{run_key}",
+            raise_on_commit_failure=True,
         )
-
-        if not response.is_success:
-            error = response.get_error_response()
-            if error and error.error == "BUDGET_EXCEEDED":
-                raise BudgetExceededError(
-                    error.message,
-                    status=response.status,
-                    error_code=error.error,
-                    request_id=error.request_id,
-                    details=error.details,
-                )
-            msg = error.message if error else (response.error_message or "Reservation failed")
-            raise CyclesProtocolError(
-                msg,
-                status=response.status,
-                error_code=error.error if error else None,
-                request_id=error.request_id if error else None,
-                details=error.details if error else None,
-            )
-
-        reservation_id = response.get_body_attribute("reservation_id")
-        self._reservations[str(run_id)] = reservation_id
+        reservation.__enter__()
+        with self._lock:
+            self._reservations[run_key] = reservation
 
     def on_llm_end(
         self,
@@ -140,34 +141,25 @@ class CyclesBudgetHandler(BaseCallbackHandler):
     ) -> None:
         """Commit actual cost after the LLM call completes."""
         run_key = str(run_id)
-        reservation_id = self._reservations.pop(run_key, None)
-        idempotency_key = self._idempotency_keys.pop(run_key, None)
-
-        if not reservation_id or not idempotency_key:
+        with self._lock:
+            reservation = self._reservations.pop(run_key, None)
+        if reservation is None:
             return
 
-        # Extract token usage from LangChain's response
-        token_usage = (response.llm_output or {}).get("token_usage", {})
-        input_tokens = token_usage.get("prompt_tokens", 0)
-        output_tokens = token_usage.get("completion_tokens", 0)
-
-        actual_cost = (
-            input_tokens * PRICE_PER_INPUT_TOKEN
+        input_tokens, output_tokens, cached_input_tokens, model_version = _normalized_usage(response)
+        billable_input_tokens = max(0, input_tokens - cached_input_tokens)
+        reservation.usage.tokens_input = input_tokens
+        reservation.usage.tokens_output = output_tokens
+        reservation.usage.model_version = model_version or self.action_name
+        reservation.usage.custom["cached_input_tokens"] = cached_input_tokens
+        reservation.usage.actual_cost = (
+            billable_input_tokens * PRICE_PER_INPUT_TOKEN
+            + cached_input_tokens * PRICE_PER_CACHED_INPUT_TOKEN
             + output_tokens * PRICE_PER_OUTPUT_TOKEN
         )
-
-        self.client.commit_reservation(
-            reservation_id,
-            CommitRequest(
-                idempotency_key=f"commit-{idempotency_key}",
-                actual=Amount(unit=Unit.USD_MICROCENTS, amount=actual_cost),
-                metrics=CyclesMetrics(
-                    tokens_input=input_tokens,
-                    tokens_output=output_tokens,
-                    model_version=token_usage.get("model_name", self.action_name),
-                ),
-            ),
-        )
+        # Stops the heartbeat, journals known spend before the first commit,
+        # and queues durable/event recovery before surfacing a commit failure.
+        reservation.__exit__(None, None, None)
 
     def on_llm_error(
         self,
@@ -178,14 +170,10 @@ class CyclesBudgetHandler(BaseCallbackHandler):
     ) -> None:
         """Release the reservation if the LLM call fails."""
         run_key = str(run_id)
-        reservation_id = self._reservations.pop(run_key, None)
-        idempotency_key = self._idempotency_keys.pop(run_key, None)
-
-        if reservation_id and idempotency_key:
-            self.client.release_reservation(
-                reservation_id,
-                ReleaseRequest(idempotency_key=f"release-{idempotency_key}"),
-            )
+        with self._lock:
+            reservation = self._reservations.pop(run_key, None)
+        if reservation is not None:
+            reservation.__exit__(type(error), error, error.__traceback__)
 
 
 # ---------------------------------------------------------------------------
@@ -249,9 +237,7 @@ def agent_with_tools_example() -> None:
 
     print("\n=== Agent with tools ===")
     try:
-        result = llm_with_tools.invoke(
-            [HumanMessage(content="What's the weather in San Francisco?")]
-        )
+        result = llm_with_tools.invoke([HumanMessage(content="What's the weather in San Francisco?")])
         print(f"Response: {result.content}")
 
         # If the model requested a tool call, show it
