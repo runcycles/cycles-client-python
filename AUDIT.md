@@ -1,5 +1,12 @@
 # Cycles Protocol v0.1.25 — Client (Python) Audit
 
+## 2026-09-24 — Dependency maintenance
+
+Dependabot PR #100 updates the SHA-pinned CodeQL SARIF uploader from
+4.37.9 to 4.38.0. Python dependencies, SDK source, and protocol fixtures are
+unchanged. The Python 3.10/3.12 lint, typing, test/coverage, and durable
+recovery checks remain enabled and must pass before merge.
+
 **Date:** 2026-08-06 (v0.5.3 — managed streams accept caller-scoped
 idempotency keys and an opt-in post-journal settlement error surface;
 recognized commit rejections never release known spend in sync/async lifecycle
