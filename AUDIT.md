@@ -1,5 +1,9 @@
 # Cycles Protocol v0.1.25 — Client (Python) Audit
 
+## 2026-10-11 — Dependency maintenance
+
+PR #104 updates the SHA-pinned download-artifact action from 8.0.1 to 8.0.2, which includes artifact-service rate-limit retry handling. The branch is brought up to date with main. Python dependencies, SDK source, and YAML protocol fixtures are unchanged. Existing Python 3.10/3.12 lint, typing, build, coverage, and durable recovery conformance checks remain enabled and must pass before merge.
+
 ## 2026-09-24 — Dependency maintenance
 
 Dependabot PR #100 updates the SHA-pinned CodeQL SARIF uploader from
