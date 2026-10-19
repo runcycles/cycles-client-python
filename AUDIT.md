@@ -1,5 +1,15 @@
 # Cycles Protocol v0.1.25 — Client (Python) Audit
 
+## 2026-10-19 — Dependabot dependency review
+
+Consolidates the following reviewed updates on current main:
+
+- PR #106: chore(deps): bump github/codeql-action/upload-sarif from 4.38.3 to 4.39.0
+- PR #107: chore(deps): bump ossf/scorecard-action from 2.4.4 to 2.5.0
+
+Workflow actions remain pinned to verified upstream commit SHAs. Existing supported runtime versions, application code, and YAML protocol contracts are preserved. Existing lint, build, test, coverage, conformance, and applicable security checks must pass on the combined commit before merge; coverage requirements are not lowered.
+
+
 ## 2026-10-11 — Dependency maintenance
 
 PR #104 updates the SHA-pinned download-artifact action from 8.0.1 to 8.0.2, which includes artifact-service rate-limit retry handling. The branch is brought up to date with main. Python dependencies, SDK source, and YAML protocol fixtures are unchanged. Existing Python 3.10/3.12 lint, typing, build, coverage, and durable recovery conformance checks remain enabled and must pass before merge.
