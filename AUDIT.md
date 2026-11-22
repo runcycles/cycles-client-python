@@ -1,5 +1,9 @@
 # Cycles Protocol v0.1.25 — Client (Python) Audit
 
+## 2026-11-22 — Dependabot dependency review
+
+PR #113 updated the Scorecard workflow to `ossf/scorecard-action` v2.6.0. The pinned commit `23f22cd` matches the upstream release tag. The change is confined to the workflow.
+
 ## 2026-10-19 — Dependabot dependency review
 
 Consolidates the following reviewed updates on current main:
